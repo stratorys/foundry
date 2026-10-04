@@ -69,6 +69,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "foundry-infer-runtime"
+version = "0.1.0"
+dependencies = [
+ "foundry-infer-core",
+ "foundry-infer-plan",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

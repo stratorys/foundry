@@ -1,0 +1,15 @@
+[package]
+name = "foundry-infer-runtime"
+description = "Backend execution contract and execution-plan interpreter of the Foundry runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+foundry-infer-core.workspace = true
+foundry-infer-plan.workspace = true
+
+[lints]
+workspace = true
