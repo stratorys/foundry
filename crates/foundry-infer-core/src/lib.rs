@@ -1,12 +1,22 @@
 mod dtype;
 mod error;
+mod graph;
 mod id;
 mod memory;
 mod shape;
 mod tensor;
 
 pub use dtype::DType;
-pub use error::CoreError;
+pub use error::{
+    CoreError,
+    GraphError,
+};
+pub use graph::{
+    Graph,
+    Op,
+    WeightDesc,
+    WeightSource,
+};
 pub use id::{
     Id,
     IdSpace,
