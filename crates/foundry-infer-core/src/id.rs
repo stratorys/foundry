@@ -3,12 +3,12 @@ use std::marker::PhantomData;
 use crate::error::CoreError;
 
 mod sealed {
-    pub trait Sealed {
-        fn from_index(index: u32) -> Self;
-    }
+    pub trait Sealed {}
 }
 
 pub trait Id: sealed::Sealed + Copy {
+    fn from_index(index: u32) -> Self;
+
     fn index(self) -> u32;
 }
 
@@ -18,19 +18,19 @@ pub struct TensorId(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OpId(u32);
 
-impl sealed::Sealed for TensorId {
-    fn from_index(index: u32) -> Self { Self(index) }
-}
+impl sealed::Sealed for TensorId {}
 
 impl Id for TensorId {
+    fn from_index(index: u32) -> Self { Self(index) }
+
     fn index(self) -> u32 { self.0 }
 }
 
-impl sealed::Sealed for OpId {
-    fn from_index(index: u32) -> Self { Self(index) }
-}
+impl sealed::Sealed for OpId {}
 
 impl Id for OpId {
+    fn from_index(index: u32) -> Self { Self(index) }
+
     fn index(self) -> u32 { self.0 }
 }
 
