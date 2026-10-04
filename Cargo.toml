@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/foundry-infer-cli"]
+members = ["crates/foundry-infer-cli", "crates/foundry-infer-core"]
 resolver = "3"
 
 [workspace.package]

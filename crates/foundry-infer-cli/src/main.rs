@@ -1,8 +1,11 @@
 use clap::Parser;
 
-/// Experimental out-of-core GPU runtime.
 #[derive(Parser)]
-#[command(name = "foundry", version)]
+#[command(
+    name = "foundry",
+    version,
+    about = "Experimental out-of-core GPU runtime"
+)]
 struct Cli {}
 
 fn main() { Cli::parse(); }
