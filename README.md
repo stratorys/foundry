@@ -24,9 +24,10 @@ chains support sequential, double-buffered, and triple-buffered plans.
 contract, with a fake backend for tests and cleanup of submitted work on failure.
 The Metal backend executes synthetic workloads on the GPU.
 
-There are no inference kernels, general-purpose scheduler, or streaming
-benchmarks yet. Transfer/compute overlap and performance relative to the legacy
-engine have not been measured.
+There are no inference kernels or general-purpose scheduler yet. A synthetic
+streaming benchmark measures end-to-end runtime execution on Metal, but
+transfer/compute overlap and performance relative to the legacy engine have not
+been measured.
 
 ## Metal
 
@@ -46,7 +47,7 @@ will be evaluated against a performance baseline measured in that repository.
 - `foundry-infer-plan`: execution plans, JSON serialization, and static validation.
 - `foundry-infer-runtime`: backend contract, plan interpreter, and fake backend.
 - `foundry-infer-metal`: macOS Metal backend for synthetic GPU workloads.
-- `foundry-infer-cli`: the `foundry` binary.
+- `foundry-infer-cli`: the `foundry` binary, with an optional `metal` feature.
 
 ## CLI
 
@@ -59,7 +60,55 @@ cargo run -p foundry-infer-cli -- plan --dump plan.json
 The workload describes 450 MiB of weights per layer and uses three resident
 slots within a 4 GiB device budget. This command exports metadata without
 loading weights or executing GPU work, and refuses to overwrite an existing
-file. GPU execution is currently exercised through the library tests.
+file.
+
+## Benchmark
+
+Compare end-to-end runtime execution of one synthetic workload with 1, 2, and 3
+resident GPU buffers. The Metal backend is behind the `metal` feature, which is
+off by default and only takes effect on macOS:
+
+```sh
+cargo run --release -p foundry-infer-cli --features metal -- \
+  bench --backend metal --layers 48 --weight-mib 64 --iterations 10
+```
+
+Defaults are `--backend metal --layers 48 --weight-mib 64 --iterations 10
+--warmup 2`. Layers, weight size, and iterations must be positive; warmup may be
+zero. Without the feature, or off macOS, `bench` exits with an error.
+
+Protocol:
+
+- Untimed setup: Metal device and checksum pipeline, the graph (no duration
+  hint), validated 1/2/3-buffer plans, deterministic in-memory weights with
+  distinct content per layer, and expected CPU checksums. Nothing is read from
+  disk.
+- Each round runs every configuration once, in an order that rotates between
+  rounds. `warmup` rounds are discarded, then `iterations` rounds are measured.
+- A monotonic timer starts right before the runtime interpreter call and stops
+  after all submitted GPU work has drained. It covers runtime validation,
+  allocations, host staging, transfers, checksum kernels, synchronization, and
+  runtime cleanup (slot release and a final drain of submitted GPU work).
+- After every execution, outside timing, the checksum of every layer is verified
+  and the checksum results are released with `clear_checksums()`. Any execution
+  or checksum error aborts the benchmark.
+- For each buffer count, the report gives median (the mean of the two middle
+  samples for even counts), minimum and maximum time, end-to-end effective
+  payload throughput (logical weight bytes / median, in GiB of 2^30 bytes), and
+  speedup against the one-buffer median.
+
+Memory: the host keeps `layers x weight` bytes of payload (3 GiB by default),
+plus transient shared staging buffers during execution. The device slot budget
+is three aligned weight slots (192 MiB by default) and must fit the GPU's
+recommended working set. It bounds the weight slots, not total application
+memory. Each weight must be below 4 GiB, and each aligned slot must fit the
+device's maximum Metal buffer length. Both limits are checked before any
+payload is generated.
+
+The workload computes checksums, not inference, and the Metal backend ignores
+duration hints. The results do not establish transfer/compute overlap or
+inference performance. More resident buffers do not guarantee overlap or a
+speedup.
 
 ## Build and validate
 
@@ -67,6 +116,7 @@ file. GPU execution is currently exercised through the library tests.
 cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo +nightly fmt --all --check
 ```
 
@@ -75,6 +125,7 @@ Require actual GPU execution when validating the backend:
 
 ```sh
 FOUNDRY_REQUIRE_METAL=1 cargo test -p foundry-infer-metal
+FOUNDRY_REQUIRE_METAL=1 cargo test -p foundry-infer-cli --features metal
 ```
 
 ## License

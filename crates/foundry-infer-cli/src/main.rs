@@ -1,3 +1,5 @@
+mod bench;
+
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::{
@@ -59,6 +61,11 @@ enum Command {
         )]
         dump: PathBuf,
     },
+    #[command(
+        about = "Benchmark end-to-end runtime execution of a synthetic streaming workload with 1, \
+                 2 and 3 resident GPU buffers"
+    )]
+    Bench(bench::BenchArgs),
 }
 
 fn main() -> ExitCode {
@@ -66,6 +73,7 @@ fn main() -> ExitCode {
         Some(Command::Plan {
             dump,
         }) => dump_plan(&dump),
+        Some(Command::Bench(args)) => bench::run(&args),
         None => Ok(()),
     };
     match result {

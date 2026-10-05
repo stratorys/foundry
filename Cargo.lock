@@ -58,7 +58,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "foundry-infer-core",
+ "foundry-infer-metal",
  "foundry-infer-plan",
+ "foundry-infer-runtime",
 ]
 
 [[package]]

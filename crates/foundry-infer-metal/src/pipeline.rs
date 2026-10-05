@@ -25,3 +25,40 @@ pub(crate) fn compile(device: &ProtocolObject<dyn MTLDevice>) -> Result<Pipeline
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|error| MetalError::PipelineCreation(error.localizedDescription().to_string()))
 }
+
+pub fn reference_checksum(payload: &[u8]) -> u32 {
+    let mut total = 0_u32;
+    let mut position = 0_u32;
+    for (chunk, bytes) in (0_u32..).zip(payload.chunks(CHUNK)) {
+        let mut sum = 0_u32;
+        for &byte in bytes {
+            position = position.wrapping_add(1);
+            sum = sum.wrapping_add(u32::from(byte).wrapping_mul(position));
+        }
+        total = total.wrapping_add(sum.wrapping_mul(2_654_435_761).wrapping_add(chunk));
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reference_checksum;
+
+    #[test]
+    fn reference_checksums_follow_the_kernel_formula() {
+        let cases: [(&[u8], u32); 4] = [
+            (&[], 0),
+            (&[0; 100], 1),
+            (&[1, 2, 3], 2_802_362_286),
+            (&[1; 65], 2_933_040_146),
+        ];
+        for (payload, expected) in cases {
+            assert_eq!(
+                reference_checksum(payload),
+                expected,
+                "{} byte payload",
+                payload.len()
+            );
+        }
+    }
+}

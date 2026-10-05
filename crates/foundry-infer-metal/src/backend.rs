@@ -144,6 +144,10 @@ impl MetalBackend {
 
     pub fn recommended_working_set(&self) -> ByteSize { self.capabilities.device_memory }
 
+    pub fn max_buffer_length(&self) -> ByteSize { byte_size(self.device.maxBufferLength()) }
+
+    pub fn clear_checksums(&mut self) { self.checksums.clear(); }
+
     pub fn checksums(
         &self,
         op: OpId,
@@ -514,7 +518,7 @@ mod tests {
         MetalStream,
     };
     use crate::error::MetalError;
-    use crate::pipeline::CHUNK;
+    use crate::pipeline::reference_checksum;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -555,20 +559,6 @@ mod tests {
                     % 256) as u8
             })
             .collect()
-    }
-
-    fn expected(payload: &[u8]) -> u32 {
-        let mut total = 0_u32;
-        let mut position = 0_u32;
-        for (chunk, bytes) in (0_u32..).zip(payload.chunks(CHUNK)) {
-            let mut sum = 0_u32;
-            for &byte in bytes {
-                position = position.wrapping_add(1);
-                sum = sum.wrapping_add(u32::from(byte).wrapping_mul(position));
-            }
-            total = total.wrapping_add(sum.wrapping_mul(2_654_435_761).wrapping_add(chunk));
-        }
-        total
     }
 
     fn stage(
@@ -639,7 +629,7 @@ mod tests {
                     } => {
                         let tensor = inputs.get(1).ok_or("synthetic op without weight")?;
                         let payload = self.payloads.get(tensor).ok_or("missing payload")?;
-                        Ok((op, expected(payload)))
+                        Ok((op, reference_checksum(payload)))
                     }
                     Op::MatMul {
                         ..
@@ -682,6 +672,11 @@ mod tests {
             !capabilities.concurrent_copy_compute,
             "overlap is not claimed"
         );
+        assert_eq!(
+            backend.max_buffer_length().bytes(),
+            u64::try_from(backend.device.maxBufferLength())?,
+            "the buffer length limit comes from the device"
+        );
         Ok(())
     }
 
@@ -721,7 +716,10 @@ mod tests {
         let op = OpId::from_index(0);
         let event = backend.synthetic_compute(&compute, op, &weights, None)?;
         backend.wait_host(&event)?;
-        let expected: Vec<u32> = payloads.iter().map(|payload| expected(payload)).collect();
+        let expected: Vec<u32> = payloads
+            .iter()
+            .map(|payload| reference_checksum(payload))
+            .collect();
         assert_eq!(
             backend.checksums(op)?,
             expected,
@@ -768,6 +766,44 @@ mod tests {
     }
 
     #[test]
+    fn repeated_runs_leave_no_residue() -> TestResult {
+        let workload = Workload::new()?;
+        let expected = workload.expected()?;
+        let Some(mut backend) = gpu()? else {
+            return Ok(());
+        };
+        for round in 0..3 {
+            for slots in 1..=3 {
+                workload.run(&mut backend, slots)??;
+                backend.drain()?;
+                assert_eq!(
+                    backend.in_flight_len(),
+                    0,
+                    "round {round} with {slots} slots leaves nothing in flight"
+                );
+                for (&op, &checksum) in &expected {
+                    assert_eq!(
+                        backend.checksums(op)?,
+                        vec![checksum],
+                        "op {} in round {round} with {slots} slots",
+                        op.index()
+                    );
+                }
+                backend.clear_checksums();
+                assert!(
+                    backend.checksums.is_empty(),
+                    "round {round} with {slots} slots keeps no checksum results"
+                );
+            }
+        }
+        assert!(
+            all_completed(&backend),
+            "repeated runs release completed work only"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn staging_dropped_after_submission_stays_alive() -> TestResult {
         let Some(mut backend) = gpu()? else {
             return Ok(());
@@ -785,7 +821,7 @@ mod tests {
         backend.wait_host(&event)?;
         assert_eq!(
             backend.checksums(op)?,
-            vec![expected(&payload)],
+            vec![reference_checksum(&payload)],
             "staged bytes survive"
         );
         Ok(())
@@ -809,7 +845,7 @@ mod tests {
         assert!(all_completed(&backend), "only completed work is released");
         assert_eq!(
             backend.checksums(op)?,
-            vec![expected(&payload)],
+            vec![reference_checksum(&payload)],
             "the result is intact"
         );
         Ok(())
@@ -844,7 +880,7 @@ mod tests {
             let (slot, _copied) = stage(&mut backend, &stream, &payload, 16 * 1024)?;
             let op = OpId::from_index(layer);
             backend.synthetic_compute(&stream, op, &[&slot], None)?;
-            expected_checksums.push((op, expected(&payload)));
+            expected_checksums.push((op, reference_checksum(&payload)));
             held.push((stream, slot));
         }
         backend.drain()?;

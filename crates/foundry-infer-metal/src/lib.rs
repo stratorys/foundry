@@ -14,3 +14,4 @@ pub use backend::{
     MetalStream,
 };
 pub use error::MetalError;
+pub use pipeline::reference_checksum;
