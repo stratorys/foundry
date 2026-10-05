@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use foundry_infer_core::ByteSize;
 
-const GIB: f64 = (1_u64 << 30) as f64;
+const GIB: f64 = 1_073_741_824.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Summary {
@@ -21,7 +21,7 @@ impl Summary {
         let upper = *sorted.get(middle)?;
         let median = if sorted.len() % 2 == 0 {
             let lower = *sorted.get(middle.checked_sub(1)?)?;
-            lower + (upper - lower) / 2
+            lower.checked_add(upper.checked_sub(lower)?.checked_div(2)?)?
         } else {
             upper
         };
@@ -37,7 +37,7 @@ pub(crate) fn throughput_gib_s(
     bytes: ByteSize,
     elapsed: Duration,
 ) -> Option<f64> {
-    (!elapsed.is_zero()).then(|| bytes.bytes() as f64 / GIB / elapsed.as_secs_f64())
+    (!elapsed.is_zero()).then(|| bytes.to_f64_lossy() / GIB / elapsed.as_secs_f64())
 }
 
 pub(crate) fn speedup(

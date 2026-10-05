@@ -30,14 +30,14 @@ pub trait Backend {
 
     fn copy_to_device(
         &mut self,
-        stream: &Self::Stream,
+        stream: &mut Self::Stream,
         source: &Self::HostBuffer,
-        destination: &Self::DeviceBuffer,
+        destination: &mut Self::DeviceBuffer,
     ) -> Result<Self::Event, Self::Error>;
 
     fn synthetic_compute(
         &mut self,
-        stream: &Self::Stream,
+        stream: &mut Self::Stream,
         op: OpId,
         weights: &[&Self::DeviceBuffer],
         duration_hint: Option<Duration>,
@@ -45,7 +45,7 @@ pub trait Backend {
 
     fn wait_stream(
         &mut self,
-        stream: &Self::Stream,
+        stream: &mut Self::Stream,
         event: &Self::Event,
     ) -> Result<(), Self::Error>;
 

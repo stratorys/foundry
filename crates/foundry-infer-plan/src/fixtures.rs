@@ -41,9 +41,13 @@ pub fn op(layer: u32) -> OpId { OpId::from_index(layer) }
 
 pub fn input() -> TensorId { TensorId::from_index(0) }
 
-pub fn weight(layer: u32) -> TensorId { TensorId::from_index(1 + 2 * layer) }
+pub fn weight(layer: u32) -> TensorId {
+    TensorId::from_index(layer.saturating_mul(2).saturating_add(1))
+}
 
-pub fn output(layer: u32) -> TensorId { TensorId::from_index(2 + 2 * layer) }
+pub fn output(layer: u32) -> TensorId {
+    TensorId::from_index(layer.saturating_mul(2).saturating_add(2))
+}
 
 pub fn device(bytes: u64) -> MemoryBudget {
     MemoryBudget::new(MemorySpace::Device, ByteSize::from_bytes(bytes))

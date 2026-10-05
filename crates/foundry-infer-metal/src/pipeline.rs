@@ -27,17 +27,22 @@ pub(crate) fn compile(device: &ProtocolObject<dyn MTLDevice>) -> Result<Pipeline
 }
 
 pub fn reference_checksum(payload: &[u8]) -> u32 {
-    let mut total = 0_u32;
-    let mut position = 0_u32;
-    for (chunk, bytes) in (0_u32..).zip(payload.chunks(CHUNK)) {
-        let mut sum = 0_u32;
-        for &byte in bytes {
-            position = position.wrapping_add(1);
-            sum = sum.wrapping_add(u32::from(byte).wrapping_mul(position));
-        }
-        total = total.wrapping_add(sum.wrapping_mul(2_654_435_761).wrapping_add(chunk));
-    }
-    total
+    (0_u32..)
+        .zip(payload.chunks(CHUNK))
+        .fold((0_u32, 0_u32), |(total, position), (chunk, bytes)| {
+            let (sum, position) = bytes
+                .iter()
+                .fold((0_u32, position), |(sum, position), &byte| {
+                    let position = position.wrapping_add(1);
+                    (
+                        sum.wrapping_add(u32::from(byte).wrapping_mul(position)),
+                        position,
+                    )
+                });
+            let total = total.wrapping_add(sum.wrapping_mul(2_654_435_761).wrapping_add(chunk));
+            (total, position)
+        })
+        .0
 }
 
 #[cfg(test)]

@@ -1,8 +1,5 @@
-use std::cell::{
-    Cell,
-    RefCell,
-};
 use std::collections::BTreeMap;
+use std::iter;
 use std::ptr::NonNull;
 use std::time::Duration;
 
@@ -55,7 +52,7 @@ const RESULT: usize = size_of::<u32>();
 
 pub struct MetalBuffer {
     buffer: Buffer,
-    payload: Cell<usize>,
+    payload: usize,
 }
 
 pub struct MetalStaging {
@@ -64,7 +61,7 @@ pub struct MetalStaging {
 
 pub struct MetalStream {
     queue: Queue,
-    waits: RefCell<Vec<Event>>,
+    waits: Vec<Event>,
 }
 
 pub struct MetalEvent {
@@ -142,9 +139,9 @@ impl MetalBackend {
 
     pub fn device_name(&self) -> String { self.device.name().to_string() }
 
-    pub fn recommended_working_set(&self) -> ByteSize { self.capabilities.device_memory }
+    pub fn working_set_recommended(&self) -> ByteSize { self.capabilities.device_memory }
 
-    pub fn max_buffer_length(&self) -> ByteSize { byte_size(self.device.maxBufferLength()) }
+    pub fn buffer_length_max(&self) -> ByteSize { byte_size(self.device.maxBufferLength()) }
 
     pub fn clear_checksums(&mut self) { self.checksums.clear(); }
 
@@ -155,6 +152,10 @@ impl MetalBackend {
         let checksum = self.checksums.get(&op).ok_or(MetalError::UnknownOp(op))?;
         completion(&checksum.command_buffer)?;
         let pointer = checksum.buffer.contents().cast::<u32>();
+        // SAFETY: `synthetic_compute` allocated this shared buffer with room
+        // for `count` u32 results, `completion` proved the GPU finished
+        // writing it, and `checksum` keeps the buffer alive for the
+        // lifetime of the slice.
         let values = unsafe { std::slice::from_raw_parts(pointer.as_ptr(), checksum.count) };
         Ok(values.to_vec())
     }
@@ -180,6 +181,9 @@ impl MetalBackend {
             byte_size(contents.len()),
             MTLResourceOptions::StorageModeShared,
         )?;
+        // SAFETY: the buffer was just allocated with at least `contents.len()`
+        // bytes of shared storage, so the destination is valid, and a
+        // fresh allocation cannot overlap `contents`.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 contents.as_ptr(),
@@ -200,7 +204,7 @@ impl MetalBackend {
             .queue
             .commandBuffer()
             .ok_or(MetalError::CommandBufferCreation)?;
-        let waits = stream.waits.borrow().clone();
+        let waits = stream.waits.clone();
         for wait in &waits {
             command_buffer.encodeWaitForEvent_value(wait, 1);
         }
@@ -213,7 +217,7 @@ impl MetalBackend {
 
     fn submit(
         &mut self,
-        stream: &MetalStream,
+        stream: &mut MetalStream,
         pending: Pending,
         buffers: Vec<Buffer>,
         pipeline: Option<Pipeline>,
@@ -225,7 +229,7 @@ impl MetalBackend {
         } = pending;
         command_buffer.encodeSignalEvent_value(&event, 1);
         command_buffer.commit();
-        stream.waits.borrow_mut().clear();
+        stream.waits.clear();
         waits.push(event.clone());
         self.submissions
             .register(command_buffer.clone(), buffers, waits, pipeline);
@@ -246,7 +250,7 @@ impl MetalBackend {
         &self,
         buffer: &MetalBuffer,
     ) -> Result<Vec<u8>, MetalError> {
-        let length = buffer.payload.get();
+        let length = buffer.payload;
         let shared = self.buffer(byte_size(length), MTLResourceOptions::StorageModeShared)?;
         let queue = self
             .device
@@ -258,6 +262,9 @@ impl MetalBackend {
         let encoder = command_buffer
             .blitCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;
+        // SAFETY: `length` is the payload last copied into `buffer`, which fits
+        // in both the device buffer and the `shared` buffer allocated
+        // with exactly `length` bytes.
         unsafe {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                 &buffer.buffer,
@@ -271,6 +278,8 @@ impl MetalBackend {
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
         completion(&command_buffer)?;
+        // SAFETY: `shared` holds `length` bytes and `waitUntilCompleted`
+        // returned, so the GPU no longer writes to it.
         let bytes =
             unsafe { std::slice::from_raw_parts(shared.contents().cast::<u8>().as_ptr(), length) };
         Ok(bytes.to_vec())
@@ -296,7 +305,7 @@ impl MetalBackend {
                 Err(MetalError::InjectedFault)
             }
             Some((planned, calls)) if planned == fault => {
-                self.fault = Some((planned, calls - 1));
+                self.fault = Some((planned, calls.saturating_sub(1)));
                 Ok(())
             }
             Some(_) | None => Ok(()),
@@ -327,7 +336,7 @@ impl Backend for MetalBackend {
     ) -> Result<MetalBuffer, MetalError> {
         Ok(MetalBuffer {
             buffer: self.buffer(bytes, MTLResourceOptions::StorageModePrivate)?,
-            payload: Cell::new(0),
+            payload: 0,
         })
     }
 
@@ -346,15 +355,15 @@ impl Backend for MetalBackend {
                 .device
                 .newCommandQueue()
                 .ok_or(MetalError::QueueCreation)?,
-            waits: RefCell::new(Vec::new()),
+            waits: Vec::new(),
         })
     }
 
     fn copy_to_device(
         &mut self,
-        stream: &MetalStream,
+        stream: &mut MetalStream,
         source: &MetalStaging,
-        destination: &MetalBuffer,
+        destination: &mut MetalBuffer,
     ) -> Result<MetalEvent, MetalError> {
         let length = source.buffer.length();
         if length > destination.buffer.length() {
@@ -368,6 +377,9 @@ impl Backend for MetalBackend {
             .command_buffer
             .blitCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;
+        // SAFETY: `length` is the source buffer length and was checked above
+        // not to exceed the destination length, so both ranges are in
+        // bounds.
         unsafe {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                 &source.buffer,
@@ -380,14 +392,14 @@ impl Backend for MetalBackend {
         encoder.endEncoding();
         let buffers = vec![source.buffer.clone(), destination.buffer.clone()];
         let event = self.submit(stream, pending, buffers, None);
-        destination.payload.set(length);
+        destination.payload = length;
         self.inject(Fault::Copy)?;
         Ok(event)
     }
 
     fn synthetic_compute(
         &mut self,
-        stream: &MetalStream,
+        stream: &mut MetalStream,
         op: OpId,
         weights: &[&MetalBuffer],
         _duration_hint: Option<Duration>,
@@ -395,13 +407,24 @@ impl Backend for MetalBackend {
         let lengths = weights
             .iter()
             .map(|weight| {
-                let length = weight.payload.get();
+                let length = weight.payload;
                 u32::try_from(length).map_err(|_| MetalError::PayloadTooLarge {
                     bytes: byte_size(length),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let result = self.shared(&vec![0; weights.len().max(1) * RESULT])?;
+        let too_many = || MetalError::TooManyWeights {
+            count: weights.len(),
+        };
+        let offsets = (0..weights.len())
+            .map(|index| index.checked_mul(RESULT).ok_or_else(too_many))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result_len = weights
+            .len()
+            .max(1)
+            .checked_mul(RESULT)
+            .ok_or_else(too_many)?;
+        let result = self.shared(&vec![0; result_len])?;
         let pending = self.begin(stream)?;
         let encoder = pending
             .command_buffer
@@ -409,14 +432,18 @@ impl Backend for MetalBackend {
             .ok_or(MetalError::EncoderCreation)?;
         encoder.setComputePipelineState(&self.pipeline);
         let width = self.pipeline.maxTotalThreadsPerThreadgroup();
-        for (index, (weight, length)) in weights.iter().zip(&lengths).enumerate() {
-            let chunks = weight.payload.get().div_ceil(CHUNK);
+        for ((weight, length), offset) in weights.iter().zip(&lengths).zip(offsets) {
+            let chunks = weight.payload.div_ceil(CHUNK);
             if chunks == 0 {
                 continue;
             }
+            // SAFETY: the kernel reads at most `length` bytes of the weight
+            // buffer, `offset` addresses one u32 inside `result`,
+            // and Metal copies the `length` bytes before `setBytes`
+            // returns.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&weight.buffer), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&result), index * RESULT, 1);
+                encoder.setBuffer_offset_atIndex(Some(&result), offset, 1);
                 encoder.setBytes_length_atIndex(NonNull::from(length).cast(), size_of::<u32>(), 2)
             };
             encoder.dispatchThreads_threadsPerThreadgroup(
@@ -433,8 +460,11 @@ impl Backend for MetalBackend {
             );
         }
         encoder.endEncoding();
-        let mut buffers: Vec<Buffer> = weights.iter().map(|weight| weight.buffer.clone()).collect();
-        buffers.push(result.clone());
+        let buffers = weights
+            .iter()
+            .map(|weight| weight.buffer.clone())
+            .chain(iter::once(result.clone()))
+            .collect();
         let event = self.submit(stream, pending, buffers, Some(self.pipeline.clone()));
         self.checksums.insert(
             op,
@@ -450,10 +480,10 @@ impl Backend for MetalBackend {
 
     fn wait_stream(
         &mut self,
-        stream: &MetalStream,
+        stream: &mut MetalStream,
         event: &MetalEvent,
     ) -> Result<(), MetalError> {
-        stream.waits.borrow_mut().push(event.event.clone());
+        stream.waits.push(event.event.clone());
         Ok(())
     }
 
@@ -526,6 +556,10 @@ mod tests {
     const WEIGHT: u64 = 1000;
     const SLOT: u64 = 4096;
 
+    #[expect(
+        clippy::print_stderr,
+        reason = "the test reports whether GPU behavior was verified or skipped"
+    )]
     fn gpu() -> Result<Option<MetalBackend>, Box<dyn Error>> {
         match MetalBackend::new() {
             Ok(backend) => {
@@ -552,24 +586,24 @@ mod tests {
         let seed = usize::try_from(layer).unwrap_or(usize::MAX);
         (0..length)
             .map(|index| {
-                (seed
+                let value = seed
                     .wrapping_mul(37)
                     .wrapping_add(index.wrapping_mul(11))
-                    .wrapping_add(5)
-                    % 256) as u8
+                    .wrapping_add(5);
+                u8::try_from(value % 256).unwrap_or_default()
             })
             .collect()
     }
 
     fn stage(
         backend: &mut MetalBackend,
-        stream: &MetalStream,
+        stream: &mut MetalStream,
         payload: &[u8],
         slot: u64,
     ) -> Result<(MetalBuffer, MetalEvent), Box<dyn Error>> {
-        let destination = backend.allocate_device(ByteSize::from_bytes(slot))?;
+        let mut destination = backend.allocate_device(ByteSize::from_bytes(slot))?;
         let staging = backend.allocate_host(payload)?;
-        let event = backend.copy_to_device(stream, &staging, &destination)?;
+        let event = backend.copy_to_device(stream, &staging, &mut destination)?;
         Ok((destination, event))
     }
 
@@ -665,7 +699,7 @@ mod tests {
         );
         assert_eq!(
             capabilities.device_memory,
-            backend.recommended_working_set(),
+            backend.working_set_recommended(),
             "device memory is the recommended working set"
         );
         assert!(
@@ -673,7 +707,7 @@ mod tests {
             "overlap is not claimed"
         );
         assert_eq!(
-            backend.max_buffer_length().bytes(),
+            backend.buffer_length_max().bytes(),
             u64::try_from(backend.device.maxBufferLength())?,
             "the buffer length limit comes from the device"
         );
@@ -685,9 +719,9 @@ mod tests {
         let Some(mut backend) = gpu()? else {
             return Ok(());
         };
-        let stream = backend.create_stream()?;
+        let mut stream = backend.create_stream()?;
         let payload = pattern(3, 1000);
-        let (destination, event) = stage(&mut backend, &stream, &payload, SLOT)?;
+        let (destination, event) = stage(&mut backend, &mut stream, &payload, SLOT)?;
         backend.wait_host(&event)?;
         assert_eq!(destination.buffer.length(), 4096, "the slot keeps its size");
         assert_eq!(
@@ -703,18 +737,18 @@ mod tests {
         let Some(mut backend) = gpu()? else {
             return Ok(());
         };
-        let copy = backend.create_stream()?;
-        let compute = backend.create_stream()?;
+        let mut copy = backend.create_stream()?;
+        let mut compute = backend.create_stream()?;
         let payloads = [pattern(0, 1), pattern(1, 1000), pattern(2, 100_003)];
         let mut slots = Vec::new();
         for payload in &payloads {
-            let (slot, event) = stage(&mut backend, &copy, payload, 128 * 1024)?;
-            backend.wait_stream(&compute, &event)?;
+            let (slot, event) = stage(&mut backend, &mut copy, payload, 128 * 1024)?;
+            backend.wait_stream(&mut compute, &event)?;
             slots.push(slot);
         }
         let weights: Vec<&MetalBuffer> = slots.iter().collect();
         let op = OpId::from_index(0);
-        let event = backend.synthetic_compute(&compute, op, &weights, None)?;
+        let event = backend.synthetic_compute(&mut compute, op, &weights, None)?;
         backend.wait_host(&event)?;
         let expected: Vec<u32> = payloads
             .iter()
@@ -808,16 +842,16 @@ mod tests {
         let Some(mut backend) = gpu()? else {
             return Ok(());
         };
-        let copy = backend.create_stream()?;
-        let compute = backend.create_stream()?;
+        let mut copy = backend.create_stream()?;
+        let mut compute = backend.create_stream()?;
         let payload = pattern(4, 50_000);
-        let slot = backend.allocate_device(ByteSize::from_bytes(64 * 1024))?;
+        let mut slot = backend.allocate_device(ByteSize::from_bytes(64 * 1024))?;
         let staging = backend.allocate_host(&payload)?;
-        let copied = backend.copy_to_device(&copy, &staging, &slot)?;
+        let copied = backend.copy_to_device(&mut copy, &staging, &mut slot)?;
         drop(staging);
-        backend.wait_stream(&compute, &copied)?;
+        backend.wait_stream(&mut compute, &copied)?;
         let op = OpId::from_index(7);
-        let event = backend.synthetic_compute(&compute, op, &[&slot], None)?;
+        let event = backend.synthetic_compute(&mut compute, op, &[&slot], None)?;
         backend.wait_host(&event)?;
         assert_eq!(
             backend.checksums(op)?,
@@ -832,14 +866,14 @@ mod tests {
         let Some(mut backend) = gpu()? else {
             return Ok(());
         };
-        let copy = backend.create_stream()?;
-        let compute = backend.create_stream()?;
+        let mut copy = backend.create_stream()?;
+        let mut compute = backend.create_stream()?;
         let payload = pattern(5, 20_000);
-        let (slot, copied) = stage(&mut backend, &copy, &payload, 32 * 1024)?;
-        backend.wait_stream(&compute, &copied)?;
+        let (slot, copied) = stage(&mut backend, &mut copy, &payload, 32 * 1024)?;
+        backend.wait_stream(&mut compute, &copied)?;
         drop(copied);
         let op = OpId::from_index(1);
-        drop(backend.synthetic_compute(&compute, op, &[&slot], None)?);
+        drop(backend.synthetic_compute(&mut compute, op, &[&slot], None)?);
         backend.drain()?;
         assert_eq!(backend.in_flight_len(), 0, "drain completes everything");
         assert!(all_completed(&backend), "only completed work is released");
@@ -856,8 +890,8 @@ mod tests {
         let Some(mut backend) = gpu()? else {
             return Ok(());
         };
-        let stream = backend.create_stream()?;
-        let (_slot, event) = stage(&mut backend, &stream, &pattern(6, 256), SLOT)?;
+        let mut stream = backend.create_stream()?;
+        let (_slot, event) = stage(&mut backend, &mut stream, &pattern(6, 256), SLOT)?;
         backend.wait_host(&event)?;
         assert_eq!(
             event.command_buffer.status(),
@@ -875,11 +909,11 @@ mod tests {
         let mut expected_checksums = Vec::new();
         let mut held = Vec::new();
         for layer in 0..3 {
-            let stream = backend.create_stream()?;
+            let mut stream = backend.create_stream()?;
             let payload = pattern(layer, 10_000 + usize::try_from(layer)?);
-            let (slot, _copied) = stage(&mut backend, &stream, &payload, 16 * 1024)?;
+            let (slot, _copied) = stage(&mut backend, &mut stream, &payload, 16 * 1024)?;
             let op = OpId::from_index(layer);
-            backend.synthetic_compute(&stream, op, &[&slot], None)?;
+            backend.synthetic_compute(&mut stream, op, &[&slot], None)?;
             expected_checksums.push((op, reference_checksum(&payload)));
             held.push((stream, slot));
         }
@@ -902,11 +936,13 @@ mod tests {
         let Some(mut backend) = gpu()? else {
             return Ok(());
         };
-        let stream = backend.create_stream()?;
+        let mut stream = backend.create_stream()?;
         let staging = backend.allocate_host(&pattern(0, 2048))?;
-        let slot = backend.allocate_device(ByteSize::from_bytes(1024))?;
+        let mut slot = backend.allocate_device(ByteSize::from_bytes(1024))?;
         assert_eq!(
-            backend.copy_to_device(&stream, &staging, &slot).err(),
+            backend
+                .copy_to_device(&mut stream, &staging, &mut slot)
+                .err(),
             Some(MetalError::CopyTooLarge {
                 source: ByteSize::from_bytes(2048),
                 destination: ByteSize::from_bytes(1024),

@@ -1,11 +1,16 @@
+#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
+mod error;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+#[expect(
+    clippy::print_stdout,
+    reason = "the benchmark prints its report to stdout"
+)]
 mod metal;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 mod stats;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 mod workload;
 
-use std::error::Error;
 use std::num::{
     NonZeroU32,
     NonZeroU64,
@@ -16,6 +21,7 @@ use clap::{
     ValueEnum,
 };
 
+use crate::bench::error::BenchError;
 use crate::bench::workload::Sizes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -62,7 +68,7 @@ pub(crate) struct BenchArgs {
     warmup: u32,
 }
 
-pub(crate) fn run(args: &BenchArgs) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(args: &BenchArgs) -> Result<(), BenchError> {
     let sizes = Sizes::new(args.layers, args.weight_mib)?;
     match args.backend {
         BackendKind::Metal => run_metal(&sizes, args.warmup, args.iterations),
@@ -74,7 +80,7 @@ fn run_metal(
     sizes: &Sizes,
     warmup: u32,
     iterations: NonZeroU32,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), BenchError> {
     metal::run(sizes, warmup, iterations)
 }
 
@@ -83,6 +89,6 @@ fn run_metal(
     _sizes: &Sizes,
     _warmup: u32,
     _iterations: NonZeroU32,
-) -> Result<(), Box<dyn Error>> {
-    Err("Metal benchmarking requires a macOS build of foundry with `--features metal`".into())
+) -> Result<(), BenchError> {
+    Err(BenchError::MetalUnavailable)
 }

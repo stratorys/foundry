@@ -54,38 +54,31 @@ fn preflight<B: Backend>(
     weights: &BTreeMap<TensorId, &[u8]>,
 ) -> Result<BTreeMap<OpId, Option<Duration>>, RuntimeError<B::Error>> {
     plan.validate(graph, budget)?;
-    let mut durations = BTreeMap::new();
-    for (op, desc) in graph.ops() {
-        match desc {
+    let durations = graph
+        .ops()
+        .map(|(op, desc)| match desc {
             Op::SyntheticCompute {
                 duration_hint, ..
-            } => {
-                durations.insert(op, *duration_hint);
-            }
+            } => Ok((op, *duration_hint)),
             Op::MatMul {
                 ..
-            } => {
-                return Err(RuntimeError::UnsupportedOp {
-                    op,
-                });
-            }
-        }
-    }
-    let mut expected = BTreeMap::new();
-    for weight in graph.weights() {
-        match weight.source {
-            WeightSource::HostMemory => {
-                expected.insert(weight.tensor, weight.bytes);
-            }
+            } => Err(RuntimeError::UnsupportedOp {
+                op,
+            }),
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let expected = graph
+        .weights()
+        .iter()
+        .map(|weight| match weight.source {
+            WeightSource::HostMemory => Ok((weight.tensor, weight.bytes)),
             WeightSource::MappedFile {
                 ..
-            } => {
-                return Err(RuntimeError::UnsupportedWeightSource {
-                    tensor: weight.tensor,
-                });
-            }
-        }
-    }
+            } => Err(RuntimeError::UnsupportedWeightSource {
+                tensor: weight.tensor,
+            }),
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     for (index, command) in plan.commands().iter().enumerate() {
         let Command::Prefetch {
             tensor, ..
@@ -282,15 +275,18 @@ impl<'run, B: Backend> Run<'run, B> {
             })?;
         let queue = self
             .streams
-            .get(&stream)
+            .get_mut(&stream)
             .ok_or(ExecutionFailure::MissingStream {
                 index,
                 stream,
             })?;
-        let destination = self.slots.get(&slot).ok_or(ExecutionFailure::MissingSlot {
-            index,
-            slot,
-        })?;
+        let destination = self
+            .slots
+            .get_mut(&slot)
+            .ok_or(ExecutionFailure::MissingSlot {
+                index,
+                slot,
+            })?;
         let staging =
             self.backend
                 .allocate_host(contents)
@@ -329,7 +325,7 @@ impl<'run, B: Backend> Run<'run, B> {
     ) -> Result<(), ExecutionFailure<B::Error>> {
         let queue = self
             .streams
-            .get(&stream)
+            .get_mut(&stream)
             .ok_or(ExecutionFailure::MissingStream {
                 index,
                 stream,
@@ -391,7 +387,7 @@ impl<'run, B: Backend> Run<'run, B> {
         })?;
         let queue = self
             .streams
-            .get(&stream)
+            .get_mut(&stream)
             .ok_or(ExecutionFailure::MissingStream {
                 index,
                 stream,
@@ -551,10 +547,12 @@ mod tests {
         Ok(synthetic_chain_plan(graph, slots, Alignment::new(SLOT)?)?)
     }
 
-    fn weight(layer: u32) -> TensorId { TensorId::from_index(1 + 2 * layer) }
+    fn weight(layer: u32) -> TensorId {
+        TensorId::from_index(layer.saturating_mul(2).saturating_add(1))
+    }
 
     fn payload(layer: u32) -> Result<Vec<u8>, Box<dyn Error>> {
-        let fill = u8::try_from(layer + 1)?;
+        let fill = u8::try_from(layer.checked_add(1).ok_or("layer overflow")?)?;
         Ok(vec![fill; usize::try_from(WEIGHT)?])
     }
 
@@ -625,11 +623,11 @@ mod tests {
                     tensor: weight(layer),
                     slot: slot(0),
                 }],
-                event: event(transfer + 1),
+                event: event(transfer.saturating_add(1)),
             },
             Command::Wait {
                 target: WaitTarget::Host,
-                event: event(transfer + 1),
+                event: event(transfer.saturating_add(1)),
             },
             Command::Release {
                 slot: slot(0),

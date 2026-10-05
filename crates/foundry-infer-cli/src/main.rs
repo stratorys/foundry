@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stderr,
+    reason = "the binary reports failures to its user on stderr"
+)]
+
 mod bench;
 
 use std::error::Error;
@@ -32,7 +37,10 @@ use foundry_infer_plan::{
 const LAYERS: u32 = 48;
 const LAYER_WEIGHT_MIB: u64 = 450;
 const LAYER_DURATION: Duration = Duration::from_millis(60);
-const RESIDENT_SLOTS: NonZeroU32 = NonZeroU32::new(3).expect("three slots are non-zero");
+const RESIDENT_SLOTS: NonZeroU32 = match NonZeroU32::new(3) {
+    Some(slots) => slots,
+    None => NonZeroU32::MIN,
+};
 const DEVICE_BUDGET_GIB: u64 = 4;
 const SLOT_ALIGNMENT: u64 = 256;
 
@@ -73,7 +81,7 @@ fn main() -> ExitCode {
         Some(Command::Plan {
             dump,
         }) => dump_plan(&dump),
-        Some(Command::Bench(args)) => bench::run(&args),
+        Some(Command::Bench(args)) => bench::run(&args).map_err(Box::from),
         None => Ok(()),
     };
     match result {

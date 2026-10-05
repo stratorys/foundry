@@ -29,6 +29,9 @@ pub enum MetalError {
     PayloadTooLarge {
         bytes: ByteSize,
     },
+    TooManyWeights {
+        count: usize,
+    },
     QueueCreation,
     CommandBufferCreation,
     EncoderCreation,
@@ -81,6 +84,12 @@ impl fmt::Display for MetalError {
             } => write!(
                 formatter,
                 "synthetic compute payload of {bytes} exceeds 4 GiB"
+            ),
+            Self::TooManyWeights {
+                count,
+            } => write!(
+                formatter,
+                "synthetic compute over {count} weights overflows its checksum buffer"
             ),
             Self::QueueCreation => write!(formatter, "Metal command queue creation failed"),
             Self::CommandBufferCreation => {

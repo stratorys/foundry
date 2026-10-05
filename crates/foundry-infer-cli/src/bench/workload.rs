@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::error::Error;
 use std::num::{
     NonZeroU32,
     NonZeroU64,
@@ -16,6 +15,8 @@ use foundry_infer_plan::{
     ExecutionPlan,
 };
 
+use crate::bench::error::BenchError;
+
 pub(crate) const BUFFER_COUNTS: [u32; 3] = [1, 2, 3];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,15 +31,23 @@ impl Sizes {
     pub(crate) fn new(
         layers: NonZeroU32,
         weight_mib: NonZeroU64,
-    ) -> Result<Self, String> {
-        let weight = ByteSize::from_mib(weight_mib.get())
-            .map_err(|_| format!("a weight of {weight_mib} MiB overflows a 64-bit byte count"))?;
-        let total = weight.checked_mul(u64::from(layers.get())).map_err(|_| {
-            format!("{layers} layers of {weight_mib} MiB overflow a 64-bit byte count")
-        })?;
-        let addressable = |bytes: ByteSize, what: &str| {
-            usize::try_from(bytes.bytes())
-                .map_err(|_| format!("the {what} of {bytes} exceeds the host address space"))
+    ) -> Result<Self, BenchError> {
+        let weight =
+            ByteSize::from_mib(weight_mib.get()).map_err(|_| BenchError::WeightOverflow {
+                weight_mib,
+            })?;
+        let total =
+            weight
+                .checked_mul(u64::from(layers.get()))
+                .map_err(|_| BenchError::TotalOverflow {
+                    layers,
+                    weight_mib,
+                })?;
+        let addressable = |bytes: ByteSize, what: &'static str| {
+            usize::try_from(bytes.bytes()).map_err(|_| BenchError::HostAddressSpace {
+                what,
+                bytes,
+            })
         };
         let weight_len = addressable(weight, "layer weight")?;
         addressable(total, "host payload")?;
@@ -54,20 +63,23 @@ impl Sizes {
 pub(crate) fn aligned_slot(
     weight: ByteSize,
     alignment: Alignment,
-) -> Result<ByteSize, String> {
+) -> Result<ByteSize, BenchError> {
     weight
         .align_up(alignment)
-        .map_err(|_| format!("aligning a {weight} weight slot overflows"))
+        .map_err(|_| BenchError::SlotAlignment {
+            weight,
+        })
 }
 
 pub(crate) fn check_buffer_limit(
     slot: ByteSize,
     limit: ByteSize,
-) -> Result<(), String> {
+) -> Result<(), BenchError> {
     if slot > limit {
-        Err(format!(
-            "an aligned weight slot of {slot} exceeds the {limit} Metal buffer length limit"
-        ))
+        Err(BenchError::BufferLimit {
+            slot,
+            limit,
+        })
     } else {
         Ok(())
     }
@@ -76,11 +88,14 @@ pub(crate) fn check_buffer_limit(
 pub(crate) fn slot_budget(
     weight: ByteSize,
     alignment: Alignment,
-) -> Result<ByteSize, String> {
+) -> Result<ByteSize, BenchError> {
     let slots = BUFFER_COUNTS.into_iter().max().unwrap_or_default();
     aligned_slot(weight, alignment)?
         .checked_mul(u64::from(slots))
-        .map_err(|_| format!("the slot budget for {slots} aligned {weight} slots overflows"))
+        .map_err(|_| BenchError::SlotBudgetOverflow {
+            slots,
+            weight,
+        })
 }
 
 pub(crate) fn round_order(round: u32) -> [u32; 3] {
@@ -89,7 +104,7 @@ pub(crate) fn round_order(round: u32) -> [u32; 3] {
     order
 }
 
-pub(crate) fn planned_peak(plan: &ExecutionPlan) -> Result<ByteSize, Box<dyn Error>> {
+pub(crate) fn planned_peak(plan: &ExecutionPlan) -> Result<ByteSize, BenchError> {
     let mut live = BTreeMap::new();
     let mut current = ByteSize::default();
     let mut peak = current;
@@ -125,23 +140,22 @@ pub(crate) fn planned_peak(plan: &ExecutionPlan) -> Result<ByteSize, Box<dyn Err
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut mixed = *state;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    mixed ^ (mixed >> 31)
+    let first = (*state ^ (*state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let second = (first ^ (first >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    second ^ (second >> 31)
 }
 
 pub(crate) fn payload(
     layer: u32,
     length: usize,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, BenchError> {
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length).map_err(|_| {
-        format!(
-            "cannot allocate {} of host payload for layer {layer}",
-            ByteSize::from_bytes(u64::try_from(length).unwrap_or(u64::MAX))
-        )
-    })?;
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| BenchError::HostAllocation {
+            layer,
+            bytes: ByteSize::from_bytes(u64::try_from(length).unwrap_or(u64::MAX)),
+        })?;
     bytes.resize(length, 0);
     let mut state = u64::from(layer).wrapping_mul(0xD1B5_4A32_D192_ED03);
     for chunk in bytes.chunks_mut(size_of::<u64>()) {
@@ -155,7 +169,7 @@ pub(crate) fn payload(
 pub(crate) fn payloads(
     graph: &Graph,
     length: usize,
-) -> Result<BTreeMap<TensorId, Vec<u8>>, String> {
+) -> Result<BTreeMap<TensorId, Vec<u8>>, BenchError> {
     (0_u32..)
         .zip(graph.weights())
         .map(|(layer, weight)| Ok((weight.tensor, payload(layer, length)?)))
@@ -192,13 +206,14 @@ mod tests {
         round_order,
         slot_budget,
     };
+    use crate::bench::error::BenchError;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
     fn sizes(
         layers: u32,
         weight_mib: u64,
-    ) -> Result<Result<Sizes, String>, Box<dyn Error>> {
+    ) -> Result<Result<Sizes, BenchError>, Box<dyn Error>> {
         Ok(Sizes::new(
             NonZeroU32::new(layers).ok_or("zero layers")?,
             NonZeroU64::new(weight_mib).ok_or("zero weight")?,
@@ -222,12 +237,18 @@ mod tests {
 
     #[test]
     fn size_overflow_is_reported() -> TestResult {
-        let error = sizes(1, u64::MAX)?.err().unwrap_or_default();
+        let error = sizes(1, u64::MAX)?
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
         assert!(
             error.contains("overflows"),
             "an oversized weight is rejected, got {error:?}"
         );
-        let error = sizes(u32::MAX, 1 << 40)?.err().unwrap_or_default();
+        let error = sizes(u32::MAX, 1 << 40)?
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
         assert!(
             error.contains("overflow"),
             "an oversized payload is rejected, got {error:?}"
@@ -245,19 +266,20 @@ mod tests {
         );
         let error = aligned_slot(ByteSize::from_bytes(u64::MAX - 1), alignment)
             .err()
+            .map(|error| error.to_string())
             .unwrap_or_default();
         assert!(
             error.contains("overflows"),
             "an overflowing slot is rejected, got {error:?}"
         );
         let limit = ByteSize::from_bytes(1024);
-        assert_eq!(
-            check_buffer_limit(limit, limit),
-            Ok(()),
+        assert!(
+            check_buffer_limit(limit, limit).is_ok(),
             "a slot at the limit fits"
         );
         let error = check_buffer_limit(ByteSize::from_bytes(1025), limit)
             .err()
+            .map(|error| error.to_string())
             .unwrap_or_default();
         assert!(
             error.contains("exceeds the 1.0 KiB Metal buffer length limit"),

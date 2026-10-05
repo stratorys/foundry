@@ -20,6 +20,13 @@ impl ByteSize {
 
     pub const fn bytes(self) -> u64 { self.0 }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "no lossless conversion from u64 to f64 exists; rounding is acceptable for \
+                  display and throughput"
+    )]
+    pub const fn to_f64_lossy(self) -> f64 { self.0 as f64 }
+
     pub fn checked_add(
         self,
         other: Self,
@@ -44,7 +51,7 @@ impl ByteSize {
         self,
         alignment: Alignment,
     ) -> Result<Self, CoreError> {
-        let mask = alignment.bytes() - 1;
+        let mask = alignment.bytes().saturating_sub(1);
         self.0
             .checked_add(mask)
             .map(|bytes| Self(bytes & !mask))
@@ -59,7 +66,11 @@ impl fmt::Display for ByteSize {
     ) -> fmt::Result {
         let units = [(GIB, "GiB"), (MIB, "MiB"), (KIB, "KiB")];
         match units.into_iter().find(|&(size, _)| self.0 >= size) {
-            Some((size, unit)) => write!(formatter, "{:.1} {unit}", self.0 as f64 / size as f64),
+            Some((size, unit)) => write!(
+                formatter,
+                "{:.1} {unit}",
+                self.to_f64_lossy() / Self(size).to_f64_lossy()
+            ),
             None => write!(formatter, "{} B", self.0),
         }
     }

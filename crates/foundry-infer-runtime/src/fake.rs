@@ -388,9 +388,9 @@ impl Backend for FakeBackend {
 
     fn copy_to_device(
         &mut self,
-        stream: &FakeStream,
+        stream: &mut FakeStream,
         source: &FakeBuffer,
-        destination: &FakeBuffer,
+        destination: &mut FakeBuffer,
     ) -> Result<FakeEvent, FakeError> {
         let call = self.call(Operation::Copy)?;
         let work = self.submit(
@@ -411,7 +411,7 @@ impl Backend for FakeBackend {
 
     fn synthetic_compute(
         &mut self,
-        stream: &FakeStream,
+        stream: &mut FakeStream,
         op: OpId,
         weights: &[&FakeBuffer],
         duration_hint: Option<Duration>,
@@ -436,7 +436,7 @@ impl Backend for FakeBackend {
 
     fn wait_stream(
         &mut self,
-        stream: &FakeStream,
+        stream: &mut FakeStream,
         event: &FakeEvent,
     ) -> Result<(), FakeError> {
         let call = self.call(Operation::StreamWait)?;

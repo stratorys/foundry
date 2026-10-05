@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::error::Error;
 use std::num::NonZeroU32;
 use std::time::{
     Duration,
@@ -9,7 +8,6 @@ use std::time::{
 use foundry_infer_core::{
     ByteSize,
     Graph,
-    Id,
     MemoryBudget,
     MemorySpace,
     Op,
@@ -30,6 +28,11 @@ use foundry_infer_runtime::{
     execute,
 };
 
+use crate::bench::error::{
+    BenchError,
+    Phase,
+    Round,
+};
 use crate::bench::stats::{
     Summary,
     speedup,
@@ -70,7 +73,7 @@ pub(crate) fn run(
     sizes: &Sizes,
     warmup: u32,
     iterations: NonZeroU32,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), BenchError> {
     let mut backend = MetalBackend::new()?;
     let prepared = prepare(&backend, sizes)?;
     println!("Foundry synthetic streaming benchmark");
@@ -110,32 +113,31 @@ pub(crate) fn run(
 fn prepare(
     backend: &MetalBackend,
     sizes: &Sizes,
-) -> Result<Prepared, Box<dyn Error>> {
+) -> Result<Prepared, BenchError> {
     if u32::try_from(sizes.weight.bytes()).is_err() {
-        return Err(format!(
-            "the Metal checksum kernel supports weights below 4 GiB, got {}",
-            sizes.weight
-        )
-        .into());
+        return Err(BenchError::WeightTooLargeForKernel {
+            weight: sizes.weight,
+        });
     }
     let alignment = backend.capabilities().alignment;
     let slot = aligned_slot(sizes.weight, alignment)?;
-    check_buffer_limit(slot, backend.max_buffer_length())?;
+    check_buffer_limit(slot, backend.buffer_length_max())?;
     let budget = slot_budget(sizes.weight, alignment)?;
-    let working_set = backend.recommended_working_set();
+    let working_set = backend.working_set_recommended();
     if budget > working_set {
-        return Err(format!(
-            "the device slot budget of {budget} exceeds the {working_set} recommended working set \
-             of {}",
-            backend.device_name()
-        )
-        .into());
+        return Err(BenchError::BudgetExceedsWorkingSet {
+            budget,
+            working_set,
+            device: backend.device_name(),
+        });
     }
     let budget = MemoryBudget::new(MemorySpace::Device, budget);
     let graph = synthetic_chain_graph(sizes.layers, sizes.weight, None)?;
     let mut configurations = Vec::new();
     for buffers in BUFFER_COUNTS {
-        let slots = NonZeroU32::new(buffers).ok_or("buffer counts are positive")?;
+        let slots = NonZeroU32::new(buffers).ok_or(BenchError::InvalidBufferCount {
+            buffers,
+        })?;
         let plan = synthetic_chain_plan(&graph, slots, alignment)?;
         plan.validate(&graph, budget)?;
         let peak = planned_peak(&plan)?;
@@ -159,22 +161,26 @@ fn prepare(
 fn expected(
     graph: &Graph,
     payloads: &BTreeMap<TensorId, Vec<u8>>,
-) -> Result<Vec<(OpId, u32)>, Box<dyn Error>> {
+) -> Result<Vec<(OpId, u32)>, BenchError> {
     graph
         .ops()
         .map(|(op, desc)| match desc {
             Op::SyntheticCompute {
                 inputs, ..
             } => {
-                let tensor = inputs.get(1).ok_or("a synthetic layer has no weight")?;
-                let payload = payloads
-                    .get(tensor)
-                    .ok_or("a layer weight has no payload")?;
+                let tensor = inputs.get(1).ok_or(BenchError::MissingWeight {
+                    op,
+                })?;
+                let payload = payloads.get(tensor).ok_or(BenchError::MissingPayload {
+                    tensor: *tensor,
+                })?;
                 Ok((op, reference_checksum(payload)))
             }
             Op::MatMul {
                 ..
-            } => Err("the synthetic workload has no matmul".into()),
+            } => Err(BenchError::UnsupportedOp {
+                op,
+            }),
         })
         .collect()
 }
@@ -184,7 +190,7 @@ fn measure(
     prepared: &Prepared,
     warmup: u32,
     iterations: NonZeroU32,
-) -> Result<Vec<Measurement>, Box<dyn Error>> {
+) -> Result<Vec<Measurement>, BenchError> {
     let weights: BTreeMap<TensorId, &[u8]> = prepared
         .payloads
         .iter()
@@ -192,16 +198,30 @@ fn measure(
         .collect();
     let rounds = warmup
         .checked_add(iterations.get())
-        .ok_or("warmup and measured iterations overflow")?;
+        .ok_or(BenchError::RoundsOverflow {
+            warmup,
+            iterations,
+        })?;
     let mut samples: BTreeMap<u32, Vec<Duration>> = BTreeMap::new();
     for round in 0..rounds {
-        let phase = if round < warmup { "warmup" } else { "measured" };
+        let phase = if round < warmup {
+            Phase::Warmup
+        } else {
+            Phase::Measured
+        };
         for buffers in round_order(round) {
             let configuration = prepared
                 .configurations
                 .iter()
                 .find(|configuration| configuration.buffers == buffers)
-                .ok_or("missing buffer configuration")?;
+                .ok_or(BenchError::MissingConfiguration {
+                    buffers,
+                })?;
+            let context = Round {
+                phase,
+                index: round,
+                buffers,
+            };
             let start = Instant::now();
             execute(
                 backend,
@@ -210,16 +230,16 @@ fn measure(
                 prepared.budget,
                 &weights,
             )
-            .map_err(|error| {
-                format!("{phase} round {round} with {buffers} buffers failed: {error}")
+            .map_err(|source| BenchError::Execution {
+                round: context,
+                source,
             })?;
-            backend.drain().map_err(|error| {
-                format!("{phase} round {round} with {buffers} buffers failed to drain: {error}")
+            backend.drain().map_err(|source| BenchError::Drain {
+                round: context,
+                source,
             })?;
             let elapsed = start.elapsed();
-            verify(backend, prepared).map_err(|error| {
-                format!("{phase} round {round} with {buffers} buffers: {error}")
-            })?;
+            verify(backend, prepared, context)?;
             backend.clear_checksums();
             if round >= warmup {
                 samples.entry(buffers).or_default().push(elapsed);
@@ -240,52 +260,59 @@ fn measure(
 fn verify(
     backend: &MetalBackend,
     prepared: &Prepared,
-) -> Result<(), Box<dyn Error>> {
-    for &(op, expected) in &prepared.expected {
-        let actual = backend.checksums(op)?;
-        if actual != [expected] {
-            return Err(format!(
-                "layer {} checksum mismatch: expected {expected:#010x}, got {actual:#010x?}",
-                op.index()
-            )
-            .into());
+    round: Round,
+) -> Result<(), BenchError> {
+    prepared.expected.iter().try_for_each(|&(op, expected)| {
+        let actual = backend
+            .checksums(op)
+            .map_err(|source| BenchError::ChecksumRead {
+                round,
+                op,
+                source,
+            })?;
+        if actual == [expected] {
+            Ok(())
+        } else {
+            Err(BenchError::ChecksumMismatch {
+                round,
+                op,
+                expected,
+                actual,
+            })
         }
-    }
-    Ok(())
+    })
 }
 
 fn report(
     total: ByteSize,
     measurements: &[Measurement],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), BenchError> {
     let summaries = measurements
         .iter()
         .map(|measurement| {
             Summary::new(&measurement.samples)
                 .map(|summary| (measurement, summary))
-                .ok_or_else(|| format!("{} buffers have no samples", measurement.buffers))
+                .ok_or(BenchError::NoSamples {
+                    buffers: measurement.buffers,
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let baseline = summaries
         .iter()
         .find(|(measurement, _)| measurement.buffers == 1)
         .map(|(_, summary)| summary.median)
-        .ok_or("the one-buffer baseline is missing")?;
+        .ok_or(BenchError::MissingBaseline)?;
     let rows = summaries
         .into_iter()
         .map(|(measurement, summary)| {
-            let undefined = || {
-                format!(
-                    "the median elapsed time with {} buffers is zero; throughput and speedup are \
-                     undefined",
-                    measurement.buffers
-                )
+            let undefined = || BenchError::ZeroMedian {
+                buffers: measurement.buffers,
             };
             let throughput = throughput_gib_s(total, summary.median).ok_or_else(undefined)?;
             let speedup = speedup(baseline, summary.median).ok_or_else(undefined)?;
             Ok((measurement, summary, throughput, speedup))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, BenchError>>()?;
     println!(
         "{:>7}  {:>12}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}",
         "buffers", "peak slots", "median ms", "min ms", "max ms", "GiB/s", "speedup"
