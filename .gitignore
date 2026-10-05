@@ -3,3 +3,5 @@
 .DS_Store
 *.safetensors
 *.gguf
+__pycache__/
+*.pyc
