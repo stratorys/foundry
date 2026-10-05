@@ -16,6 +16,8 @@ clap.workspace = true
 foundry-infer-core.workspace = true
 foundry-infer-plan.workspace = true
 foundry-infer-runtime = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 foundry-infer-metal = { workspace = true, optional = true }
@@ -27,6 +29,9 @@ metal = ["dep:foundry-infer-metal", "dep:foundry-infer-runtime"]
 [dev-dependencies]
 foundry-infer-core.workspace = true
 foundry-infer-plan.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

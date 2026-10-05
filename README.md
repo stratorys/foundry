@@ -25,9 +25,9 @@ contract, with a fake backend for tests and cleanup of submitted work on failure
 The Metal backend executes synthetic workloads on the GPU.
 
 There are no inference kernels or general-purpose scheduler yet. A synthetic
-streaming benchmark measures end-to-end runtime execution on Metal, but
-transfer/compute overlap and performance relative to the legacy engine have not
-been measured.
+streaming benchmark measures end-to-end runtime execution on Metal and exports
+raw samples, provenance, statistics, traces and memory accounting.
+Transfer/compute overlap has not been established.
 
 ## Metal
 
@@ -37,9 +37,7 @@ Command queues and events provide synchronization, and submitted resources are
 retained until their work completes. Tests cover execution with one, two, and
 three resident buffers, plus cleanup after submission failures.
 
-The backend does not yet claim concurrent copy and compute. Foundry does not
-depend on the legacy `metal-infer-rs` repository; any future reuse of its code
-will be evaluated against a performance baseline measured in that repository.
+The backend does not yet claim concurrent copy and compute.
 
 ## Workspace
 
@@ -74,8 +72,9 @@ cargo run --release -p foundry-infer-cli --features metal -- \
 ```
 
 Defaults are `--backend metal --layers 48 --weight-mib 64 --iterations 10
---warmup 2`. Layers, weight size, and iterations must be positive; warmup may be
-zero. Without the feature, or off macOS, `bench` exits with an error.
+--warmup 2 --bootstrap-resamples 10000 --seed 0`. Layers, weight size,
+iterations and resamples must be positive; warmup may be zero. Without the
+feature, or off macOS, `bench` exits with an error.
 
 Protocol:
 
@@ -92,10 +91,19 @@ Protocol:
 - After every execution, outside timing, the checksum of every layer is verified
   and the checksum results are released with `clear_checksums()`. Any execution
   or checksum error aborts the benchmark.
-- For each buffer count, the report gives median (the mean of the two middle
-  samples for even counts), minimum and maximum time, end-to-end effective
-  payload throughput (logical weight bytes / median, in GiB of 2^30 bytes), and
-  speedup against the one-buffer median.
+- For each buffer count, the console gives median, mean, standard deviation,
+  minimum and maximum time, 95% bootstrap intervals, end-to-end effective payload
+  throughput (logical weight bytes / median, in GiB of 2^30 bytes), and speedup
+  against the one-buffer median with a paired 95% interval.
+
+`--report PATH` writes a versioned JSON report with every execution, build and
+runtime provenance, environment, protocol and statistics. `--trace PATH`
+(requires `--report`) also writes a Chrome Trace for Perfetto, with CPU and GPU
+command-buffer tracks and allocation accounting. Neither overwrites an existing
+file. See [docs/benchmark.md](docs/benchmark.md) for the schema, the statistical
+method, timing semantics and memory limitations, and
+`scripts/bench_summary.py` to recalculate a report offline with
+`uv run --script`.
 
 Memory: the host keeps `layers x weight` bytes of payload (3 GiB by default),
 plus transient shared staging buffers during execution. The device slot budget
@@ -127,6 +135,10 @@ Require actual GPU execution when validating the backend:
 FOUNDRY_REQUIRE_METAL=1 cargo test -p foundry-infer-metal
 FOUNDRY_REQUIRE_METAL=1 cargo test -p foundry-infer-cli --features metal
 ```
+
+The offline recalculation tests run `scripts/bench_summary.py` with
+[uv](https://docs.astral.sh/uv/) and skip when it is missing; set
+`FOUNDRY_REQUIRE_UV=1` to require them.
 
 ## License
 

@@ -1,8 +1,12 @@
 use std::error::Error;
-use std::fmt;
 use std::num::{
     NonZeroU32,
     NonZeroU64,
+};
+use std::path::PathBuf;
+use std::{
+    fmt,
+    io,
 };
 
 use foundry_infer_core::{
@@ -121,12 +125,47 @@ pub(crate) enum BenchError {
         expected: u32,
         actual: Vec<u32>,
     },
-    NoSamples {
-        buffers: u32,
+    ResamplesTooLarge {
+        count: NonZeroU32,
+        max: u32,
     },
-    MissingBaseline,
-    ZeroMedian {
-        buffers: u32,
+    OutputName {
+        path: PathBuf,
+    },
+    OutputDirectory {
+        path: PathBuf,
+        source: io::Error,
+    },
+    OutputExists {
+        path: PathBuf,
+    },
+    OutputConflict {
+        path: PathBuf,
+    },
+    OutputWrite {
+        path: PathBuf,
+        source: io::Error,
+    },
+    OutputSerialize {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    TraceWithoutReport,
+    BuildProvenance(serde_json::Error),
+    DiagnosticBudget {
+        what: &'static str,
+    },
+    GpuTimingGate {
+        invalid: u64,
+    },
+    Statistics(String),
+    Reported {
+        source: Box<BenchError>,
+        report: PathBuf,
+    },
+    ExportAfterFailure {
+        source: Box<BenchError>,
+        export: Box<BenchError>,
     },
     Core(CoreError),
     Graph(GraphError),
@@ -256,16 +295,81 @@ impl fmt::Display for BenchError {
                  {actual:#010x?}",
                 op.index()
             ),
-            Self::NoSamples {
-                buffers,
-            } => write!(formatter, "{buffers} buffers have no samples"),
-            Self::MissingBaseline => formatter.write_str("the one-buffer baseline is missing"),
-            Self::ZeroMedian {
-                buffers,
+            Self::ResamplesTooLarge {
+                count,
+                max,
             } => write!(
                 formatter,
-                "the median elapsed time with {buffers} buffers is zero; throughput and speedup \
-                 are undefined"
+                "--bootstrap-resamples {count} exceeds the supported maximum of {max}"
+            ),
+            Self::OutputName {
+                path,
+            } => write!(formatter, "output path {} has no file name", path.display()),
+            Self::OutputDirectory {
+                path,
+                source,
+            } => write!(
+                formatter,
+                "the directory of output {} is not usable: {source}",
+                path.display()
+            ),
+            Self::OutputExists {
+                path,
+            } => write!(
+                formatter,
+                "{} already exists; choose a new output path",
+                path.display()
+            ),
+            Self::OutputConflict {
+                path,
+            } => write!(
+                formatter,
+                "--report and --trace name the same file {}",
+                path.display()
+            ),
+            Self::OutputWrite {
+                path,
+                source,
+            } => write!(formatter, "cannot write {}: {source}", path.display()),
+            Self::OutputSerialize {
+                path,
+                source,
+            } => write!(formatter, "cannot serialize {}: {source}", path.display()),
+            Self::TraceWithoutReport => formatter.write_str("--trace requires --report"),
+            Self::BuildProvenance(error) => {
+                write!(
+                    formatter,
+                    "the embedded build provenance is invalid: {error}"
+                )
+            }
+            Self::DiagnosticBudget {
+                what,
+            } => write!(
+                formatter,
+                "the diagnostic storage needed for {what} overflows; reduce the rounds or layers"
+            ),
+            Self::GpuTimingGate {
+                invalid,
+            } => write!(
+                formatter,
+                "GPU timing acceptance gate failed: {invalid} command buffers lack valid \
+                 GPUStartTime/GPUEndTime timestamps"
+            ),
+            Self::Statistics(reason) => write!(formatter, "cannot summarize the samples: {reason}"),
+            Self::Reported {
+                source,
+                report,
+            } => write!(
+                formatter,
+                "{source} (failure report written to {})",
+                report.display()
+            ),
+            Self::ExportAfterFailure {
+                source,
+                export,
+            } => write!(
+                formatter,
+                "{source}; exporting the failure report also failed: {export}"
             ),
             Self::Core(error) => write!(formatter, "{error}"),
             Self::Graph(error) => write!(formatter, "{error}"),
@@ -368,13 +472,42 @@ impl Error for BenchError {
             | Self::ChecksumMismatch {
                 ..
             }
-            | Self::NoSamples {
+            | Self::ResamplesTooLarge {
                 ..
             }
-            | Self::MissingBaseline
-            | Self::ZeroMedian {
+            | Self::OutputName {
                 ..
-            } => None,
+            }
+            | Self::OutputExists {
+                ..
+            }
+            | Self::OutputConflict {
+                ..
+            }
+            | Self::TraceWithoutReport
+            | Self::DiagnosticBudget {
+                ..
+            }
+            | Self::GpuTimingGate {
+                ..
+            }
+            | Self::Statistics(_) => None,
+            Self::OutputDirectory {
+                source, ..
+            }
+            | Self::OutputWrite {
+                source, ..
+            } => Some(source),
+            Self::OutputSerialize {
+                source, ..
+            } => Some(source),
+            Self::BuildProvenance(error) => Some(error),
+            Self::Reported {
+                source, ..
+            }
+            | Self::ExportAfterFailure {
+                source, ..
+            } => Some(source.as_ref()),
             #[cfg(not(all(feature = "metal", target_os = "macos")))]
             Self::MetalUnavailable => None,
         }

@@ -30,6 +30,14 @@ use crate::error::{
     ExecutionFailure,
     RuntimeError,
 };
+use crate::observe::{
+    CommandContext,
+    CpuActivity,
+    CpuRecord,
+    ExecutionObserver,
+    ExecutionOutcome,
+    Unobserved,
+};
 
 pub fn execute<B: Backend>(
     backend: &mut B,
@@ -38,14 +46,33 @@ pub fn execute<B: Backend>(
     budget: MemoryBudget,
     weights: &BTreeMap<TensorId, &[u8]>,
 ) -> Result<(), RuntimeError<B::Error>> {
-    let durations = preflight(backend, graph, plan, budget, weights)?;
-    let mut run = Run::new(backend, durations, weights);
+    execute_observed(backend, graph, plan, budget, weights, &mut Unobserved)
+}
+
+pub fn execute_observed<B: Backend, O: ExecutionObserver>(
+    backend: &mut B,
+    graph: &Graph,
+    plan: &ExecutionPlan,
+    budget: MemoryBudget,
+    weights: &BTreeMap<TensorId, &[u8]>,
+    observer: &mut O,
+) -> Result<(), RuntimeError<B::Error>> {
+    let durations = match preflight(backend, graph, plan, budget, weights) {
+        Ok(durations) => durations,
+        Err(error) => {
+            observer.finish(ExecutionOutcome::Rejected);
+            return Err(error);
+        }
+    };
+    let mut run = Run::new(backend, observer, durations, weights);
     match run.commands(plan.commands()) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            run.observer.finish(ExecutionOutcome::Completed);
+            Ok(())
+        }
         Err(failure) => Err(run.fail(failure)),
     }
 }
-
 fn preflight<B: Backend>(
     backend: &B,
     graph: &Graph,
@@ -143,8 +170,35 @@ fn streams(commands: &[Command]) -> BTreeSet<StreamId> {
         .collect()
 }
 
-struct Run<'run, B: Backend> {
+fn byte_len(bytes: &[u8]) -> ByteSize {
+    u64::try_from(bytes.len()).map_or(ByteSize::from_bytes(u64::MAX), ByteSize::from_bytes)
+}
+
+fn observed<B: Backend, O: ExecutionObserver, T>(
+    backend: &mut B,
+    observer: &mut O,
+    activity: CpuActivity,
+    context: CommandContext<'_>,
+    call: impl FnOnce(&mut B) -> Result<T, B::Error>,
+) -> Result<T, B::Error> {
+    backend.annotate(Some(&context));
+    let start = observer.now();
+    let result = call(backend);
+    let end = observer.now();
+    backend.annotate(None);
+    observer.record(CpuRecord {
+        context,
+        activity,
+        start,
+        end,
+        succeeded: result.is_ok(),
+    });
+    result
+}
+
+struct Run<'run, B: Backend, O: ExecutionObserver> {
     backend: &'run mut B,
+    observer: &'run mut O,
     durations: BTreeMap<OpId, Option<Duration>>,
     weights: &'run BTreeMap<TensorId, &'run [u8]>,
     streams: BTreeMap<StreamId, B::Stream>,
@@ -154,14 +208,16 @@ struct Run<'run, B: Backend> {
     submitted: bool,
 }
 
-impl<'run, B: Backend> Run<'run, B> {
+impl<'run, B: Backend, O: ExecutionObserver> Run<'run, B, O> {
     fn new(
         backend: &'run mut B,
+        observer: &'run mut O,
         durations: BTreeMap<OpId, Option<Duration>>,
         weights: &'run BTreeMap<TensorId, &'run [u8]>,
     ) -> Self {
         Self {
             backend,
+            observer,
             durations,
             weights,
             streams: BTreeMap::new(),
@@ -189,15 +245,23 @@ impl<'run, B: Backend> Run<'run, B> {
         &mut self,
         stream: StreamId,
     ) -> Result<(), ExecutionFailure<B::Error>> {
-        let created = self
-            .backend
-            .create_stream()
-            .map_err(|source| ExecutionFailure::Backend {
-                operation: BackendOperation::CreateStream {
-                    stream,
-                },
-                source,
-            })?;
+        let context = CommandContext {
+            stream: Some(stream),
+            ..CommandContext::default()
+        };
+        let created = observed(
+            self.backend,
+            self.observer,
+            CpuActivity::CreateStream,
+            context,
+            |backend| backend.create_stream(),
+        )
+        .map_err(|source| ExecutionFailure::Backend {
+            operation: BackendOperation::CreateStream {
+                stream,
+            },
+            source,
+        })?;
         self.streams.insert(stream, created);
         Ok(())
     }
@@ -244,16 +308,26 @@ impl<'run, B: Backend> Run<'run, B> {
         slot: BufferSlot,
         bytes: ByteSize,
     ) -> Result<(), ExecutionFailure<B::Error>> {
-        let buffer =
-            self.backend
-                .allocate_device(bytes)
-                .map_err(|source| ExecutionFailure::Backend {
-                    operation: BackendOperation::Allocate {
-                        index,
-                        slot,
-                    },
-                    source,
-                })?;
+        let context = CommandContext {
+            index: Some(index),
+            slot: Some(slot),
+            bytes: Some(bytes),
+            ..CommandContext::default()
+        };
+        let buffer = observed(
+            self.backend,
+            self.observer,
+            CpuActivity::Allocate,
+            context,
+            |backend| backend.allocate_device(bytes),
+        )
+        .map_err(|source| ExecutionFailure::Backend {
+            operation: BackendOperation::Allocate {
+                index,
+                slot,
+            },
+            source,
+        })?;
         self.slots.insert(slot, buffer);
         Ok(())
     }
@@ -287,31 +361,48 @@ impl<'run, B: Backend> Run<'run, B> {
                 index,
                 slot,
             })?;
-        let staging =
-            self.backend
-                .allocate_host(contents)
-                .map_err(|source| ExecutionFailure::Backend {
-                    operation: BackendOperation::StageHost {
-                        index,
-                        tensor,
-                    },
-                    source,
-                })?;
+        let context = CommandContext {
+            index: Some(index),
+            tensor: Some(tensor),
+            slot: Some(slot),
+            stream: Some(stream),
+            event: Some(event),
+            bytes: Some(byte_len(contents)),
+            ..CommandContext::default()
+        };
+        let staging = observed(
+            self.backend,
+            self.observer,
+            CpuActivity::Stage,
+            context,
+            |backend| backend.allocate_host(contents),
+        )
+        .map_err(|source| ExecutionFailure::Backend {
+            operation: BackendOperation::StageHost {
+                index,
+                tensor,
+            },
+            source,
+        })?;
         self.submitted = true;
         let source = self.staging.insert(staging);
-        let completion = self
-            .backend
-            .copy_to_device(queue, source, destination)
-            .map_err(|source| ExecutionFailure::Backend {
-                operation: BackendOperation::Copy {
-                    index,
-                    tensor,
-                    slot,
-                    stream,
-                    event,
-                },
-                source,
-            })?;
+        let completion = observed(
+            self.backend,
+            self.observer,
+            CpuActivity::SubmitCopy,
+            context,
+            |backend| backend.copy_to_device(queue, source, destination),
+        )
+        .map_err(|source| ExecutionFailure::Backend {
+            operation: BackendOperation::Copy {
+                index,
+                tensor,
+                slot,
+                stream,
+                event,
+            },
+            source,
+        })?;
         self.staging = None;
         self.events.insert(event, completion);
         Ok(())
@@ -338,16 +429,27 @@ impl<'run, B: Backend> Run<'run, B> {
                 event,
             })?;
         self.submitted = true;
-        self.backend
-            .wait_stream(queue, completion)
-            .map_err(|source| ExecutionFailure::Backend {
-                operation: BackendOperation::StreamWait {
-                    index,
-                    stream,
-                    event,
-                },
-                source,
-            })
+        let context = CommandContext {
+            index: Some(index),
+            stream: Some(stream),
+            event: Some(event),
+            ..CommandContext::default()
+        };
+        observed(
+            self.backend,
+            self.observer,
+            CpuActivity::StreamWait,
+            context,
+            |backend| backend.wait_stream(queue, completion),
+        )
+        .map_err(|source| ExecutionFailure::Backend {
+            operation: BackendOperation::StreamWait {
+                index,
+                stream,
+                event,
+            },
+            source,
+        })
     }
 
     fn wait_host(
@@ -362,15 +464,25 @@ impl<'run, B: Backend> Run<'run, B> {
                 index,
                 event,
             })?;
-        self.backend
-            .wait_host(completion)
-            .map_err(|source| ExecutionFailure::Backend {
-                operation: BackendOperation::HostWait {
-                    index,
-                    event,
-                },
-                source,
-            })
+        let context = CommandContext {
+            index: Some(index),
+            event: Some(event),
+            ..CommandContext::default()
+        };
+        observed(
+            self.backend,
+            self.observer,
+            CpuActivity::HostWait,
+            context,
+            |backend| backend.wait_host(completion),
+        )
+        .map_err(|source| ExecutionFailure::Backend {
+            operation: BackendOperation::HostWait {
+                index,
+                event,
+            },
+            source,
+        })
     }
 
     fn launch(
@@ -403,19 +515,38 @@ impl<'run, B: Backend> Run<'run, B> {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let bytes = bindings
+            .iter()
+            .try_fold(ByteSize::default(), |total, binding| {
+                let weight = self.weights.get(&binding.tensor)?;
+                total.checked_add(byte_len(weight)).ok()
+            });
         self.submitted = true;
-        let completion = self
-            .backend
-            .synthetic_compute(queue, op, &weights, duration_hint)
-            .map_err(|source| ExecutionFailure::Backend {
-                operation: BackendOperation::Launch {
-                    index,
-                    op,
-                    stream,
-                    event,
-                },
-                source,
-            })?;
+        let context = CommandContext {
+            index: Some(index),
+            op: Some(op),
+            bindings,
+            stream: Some(stream),
+            event: Some(event),
+            bytes,
+            ..CommandContext::default()
+        };
+        let completion = observed(
+            self.backend,
+            self.observer,
+            CpuActivity::SubmitLaunch,
+            context,
+            |backend| backend.synthetic_compute(queue, op, &weights, duration_hint),
+        )
+        .map_err(|source| ExecutionFailure::Backend {
+            operation: BackendOperation::Launch {
+                index,
+                op,
+                stream,
+                event,
+            },
+            source,
+        })?;
         self.events.insert(event, completion);
         Ok(())
     }
@@ -425,13 +556,29 @@ impl<'run, B: Backend> Run<'run, B> {
         index: usize,
         slot: BufferSlot,
     ) -> Result<(), ExecutionFailure<B::Error>> {
-        self.slots
+        let buffer = self
+            .slots
             .remove(&slot)
-            .map(drop)
             .ok_or(ExecutionFailure::MissingSlot {
                 index,
                 slot,
-            })
+            })?;
+        let context = CommandContext {
+            index: Some(index),
+            slot: Some(slot),
+            ..CommandContext::default()
+        };
+        let start = self.observer.now();
+        drop(buffer);
+        let end = self.observer.now();
+        self.observer.record(CpuRecord {
+            context,
+            activity: CpuActivity::Release,
+            start,
+            end,
+            succeeded: true,
+        });
+        Ok(())
     }
 
     fn fail(
@@ -439,7 +586,14 @@ impl<'run, B: Backend> Run<'run, B> {
         failure: ExecutionFailure<B::Error>,
     ) -> RuntimeError<B::Error> {
         let cleanup = if self.submitted {
-            self.backend.drain().err()
+            observed(
+                self.backend,
+                self.observer,
+                CpuActivity::CleanupDrain,
+                CommandContext::default(),
+                |backend| backend.drain(),
+            )
+            .err()
         } else {
             None
         };
@@ -449,6 +603,30 @@ impl<'run, B: Backend> Run<'run, B> {
             mem::forget(mem::take(&mut self.events));
             mem::forget(mem::take(&mut self.streams));
         }
+        let operation = match &failure {
+            ExecutionFailure::Backend {
+                operation, ..
+            } => Some(*operation),
+            ExecutionFailure::MissingStream {
+                ..
+            }
+            | ExecutionFailure::MissingSlot {
+                ..
+            }
+            | ExecutionFailure::MissingEvent {
+                ..
+            }
+            | ExecutionFailure::MissingOp {
+                ..
+            }
+            | ExecutionFailure::MissingHostWeight {
+                ..
+            } => None,
+        };
+        self.observer.finish(ExecutionOutcome::Failed {
+            operation,
+            cleanup_failed: cleanup.is_some(),
+        });
         RuntimeError::Execution {
             failure,
             cleanup,
@@ -495,6 +673,7 @@ mod tests {
     use super::{
         Run,
         execute,
+        execute_observed,
     };
     use crate::error::{
         BackendOperation,
@@ -506,6 +685,13 @@ mod tests {
         FakeBackend,
         FakeError,
         Operation,
+    };
+    use crate::observe::{
+        CpuActivity,
+        CpuRecord,
+        ExecutionObserver,
+        ExecutionOutcome,
+        Unobserved,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1428,7 +1614,8 @@ mod tests {
         let weights = bindings(&payloads);
         let durations = BTreeMap::from([(OpId::from_index(0), Some(HINT))]);
         let [allocate, prefetch, wait, ..] = layer_commands(0, 0);
-        let mut run = Run::new(backend, durations, &weights);
+        let mut observer = Unobserved;
+        let mut run = Run::new(backend, &mut observer, durations, &weights);
         run.create_stream(COPY)?;
         run.command(0, &allocate)?;
         run.command(1, &prefetch)?;
@@ -1654,6 +1841,376 @@ mod tests {
             "neither the slot nor the staging buffer of the failed copy is released"
         );
         check_lifetimes(&log)?;
+        Ok(())
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Recorded {
+        activity: CpuActivity,
+        index: Option<usize>,
+        op: Option<OpId>,
+        tensor: Option<TensorId>,
+        slot: Option<BufferSlot>,
+        bindings: Vec<WeightBinding>,
+        stream: Option<StreamId>,
+        event: Option<EventId>,
+        bytes: Option<ByteSize>,
+        start: u64,
+        end: u64,
+        succeeded: bool,
+    }
+
+    type Observed = (Result<(), RuntimeError<FakeError>>, Recorder);
+
+    #[derive(Default)]
+    struct Recorder {
+        clock: u64,
+        records: Vec<Recorded>,
+        outcomes: Vec<ExecutionOutcome>,
+    }
+
+    impl ExecutionObserver for Recorder {
+        type Instant = u64;
+
+        fn now(&mut self) -> u64 {
+            self.clock = self.clock.saturating_add(1);
+            self.clock
+        }
+
+        fn record(
+            &mut self,
+            record: CpuRecord<'_, u64>,
+        ) {
+            let context = record.context;
+            self.records.push(Recorded {
+                activity: record.activity,
+                index: context.index,
+                op: context.op,
+                tensor: context.tensor,
+                slot: context.slot,
+                bindings: context.bindings.to_vec(),
+                stream: context.stream,
+                event: context.event,
+                bytes: context.bytes,
+                start: record.start,
+                end: record.end,
+                succeeded: record.succeeded,
+            });
+        }
+
+        fn finish(
+            &mut self,
+            outcome: ExecutionOutcome,
+        ) {
+            self.outcomes.push(outcome);
+        }
+    }
+
+    fn observe(
+        backend: &mut FakeBackend,
+        graph: &Graph,
+        plan: &ExecutionPlan,
+    ) -> Result<Observed, Box<dyn Error>> {
+        let payloads = payloads(graph)?;
+        let mut recorder = Recorder::default();
+        let result = execute_observed(
+            backend,
+            graph,
+            plan,
+            budget(),
+            &bindings(&payloads),
+            &mut recorder,
+        );
+        Ok((result, recorder))
+    }
+
+    fn activity(command: &Command) -> Vec<CpuActivity> {
+        match command {
+            Command::Allocate {
+                ..
+            } => vec![CpuActivity::Allocate],
+            Command::Prefetch {
+                ..
+            } => vec![CpuActivity::Stage, CpuActivity::SubmitCopy],
+            Command::Wait {
+                target: WaitTarget::Stream(_),
+                ..
+            } => vec![CpuActivity::StreamWait],
+            Command::Wait {
+                target: WaitTarget::Host,
+                ..
+            } => vec![CpuActivity::HostWait],
+            Command::Launch {
+                ..
+            } => vec![CpuActivity::SubmitLaunch],
+            Command::Release {
+                ..
+            } => vec![CpuActivity::Release],
+        }
+    }
+
+    #[test]
+    fn observed_and_unobserved_executions_are_equivalent() -> TestResult {
+        let graph = chain(4)?;
+        for slots in 1..=3 {
+            let plan = buffered(&graph, slots)?;
+            let mut plain = FakeBackend::new(DEVICE)?;
+            let expected = run(&mut plain, &graph, &plan)?;
+            let mut watched = FakeBackend::new(DEVICE)?;
+            let (result, recorder) = observe(&mut watched, &graph, &plan)?;
+            assert_eq!(result, expected, "{slots} slots: same result");
+            assert_eq!(
+                watched.log(),
+                plain.log(),
+                "{slots} slots: same backend calls"
+            );
+            assert_eq!(
+                recorder.outcomes,
+                [ExecutionOutcome::Completed],
+                "{slots} slots: one completed outcome"
+            );
+            let activities: Vec<CpuActivity> = recorder
+                .records
+                .iter()
+                .map(|record| record.activity)
+                .collect();
+            let expected: Vec<CpuActivity> = [CpuActivity::CreateStream, CpuActivity::CreateStream]
+                .into_iter()
+                .chain(plan.commands().iter().flat_map(activity))
+                .collect();
+            assert_eq!(activities, expected, "{slots} slots: one record per call");
+            assert!(
+                recorder
+                    .records
+                    .windows(2)
+                    .all(|pair| matches!(pair, [first, second] if first.end < second.start)),
+                "{slots} slots: records are chronological and disjoint"
+            );
+            assert!(
+                recorder
+                    .records
+                    .iter()
+                    .all(|record| record.start < record.end && record.succeeded),
+                "{slots} slots: every interval is closed and successful"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn records_carry_their_command_context() -> TestResult {
+        let graph = chain(1)?;
+        let plan = buffered(&graph, 1)?;
+        let mut backend = FakeBackend::new(DEVICE)?;
+        let (result, recorder) = observe(&mut backend, &graph, &plan)?;
+        assert_eq!(result, Ok(()), "the plan executes");
+        let base = Recorded {
+            activity: CpuActivity::CreateStream,
+            index: None,
+            op: None,
+            tensor: None,
+            slot: None,
+            bindings: Vec::new(),
+            stream: None,
+            event: None,
+            bytes: None,
+            start: 0,
+            end: 0,
+            succeeded: true,
+        };
+        let copy = Recorded {
+            activity: CpuActivity::Stage,
+            index: Some(1),
+            tensor: Some(weight(0)),
+            slot: Some(slot(0)),
+            stream: Some(COPY),
+            event: Some(event(0)),
+            bytes: Some(ByteSize::from_bytes(WEIGHT)),
+            ..base.clone()
+        };
+        let expected = [
+            Recorded {
+                stream: Some(COPY),
+                ..base.clone()
+            },
+            Recorded {
+                stream: Some(COMPUTE),
+                ..base.clone()
+            },
+            Recorded {
+                activity: CpuActivity::Allocate,
+                index: Some(0),
+                slot: Some(slot(0)),
+                bytes: Some(ByteSize::from_bytes(SLOT)),
+                ..base.clone()
+            },
+            copy.clone(),
+            Recorded {
+                activity: CpuActivity::SubmitCopy,
+                ..copy
+            },
+            Recorded {
+                activity: CpuActivity::StreamWait,
+                index: Some(2),
+                stream: Some(COMPUTE),
+                event: Some(event(0)),
+                ..base.clone()
+            },
+            Recorded {
+                activity: CpuActivity::SubmitLaunch,
+                index: Some(3),
+                op: Some(OpId::from_index(0)),
+                bindings: vec![WeightBinding {
+                    tensor: weight(0),
+                    slot: slot(0),
+                }],
+                stream: Some(COMPUTE),
+                event: Some(event(1)),
+                bytes: Some(ByteSize::from_bytes(WEIGHT)),
+                ..base.clone()
+            },
+            Recorded {
+                activity: CpuActivity::HostWait,
+                index: Some(4),
+                event: Some(event(1)),
+                ..base.clone()
+            },
+            Recorded {
+                activity: CpuActivity::Release,
+                index: Some(5),
+                slot: Some(slot(0)),
+                ..base
+            },
+        ];
+        let actual: Vec<Recorded> = recorder
+            .records
+            .iter()
+            .map(|record| Recorded {
+                start: 0,
+                end: 0,
+                ..record.clone()
+            })
+            .collect();
+        assert_eq!(actual, expected, "every record names its command");
+        Ok(())
+    }
+
+    #[test]
+    fn observed_failures_report_their_outcome_and_cleanup() -> TestResult {
+        let graph = chain(2)?;
+        let plan = buffered(&graph, 2)?;
+        let cases = [
+            (
+                FakeBackend::new(DEVICE)?.fail_on(Operation::AllocateDevice, 0),
+                CpuActivity::Allocate,
+                false,
+                false,
+            ),
+            (
+                FakeBackend::new(DEVICE)?.fail_on(Operation::AllocateHost, 1),
+                CpuActivity::Stage,
+                true,
+                false,
+            ),
+            (
+                FakeBackend::new(DEVICE)?.fail_after_submit(Operation::Copy, 0),
+                CpuActivity::SubmitCopy,
+                true,
+                false,
+            ),
+            (
+                FakeBackend::new(DEVICE)?.fail_on(Operation::Compute, 0),
+                CpuActivity::SubmitLaunch,
+                true,
+                false,
+            ),
+            (
+                FakeBackend::new(DEVICE)?
+                    .fail_on(Operation::HostWait, 0)
+                    .fail_on(Operation::Drain, 0),
+                CpuActivity::HostWait,
+                true,
+                true,
+            ),
+        ];
+        for (mut backend, failed, drained, cleanup_failed) in cases {
+            let (result, recorder) = observe(&mut backend, &graph, &plan)?;
+            let error = result.err().ok_or("the execution fails")?;
+            let operation = match &error {
+                RuntimeError::Execution {
+                    failure:
+                        ExecutionFailure::Backend {
+                            operation, ..
+                        },
+                    ..
+                } => Some(*operation),
+                RuntimeError::Plan(_)
+                | RuntimeError::UnsupportedOp {
+                    ..
+                }
+                | RuntimeError::UnsupportedWeightSource {
+                    ..
+                }
+                | RuntimeError::MissingHostWeight {
+                    ..
+                }
+                | RuntimeError::HostWeightSize {
+                    ..
+                }
+                | RuntimeError::BudgetExceedsDevice {
+                    ..
+                }
+                | RuntimeError::Execution {
+                    ..
+                } => None,
+            };
+            assert!(operation.is_some(), "{failed:?}: a backend operation fails");
+            assert_eq!(
+                recorder.outcomes,
+                [ExecutionOutcome::Failed {
+                    operation,
+                    cleanup_failed,
+                }],
+                "{failed:?}: the outcome names the failure"
+            );
+            let unsuccessful: Vec<CpuActivity> = recorder
+                .records
+                .iter()
+                .filter(|record| !record.succeeded)
+                .map(|record| record.activity)
+                .collect();
+            let expected = if cleanup_failed {
+                vec![failed, CpuActivity::CleanupDrain]
+            } else {
+                vec![failed]
+            };
+            assert_eq!(
+                unsuccessful, expected,
+                "{failed:?}: failed calls are marked"
+            );
+            let last = recorder.records.last().map(|record| record.activity);
+            assert_eq!(
+                last == Some(CpuActivity::CleanupDrain),
+                drained,
+                "{failed:?}: submitted work is drained under observation"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_executions_are_observed_without_records() -> TestResult {
+        let graph = chain(1)?;
+        let plan = buffered(&graph, 1)?;
+        let mut backend = FakeBackend::new(1)?;
+        let (result, recorder) = observe(&mut backend, &graph, &plan)?;
+        assert!(result.is_err(), "the budget exceeds the device");
+        assert_eq!(recorder.records, [], "nothing is recorded");
+        assert_eq!(
+            recorder.outcomes,
+            [ExecutionOutcome::Rejected],
+            "the rejection is reported"
+        );
         Ok(())
     }
 }

@@ -3,6 +3,7 @@ mod error;
 mod execute;
 #[cfg(test)]
 mod fake;
+mod observe;
 
 pub use backend::Backend;
 pub use error::{
@@ -10,4 +11,14 @@ pub use error::{
     ExecutionFailure,
     RuntimeError,
 };
-pub use execute::execute;
+pub use execute::{
+    execute,
+    execute_observed,
+};
+pub use observe::{
+    CommandContext,
+    CpuActivity,
+    CpuRecord,
+    ExecutionObserver,
+    ExecutionOutcome,
+};

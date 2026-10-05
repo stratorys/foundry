@@ -6,27 +6,37 @@ use objc2_metal::{
     MTLBuffer,
     MTLCommandBuffer,
     MTLCommandBufferStatus,
+    MTLDevice,
     MTLEvent,
 };
 
+use crate::diagnostics::{
+    GpuLog,
+    Submission,
+    interval,
+};
 use crate::error::MetalError;
 use crate::pipeline::Pipeline;
+use crate::tracked::TrackedBuffer;
 
 pub(crate) type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 pub(crate) type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub(crate) type Event = Retained<ProtocolObject<dyn MTLEvent>>;
+pub(crate) type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
 struct InFlight {
     command_buffer: CommandBuffer,
-    _buffers: Vec<Buffer>,
+    _buffers: Vec<TrackedBuffer>,
     _events: Vec<Event>,
     _pipeline: Option<Pipeline>,
+    submission: Option<Submission>,
 }
 
 #[derive(Default)]
 pub(crate) struct Submissions {
     in_flight: Vec<InFlight>,
     faults: Vec<MetalError>,
+    log: Option<GpuLog>,
     #[cfg(test)]
     released: Vec<MTLCommandBufferStatus>,
 }
@@ -35,15 +45,17 @@ impl Submissions {
     pub(crate) fn register(
         &mut self,
         command_buffer: CommandBuffer,
-        buffers: Vec<Buffer>,
+        buffers: Vec<TrackedBuffer>,
         events: Vec<Event>,
         pipeline: Option<Pipeline>,
+        submission: Option<Submission>,
     ) {
         self.in_flight.push(InFlight {
             command_buffer,
             _buffers: buffers,
             _events: events,
             _pipeline: pipeline,
+            submission,
         });
     }
 
@@ -76,10 +88,31 @@ impl Submissions {
         errors.into_iter().next().map_or(Ok(()), Err)
     }
 
+    pub(crate) fn record(
+        &mut self,
+        log: GpuLog,
+    ) {
+        self.log = Some(log);
+    }
+
+    pub(crate) fn recording(&self) -> bool { self.log.is_some() }
+
+    pub(crate) fn take_log(&mut self) -> Option<(GpuLog, usize)> {
+        let pending = self
+            .in_flight
+            .iter()
+            .filter(|entry| entry.submission.is_some())
+            .count();
+        self.log.take().map(|log| (log, pending))
+    }
+
     fn release(
         &mut self,
         entry: InFlight,
     ) {
+        if let (Some(log), Some(submission)) = (self.log.as_mut(), entry.submission) {
+            log.push(interval(&entry.command_buffer, submission));
+        }
         #[cfg(test)]
         self.released.push(entry.command_buffer.status());
         drop(entry);

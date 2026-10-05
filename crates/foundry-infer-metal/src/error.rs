@@ -43,6 +43,13 @@ pub enum MetalError {
     GpuWithoutError,
     NotCompleted,
     UnknownOp(OpId),
+    HostClock {
+        status: i32,
+    },
+    DiagnosticsActive,
+    DiagnosticLimit {
+        what: &'static str,
+    },
     #[cfg(test)]
     InjectedFault,
 }
@@ -110,6 +117,22 @@ impl fmt::Display for MetalError {
             }
             Self::NotCompleted => write!(formatter, "Metal command buffer has not completed"),
             Self::UnknownOp(op) => write!(formatter, "op {} was never launched", op.index()),
+            Self::HostClock {
+                status,
+            } => write!(
+                formatter,
+                "the host timebase is unavailable (mach_timebase_info returned {status})"
+            ),
+            Self::DiagnosticsActive => write!(
+                formatter,
+                "Metal diagnostics are already recording an execution"
+            ),
+            Self::DiagnosticLimit {
+                what,
+            } => write!(
+                formatter,
+                "the diagnostic storage limit for {what} overflows or cannot be reserved"
+            ),
             #[cfg(test)]
             Self::InjectedFault => write!(formatter, "injected fault"),
         }

@@ -16,6 +16,7 @@ use foundry_infer_plan::{
 };
 
 use crate::bench::error::BenchError;
+use crate::bench::random::SplitMix64;
 
 pub(crate) const BUFFER_COUNTS: [u32; 3] = [1, 2, 3];
 
@@ -138,13 +139,6 @@ pub(crate) fn planned_peak(plan: &ExecutionPlan) -> Result<ByteSize, BenchError>
     Ok(peak)
 }
 
-fn splitmix(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let first = (*state ^ (*state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    let second = (first ^ (first >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    second ^ (second >> 31)
-}
-
 pub(crate) fn payload(
     layer: u32,
     length: usize,
@@ -157,9 +151,9 @@ pub(crate) fn payload(
             bytes: ByteSize::from_bytes(u64::try_from(length).unwrap_or(u64::MAX)),
         })?;
     bytes.resize(length, 0);
-    let mut state = u64::from(layer).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    let mut generator = SplitMix64::new(u64::from(layer).wrapping_mul(0xD1B5_4A32_D192_ED03));
     for chunk in bytes.chunks_mut(size_of::<u64>()) {
-        for (byte, value) in chunk.iter_mut().zip(splitmix(&mut state).to_le_bytes()) {
+        for (byte, value) in chunk.iter_mut().zip(generator.next_u64().to_le_bytes()) {
             *byte = value;
         }
     }

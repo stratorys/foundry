@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::iter;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::time::Duration;
 
 use foundry_infer_core::{
@@ -9,7 +11,10 @@ use foundry_infer_core::{
     DeviceCapabilities,
     OpId,
 };
-use foundry_infer_runtime::Backend;
+use foundry_infer_runtime::{
+    Backend,
+    CommandContext,
+};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -27,9 +32,21 @@ use objc2_metal::{
     MTLSize,
 };
 
+use crate::clock::HostClock;
 use crate::device::{
     allocation_length,
     byte_size,
+};
+use crate::diagnostics::{
+    AllocationCategory,
+    Boundary,
+    CommandLabel,
+    DiagnosticLimits,
+    GpuLog,
+    GpuWork,
+    Ledger,
+    MetalDiagnostics,
+    Submission,
 };
 use crate::error::MetalError;
 use crate::pipeline::{
@@ -40,23 +57,28 @@ use crate::pipeline::{
 use crate::submission::{
     Buffer,
     CommandBuffer,
+    Device,
     Event,
     Submissions,
     completion,
 };
+use crate::tracked::{
+    SharedLedger,
+    TrackedAllocation,
+    TrackedBuffer,
+};
 
-type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 type Queue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 const RESULT: usize = size_of::<u32>();
 
 pub struct MetalBuffer {
-    buffer: Buffer,
+    buffer: TrackedBuffer,
     payload: usize,
 }
 
 pub struct MetalStaging {
-    buffer: Buffer,
+    buffer: TrackedBuffer,
 }
 
 pub struct MetalStream {
@@ -70,7 +92,7 @@ pub struct MetalEvent {
 }
 
 struct Checksum {
-    buffer: Buffer,
+    buffer: TrackedBuffer,
     command_buffer: CommandBuffer,
     count: usize,
 }
@@ -91,8 +113,11 @@ pub struct MetalBackend {
     device: Device,
     pipeline: Pipeline,
     capabilities: DeviceCapabilities,
+    clock: HostClock,
     checksums: BTreeMap<OpId, Checksum>,
     submissions: Submissions,
+    ledger: Option<SharedLedger>,
+    label: CommandLabel,
     #[cfg(test)]
     fault: Option<(Fault, usize)>,
 }
@@ -126,12 +151,16 @@ impl MetalBackend {
             alignment,
         };
         let pipeline = pipeline::compile(&device)?;
+        let clock = HostClock::new()?;
         Ok(Self {
             device,
             pipeline,
             capabilities,
+            clock,
             checksums: BTreeMap::new(),
             submissions: Submissions::default(),
+            ledger: None,
+            label: CommandLabel::default(),
             #[cfg(test)]
             fault: None,
         })
@@ -143,6 +172,8 @@ impl MetalBackend {
 
     pub fn buffer_length_max(&self) -> ByteSize { byte_size(self.device.maxBufferLength()) }
 
+    pub fn host_clock(&self) -> HostClock { self.clock }
+
     pub fn clear_checksums(&mut self) { self.checksums.clear(); }
 
     pub fn checksums(
@@ -151,13 +182,46 @@ impl MetalBackend {
     ) -> Result<Vec<u32>, MetalError> {
         let checksum = self.checksums.get(&op).ok_or(MetalError::UnknownOp(op))?;
         completion(&checksum.command_buffer)?;
-        let pointer = checksum.buffer.contents().cast::<u32>();
+        let pointer = checksum.buffer.native().contents().cast::<u32>();
         // SAFETY: `synthetic_compute` allocated this shared buffer with room
         // for `count` u32 results, `completion` proved the GPU finished
         // writing it, and `checksum` keeps the buffer alive for the
         // lifetime of the slice.
         let values = unsafe { std::slice::from_raw_parts(pointer.as_ptr(), checksum.count) };
         Ok(values.to_vec())
+    }
+
+    pub fn begin_diagnostics(
+        &mut self,
+        limits: DiagnosticLimits,
+    ) -> Result<(), MetalError> {
+        if self.ledger.is_some() || self.submissions.recording() {
+            return Err(MetalError::DiagnosticsActive);
+        }
+        let mut ledger = Ledger::new(self.clock, self.device.clone(), limits)?;
+        let log = GpuLog::new(limits)?;
+        ledger.snapshot(Boundary::ExecutionStart);
+        self.ledger = Some(Rc::new(RefCell::new(ledger)));
+        self.submissions.record(log);
+        self.label = CommandLabel::default();
+        Ok(())
+    }
+
+    pub fn snapshot(
+        &mut self,
+        boundary: Boundary,
+    ) {
+        if let Some(Ok(mut ledger)) = self.ledger.as_ref().map(|ledger| ledger.try_borrow_mut()) {
+            ledger.snapshot(boundary);
+        }
+    }
+
+    pub fn take_diagnostics(&mut self) -> Option<MetalDiagnostics> {
+        let ledger = self.ledger.take()?;
+        let (log, pending) = self.submissions.take_log()?;
+        self.label = CommandLabel::default();
+        let mut ledger = ledger.try_borrow_mut().ok()?;
+        Some(MetalDiagnostics::extract(&mut ledger, log, pending))
     }
 
     fn buffer(
@@ -173,10 +237,26 @@ impl MetalBackend {
             })
     }
 
+    fn track(
+        &self,
+        buffer: Buffer,
+        category: AllocationCategory,
+        requested: usize,
+    ) -> TrackedBuffer {
+        TrackedAllocation::new(
+            buffer,
+            self.ledger.as_ref(),
+            category,
+            byte_size(requested).bytes(),
+            self.label,
+        )
+    }
+
     fn shared(
         &self,
         contents: &[u8],
-    ) -> Result<Buffer, MetalError> {
+        category: AllocationCategory,
+    ) -> Result<TrackedBuffer, MetalError> {
         let buffer = self.buffer(
             byte_size(contents.len()),
             MTLResourceOptions::StorageModeShared,
@@ -191,7 +271,7 @@ impl MetalBackend {
                 contents.len(),
             )
         };
-        Ok(buffer)
+        Ok(self.track(buffer, category, contents.len()))
     }
 
     fn begin(
@@ -219,7 +299,7 @@ impl MetalBackend {
         &mut self,
         stream: &mut MetalStream,
         pending: Pending,
-        buffers: Vec<Buffer>,
+        buffers: Vec<TrackedBuffer>,
         pipeline: Option<Pipeline>,
     ) -> MetalEvent {
         let Pending {
@@ -227,12 +307,22 @@ impl MetalBackend {
             event,
             mut waits,
         } = pending;
+        let work = if pipeline.is_some() {
+            GpuWork::Compute
+        } else {
+            GpuWork::Copy
+        };
         command_buffer.encodeSignalEvent_value(&event, 1);
+        let submission = self.submissions.recording().then(|| Submission {
+            label: self.label,
+            work,
+            submitted: self.clock.now(),
+        });
         command_buffer.commit();
         stream.waits.clear();
         waits.push(event.clone());
         self.submissions
-            .register(command_buffer.clone(), buffers, waits, pipeline);
+            .register(command_buffer.clone(), buffers, waits, pipeline, submission);
         MetalEvent {
             event,
             command_buffer,
@@ -267,7 +357,7 @@ impl MetalBackend {
         // with exactly `length` bytes.
         unsafe {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &buffer.buffer,
+                buffer.buffer.native(),
                 0,
                 &shared,
                 0,
@@ -334,8 +424,10 @@ impl Backend for MetalBackend {
         &mut self,
         bytes: ByteSize,
     ) -> Result<MetalBuffer, MetalError> {
+        let buffer = self.buffer(bytes, MTLResourceOptions::StorageModePrivate)?;
+        let requested = buffer.length();
         Ok(MetalBuffer {
-            buffer: self.buffer(bytes, MTLResourceOptions::StorageModePrivate)?,
+            buffer: self.track(buffer, AllocationCategory::PrivateSlot, requested),
             payload: 0,
         })
     }
@@ -345,7 +437,7 @@ impl Backend for MetalBackend {
         contents: &[u8],
     ) -> Result<MetalStaging, MetalError> {
         Ok(MetalStaging {
-            buffer: self.shared(contents)?,
+            buffer: self.shared(contents, AllocationCategory::Staging)?,
         })
     }
 
@@ -365,11 +457,11 @@ impl Backend for MetalBackend {
         source: &MetalStaging,
         destination: &mut MetalBuffer,
     ) -> Result<MetalEvent, MetalError> {
-        let length = source.buffer.length();
-        if length > destination.buffer.length() {
+        let length = source.buffer.native().length();
+        if length > destination.buffer.native().length() {
             return Err(MetalError::CopyTooLarge {
                 source: byte_size(length),
-                destination: byte_size(destination.buffer.length()),
+                destination: byte_size(destination.buffer.native().length()),
             });
         }
         let pending = self.begin(stream)?;
@@ -382,15 +474,15 @@ impl Backend for MetalBackend {
         // bounds.
         unsafe {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &source.buffer,
+                source.buffer.native(),
                 0,
-                &destination.buffer,
+                destination.buffer.native(),
                 0,
                 length,
             )
         };
         encoder.endEncoding();
-        let buffers = vec![source.buffer.clone(), destination.buffer.clone()];
+        let buffers = vec![Rc::clone(&source.buffer), Rc::clone(&destination.buffer)];
         let event = self.submit(stream, pending, buffers, None);
         destination.payload = length;
         self.inject(Fault::Copy)?;
@@ -424,7 +516,7 @@ impl Backend for MetalBackend {
             .max(1)
             .checked_mul(RESULT)
             .ok_or_else(too_many)?;
-        let result = self.shared(&vec![0; result_len])?;
+        let result = self.shared(&vec![0; result_len], AllocationCategory::ChecksumResult)?;
         let pending = self.begin(stream)?;
         let encoder = pending
             .command_buffer
@@ -442,8 +534,8 @@ impl Backend for MetalBackend {
             // and Metal copies the `length` bytes before `setBytes`
             // returns.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(&weight.buffer), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&result), offset, 1);
+                encoder.setBuffer_offset_atIndex(Some(weight.buffer.native()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(result.native()), offset, 1);
                 encoder.setBytes_length_atIndex(NonNull::from(length).cast(), size_of::<u32>(), 2)
             };
             encoder.dispatchThreads_threadsPerThreadgroup(
@@ -462,8 +554,8 @@ impl Backend for MetalBackend {
         encoder.endEncoding();
         let buffers = weights
             .iter()
-            .map(|weight| weight.buffer.clone())
-            .chain(iter::once(result.clone()))
+            .map(|weight| Rc::clone(&weight.buffer))
+            .chain(iter::once(Rc::clone(&result)))
             .collect();
         let event = self.submit(stream, pending, buffers, Some(self.pipeline.clone()));
         self.checksums.insert(
@@ -499,6 +591,15 @@ impl Backend for MetalBackend {
     }
 
     fn drain(&mut self) -> Result<(), MetalError> { self.submissions.drain() }
+
+    fn annotate(
+        &mut self,
+        context: Option<&CommandContext<'_>>,
+    ) {
+        if self.submissions.recording() {
+            self.label = context.map(CommandLabel::from).unwrap_or_default();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +647,15 @@ mod tests {
         MetalBuffer,
         MetalEvent,
         MetalStream,
+    };
+    use crate::diagnostics::{
+        AllocationCategory,
+        AllocationChange,
+        Boundary,
+        DiagnosticLimits,
+        GpuTiming,
+        GpuWork,
+        MetalDiagnostics,
     };
     use crate::error::MetalError;
     use crate::pipeline::reference_checksum;
@@ -654,6 +764,30 @@ mod tests {
             Ok(execute(backend, &self.graph, &plan, budget, &weights))
         }
 
+        fn diagnosed(
+            &self,
+            backend: &mut MetalBackend,
+            slots: u32,
+        ) -> Result<MetalDiagnostics, Box<dyn Error>> {
+            let plan = synthetic_chain_plan(
+                &self.graph,
+                NonZeroU32::new(slots).ok_or("zero slots")?,
+                backend.capabilities().alignment,
+            )?;
+            backend.begin_diagnostics(DiagnosticLimits::for_plan(&plan)?)?;
+            self.run(backend, slots)??;
+            backend.drain()?;
+            backend.snapshot(Boundary::AfterDrain);
+            for (op, checksum) in self.expected()? {
+                assert_eq!(backend.checksums(op)?, vec![checksum], "op {}", op.index());
+            }
+            backend.clear_checksums();
+            backend.snapshot(Boundary::AfterChecksumRelease);
+            Ok(backend
+                .take_diagnostics()
+                .ok_or("diagnostics were recorded")?)
+        }
+
         fn expected(&self) -> Result<BTreeMap<OpId, u32>, Box<dyn Error>> {
             self.graph
                 .ops()
@@ -723,7 +857,11 @@ mod tests {
         let payload = pattern(3, 1000);
         let (destination, event) = stage(&mut backend, &mut stream, &payload, SLOT)?;
         backend.wait_host(&event)?;
-        assert_eq!(destination.buffer.length(), 4096, "the slot keeps its size");
+        assert_eq!(
+            destination.buffer.native().length(),
+            4096,
+            "the slot keeps its size"
+        );
         assert_eq!(
             backend.read_device(&destination)?,
             payload,
@@ -1033,6 +1171,256 @@ mod tests {
                     return Err(format!("{fault:?} failed at {operation:?}").into());
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_time_every_completed_command_buffer() -> TestResult {
+        let workload = Workload::new()?;
+        for slots in 1..=3 {
+            let Some(mut backend) = gpu()? else {
+                return Ok(());
+            };
+            let diagnostics = workload.diagnosed(&mut backend, slots)?;
+            let after = backend.host_clock().now();
+            assert!(
+                diagnostics.gpu_timestamps_valid(),
+                "{slots} slots: every interval has valid timestamps"
+            );
+            let copies: Vec<_> = diagnostics
+                .gpu
+                .iter()
+                .filter(|interval| interval.work == GpuWork::Copy)
+                .collect();
+            let launches: Vec<_> = diagnostics
+                .gpu
+                .iter()
+                .filter(|interval| interval.work == GpuWork::Compute)
+                .collect();
+            let layers = usize::try_from(LAYERS)?;
+            assert_eq!(copies.len(), layers, "{slots} slots: one copy per layer");
+            assert_eq!(
+                launches.len(),
+                layers,
+                "{slots} slots: one launch per layer"
+            );
+            for interval in &diagnostics.gpu {
+                let GpuTiming::Valid {
+                    start,
+                    end,
+                } = interval.timing
+                else {
+                    return Err("invalid timing".into());
+                };
+                assert!(
+                    interval.submitted <= start && start <= end && end <= after,
+                    "{slots} slots: GPU time follows CPU submission on the host clock"
+                );
+                assert!(interval.completed, "{slots} slots: the buffer completed");
+                assert!(
+                    interval.label.index.is_some() && interval.label.stream.is_some(),
+                    "{slots} slots: the command and stream are named"
+                );
+            }
+            assert!(
+                copies.iter().all(|interval| interval.label.tensor.is_some()
+                    && interval.label.slot.is_some()
+                    && interval.label.bytes == Some(ByteSize::from_bytes(WEIGHT))),
+                "{slots} slots: copies name their tensor, slot and bytes"
+            );
+            assert!(
+                launches.iter().all(|interval| interval.label.op.is_some()
+                    && interval.label.slot.is_some()
+                    && interval.work.kernel() == Some("checksum")),
+                "{slots} slots: launches name their op, slot and kernel"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_account_every_allocation_once() -> TestResult {
+        let workload = Workload::new()?;
+        let Some(mut backend) = gpu()? else {
+            return Ok(());
+        };
+        let diagnostics = workload.diagnosed(&mut backend, 2)?;
+        let layers = u64::from(LAYERS);
+        for (category, expected) in [
+            (AllocationCategory::Staging, layers),
+            (AllocationCategory::PrivateSlot, 2),
+            (AllocationCategory::ChecksumResult, layers),
+        ] {
+            let usage = diagnostics
+                .categories
+                .get(&category)
+                .ok_or("missing category")?;
+            assert_eq!(usage.allocations, expected, "{category:?} allocations");
+            assert_eq!(usage.frees, expected, "{category:?} frees");
+            assert_eq!(usage.live_requested, 0, "{category:?} is released");
+            assert!(
+                usage.peak_allocated >= usage.peak_requested && usage.peak_requested > 0,
+                "{category:?} allocated sizes cover requests"
+            );
+        }
+        let boundaries: Vec<Boundary> = diagnostics
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.boundary)
+            .collect();
+        assert_eq!(
+            boundaries,
+            [
+                Boundary::ExecutionStart,
+                Boundary::AfterDrain,
+                Boundary::AfterChecksumRelease
+            ],
+            "every boundary is sampled"
+        );
+        let after_drain = diagnostics.snapshots.get(1).ok_or("no drain snapshot")?;
+        assert_eq!(
+            after_drain
+                .categories
+                .get(&AllocationCategory::ChecksumResult)
+                .map(|usage| usage.live_requested),
+            Some(layers * 4),
+            "checksum results stay live until they are cleared"
+        );
+        assert_eq!(diagnostics.live_allocations, 0, "nothing stays live");
+        assert_eq!(
+            diagnostics.allocations.len(),
+            usize::try_from(2 * (2 + layers * 2))?,
+            "every allocation and free is an event"
+        );
+        assert!(
+            diagnostics.device_sampled_max >= diagnostics.tracked.peak_allocated,
+            "the sampled device maximum covers tracked buffers"
+        );
+        assert!(
+            diagnostics.storage_bytes > 0,
+            "diagnostic storage is counted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_buffers_are_counted_once_until_their_work_completes() -> TestResult {
+        let Some(mut backend) = gpu()? else {
+            return Ok(());
+        };
+        let workload = Workload::new()?;
+        let plan = synthetic_chain_plan(
+            &workload.graph,
+            NonZeroU32::new(1).ok_or("zero slots")?,
+            backend.capabilities().alignment,
+        )?;
+        backend.begin_diagnostics(DiagnosticLimits::for_plan(&plan)?)?;
+        let mut stream = backend.create_stream()?;
+        let (slot, event) = stage(&mut backend, &mut stream, &pattern(9, 4000), SLOT)?;
+        let clone = std::rc::Rc::clone(&slot.buffer);
+        drop(slot);
+        drop(clone);
+        drop(event);
+        let live = |backend: &MetalBackend| {
+            backend
+                .ledger
+                .as_ref()
+                .and_then(|ledger| ledger.borrow().live_usage(AllocationCategory::PrivateSlot))
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            live(&backend),
+            (1, SLOT),
+            "the dropped slot is retained by its in-flight copy"
+        );
+        backend.drain()?;
+        assert_eq!(live(&backend), (0, 0), "draining releases the slot");
+        let diagnostics = backend.take_diagnostics().ok_or("no diagnostics")?;
+        let slots: Vec<AllocationChange> = diagnostics
+            .allocations
+            .iter()
+            .filter(|event| event.category == AllocationCategory::PrivateSlot)
+            .map(|event| event.change)
+            .collect();
+        assert_eq!(
+            slots,
+            [AllocationChange::Allocated, AllocationChange::Freed],
+            "the slot is allocated and freed once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_diagnosed_executions_accumulate_nothing() -> TestResult {
+        let workload = Workload::new()?;
+        let Some(mut backend) = gpu()? else {
+            return Ok(());
+        };
+        for round in 0..3 {
+            for slots in 1..=3 {
+                let diagnostics = workload.diagnosed(&mut backend, slots)?;
+                let end = diagnostics.snapshots.last().ok_or("no final snapshot")?;
+                assert_eq!(
+                    (end.live_allocations, end.tracked.live_allocated),
+                    (0, 0),
+                    "round {round} with {slots} slots ends with no tracked buffer"
+                );
+                assert_eq!(backend.in_flight_len(), 0, "nothing is in flight");
+            }
+        }
+        assert!(
+            backend.take_diagnostics().is_none(),
+            "diagnostics end with their execution"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_cannot_overlap() -> TestResult {
+        let Some(mut backend) = gpu()? else {
+            return Ok(());
+        };
+        let workload = Workload::new()?;
+        let plan = synthetic_chain_plan(
+            &workload.graph,
+            NonZeroU32::new(1).ok_or("zero slots")?,
+            backend.capabilities().alignment,
+        )?;
+        let limits = DiagnosticLimits::for_plan(&plan)?;
+        backend.begin_diagnostics(limits)?;
+        assert_eq!(
+            backend.begin_diagnostics(limits).err(),
+            Some(MetalError::DiagnosticsActive),
+            "a second recording is rejected"
+        );
+        assert!(backend.take_diagnostics().is_some(), "the first one ends");
+        backend.begin_diagnostics(limits)?;
+        Ok(())
+    }
+
+    #[test]
+    fn limits_follow_the_plan() -> TestResult {
+        let workload = Workload::new()?;
+        let alignment = foundry_infer_core::Alignment::new(256)?;
+        for slots in 1..=3 {
+            let plan = synthetic_chain_plan(
+                &workload.graph,
+                NonZeroU32::new(slots).ok_or("zero slots")?,
+                alignment,
+            )?;
+            let limits = DiagnosticLimits::for_plan(&plan)?;
+            let layers = usize::try_from(LAYERS)?;
+            assert_eq!(
+                limits.gpu_intervals(),
+                2 * layers,
+                "{slots} slots: submissions"
+            );
+            assert_eq!(
+                limits.allocation_events(),
+                2 * (usize::try_from(slots)? + 2 * layers),
+                "{slots} slots: allocation events"
+            );
         }
         Ok(())
     }

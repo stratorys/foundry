@@ -7,6 +7,8 @@ use foundry_infer_core::{
     OpId,
 };
 
+use crate::observe::CommandContext;
+
 pub trait Backend {
     type DeviceBuffer;
     type HostBuffer;
@@ -55,4 +57,10 @@ pub trait Backend {
     ) -> Result<(), Self::Error>;
 
     fn drain(&mut self) -> Result<(), Self::Error>;
+
+    fn annotate(
+        &mut self,
+        _context: Option<&CommandContext<'_>>,
+    ) {
+    }
 }
