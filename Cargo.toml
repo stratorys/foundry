@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/foundry-infer-cli", "crates/foundry-infer-core", "crates/foundry-infer-plan", "crates/foundry-infer-runtime"]
+members = [
+    "crates/foundry-infer-cli",
+    "crates/foundry-infer-core",
+    "crates/foundry-infer-metal",
+    "crates/foundry-infer-plan",
+    "crates/foundry-infer-runtime",
+]
 resolver = "3"
 
 [workspace.package]
@@ -12,6 +18,7 @@ license = "MPL-2.0"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 foundry-infer-core = { path = "crates/foundry-infer-core", default-features = false }
 foundry-infer-plan = { path = "crates/foundry-infer-plan", default-features = false }
+foundry-infer-runtime = { path = "crates/foundry-infer-runtime", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 
