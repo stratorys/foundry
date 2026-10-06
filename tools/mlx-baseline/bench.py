@@ -35,8 +35,12 @@ VERIFIER_PATH = REPO_DIR / "scripts" / "verify-model-manifest.py"
 ARCHIVED_TOOL_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 CONFIGURATION_NAME = "CONFIGURATION.md"
 REPORT_NAME = "report.json"
+INPUT_PATH = TOOL_DIR / "inputs" / "random-512-seed0.json"
+STREAM_GENERATE = "stream-generate"
+TOKEN_IDS = "token-ids"
 
 PROTOCOL = {
+    "id": "stream-generate-v1",
     "scenario": "synthetic-token prefill and fixed-length greedy decode",
     "batch_size": BATCH_SIZE,
     "input_tokens": INPUT_TOKENS,
@@ -125,6 +129,70 @@ METRICS = {
 SUMMARIZED_METRICS = ("elapsed_ns", "first_token_ns", "prompt_tps", "generation_tps", "peak_memory_bytes", "peak_memory_gb")
 INTEGER_METRICS = ("elapsed_ns", "first_token_ns", "peak_memory_bytes")
 
+TOKEN_IDS_PROTOCOL = {
+    "id": "token-ids-512x128-v1",
+    "scenario": "synthetic-token prefill and fixed-length greedy decode, token IDs only",
+    "batch_size": BATCH_SIZE,
+    "input_tokens": INPUT_TOKENS,
+    "output_tokens": OUTPUT_TOKENS,
+    "warmup_executions": WARMUP_EXECUTIONS,
+    "measured_executions": MEASURED_EXECUTIONS,
+    "input": "tools/mlx-baseline/inputs/random-512-seed0.json, checked to equal the stream-generate-v1 generator output",
+    "sampler": "greedy: mx.argmax(logprobs, axis=-1) over float16 log-probabilities, first index on ties",
+    "generation_api": "mlx_lm.generate.generate_step with an mx.array prompt; yields token IDs, no detokenizer",
+    "eos_handling": "ignored: generate_step has no stop condition and runs for exactly 128 tokens",
+    "kv_cache": "fresh mlx_lm.models.cache.make_prompt_cache(model) per execution (unquantized KVCache per layer)",
+    "kv_bits": None,
+    "max_kv_size": None,
+    "prefill_step_size": PREFILL_STEP_SIZE,
+    "prompt_cache_reuse": False,
+    "draft_model": None,
+    "model_loading": "mlx_lm.load(snapshot) with default arguments",
+    "synchronization": "mx.synchronize() before starting and before stopping each execution timer",
+}
+
+TOKEN_IDS_TIMING_BOUNDARIES = {
+    "clock": "time.perf_counter_ns (monotonic)",
+    "start": "after the prompt array is evaluated, the KV cache is constructed and mx.synchronize() returns",
+    "token_available": "when generate_step yields the token as a Python int (y.item() synchronizes on that token)",
+    "stop": "after the 128th token is available and a final mx.synchronize() returns",
+    "included": ["prefill", "decode", "token retrieval to the host", "final GPU synchronization"],
+    "excluded": [
+        "manifest verification",
+        "model loading and kernel compilation",
+        "input preparation",
+        "KV cache construction",
+        "report writing and archiving",
+    ],
+}
+
+COMMON_METRICS = {
+    "elapsed_ns": {
+        "unit": "ns",
+        "definition": "Timer start to timer stop, as defined by the timing boundaries.",
+    },
+    "token_available_ns": {
+        "unit": "ns",
+        "definition": "For each generated token, the time from the timer start until its ID is available on the host.",
+    },
+    "first_token_ns": {
+        "unit": "ns",
+        "definition": "token_available_ns[0].",
+    },
+    "decode_tokens_per_s": {
+        "unit": "tokens/s",
+        "definition": "127 / (token_available_ns[127] - token_available_ns[0]) in seconds.",
+    },
+}
+
+TOKEN_IDS_METRICS = {
+    **COMMON_METRICS,
+    "peak_memory_bytes": METRICS["peak_memory_bytes"],
+}
+
+TOKEN_IDS_SUMMARIZED_METRICS = ("elapsed_ns", "first_token_ns", "decode_tokens_per_s", "peak_memory_bytes")
+TOKEN_IDS_INTEGER_METRICS = ("elapsed_ns", "first_token_ns", "peak_memory_bytes")
+
 
 class HarnessError(Exception):
     pass
@@ -144,6 +212,27 @@ def make_input_ids():
     return [BOS_ID] + [generator.randrange(DRAWN_ID_BOUND) for _ in range(INPUT_TOKENS - 1)]
 
 
+def input_sha256(input_ids):
+    return hashlib.sha256(json.dumps(input_ids).encode()).hexdigest()
+
+
+def load_input_ids(path=INPUT_PATH):
+    text = Path(path).read_text(encoding="utf-8")
+    input_ids = json.loads(text)
+    if input_ids != make_input_ids() or text != json.dumps(input_ids):
+        raise HarnessError(f"{path} does not hold the canonical benchmark input")
+    return input_ids
+
+
+def decode_tokens_per_s(token_available_ns):
+    if len(token_available_ns) < 2:
+        return None
+    span_ns = token_available_ns[-1] - token_available_ns[0]
+    if span_ns <= 0:
+        return None
+    return (len(token_available_ns) - 1) / (span_ns / 1e9)
+
+
 def parse_arguments(argv):
     parser = argparse.ArgumentParser(
         description=f"MLX baseline: {INPUT_TOKENS} input tokens, {OUTPUT_TOKENS} generated tokens, batch {BATCH_SIZE}."
@@ -151,6 +240,12 @@ def parse_arguments(argv):
     parser.add_argument("--snapshot", required=True, help="pinned Hugging Face snapshot directory")
     parser.add_argument("--manifest", required=True, help="manifest.json describing the snapshot")
     parser.add_argument("--output-dir", required=True, help="archive directory to create; must not exist")
+    parser.add_argument(
+        "--protocol",
+        choices=(STREAM_GENERATE, TOKEN_IDS),
+        default=STREAM_GENERATE,
+        help="stream-generate-v1 (default, mlx-lm stream_generate) or token-ids-512x128-v1 (token IDs only)",
+    )
     return parser.parse_args(argv)
 
 
@@ -244,19 +339,21 @@ def archive_files(manifest_path, output_dir):
     return archived
 
 
-def summarize(executions):
+def summarize(executions, metrics=SUMMARIZED_METRICS, definitions=METRICS, integers=INTEGER_METRICS):
     measured = [execution for execution in executions if execution["phase"] == "measured"]
     if len(measured) < 2:
         raise HarnessError(f"statistics require at least 2 measured executions, have {len(measured)}")
     return {
-        metric: summarize_metric(metric, [execution[metric] for execution in measured])
-        for metric in SUMMARIZED_METRICS
+        metric: summarize_metric(metric, [execution[metric] for execution in measured], definitions, integers)
+        for metric in metrics
     }
 
 
-def summarize_metric(metric, values):
+def summarize_metric(metric, values, definitions=METRICS, integers=INTEGER_METRICS):
+    if any(value is None for value in values):
+        raise HarnessError(f"metric {metric} is missing from a measured execution")
     summary = {
-        "unit": METRICS[metric]["unit"],
+        "unit": definitions[metric]["unit"],
         "count": len(values),
         "median": statistics.median(values),
         "mean": statistics.fmean(values),
@@ -264,7 +361,7 @@ def summarize_metric(metric, values):
         "max": max(values),
         "stdev_sample": statistics.stdev(values),
     }
-    if metric in INTEGER_METRICS:
+    if metric in integers:
         summary.update({key: round(summary[key]) for key in ("median", "mean", "stdev_sample")})
     return summary
 
@@ -318,11 +415,28 @@ def make_record(phase, index, result, ignored_eos_ids):
     }
 
 
+def make_token_ids_record(phase, index, result):
+    token_ids = list(result["token_ids"])
+    token_available_ns = [int(value) for value in result["token_available_ns"]]
+    return {
+        "phase": phase,
+        "index": index,
+        "generated_count": len(token_ids),
+        "token_ids": token_ids,
+        "elapsed_ns": int(result["elapsed_ns"]),
+        "token_available_ns": token_available_ns,
+        "first_token_ns": token_available_ns[0] if token_available_ns else None,
+        "decode_tokens_per_s": decode_tokens_per_s(token_available_ns),
+        "peak_memory_bytes": int(result["peak_memory_bytes"]),
+    }
+
+
 class MlxBackend:
     def __init__(self):
         self.mx = importlib.import_module("mlx.core")
         self.load_model = importlib.import_module("mlx_lm.utils").load
         self.stream_generate = importlib.import_module("mlx_lm.generate").stream_generate
+        self.generate_step = importlib.import_module("mlx_lm.generate").generate_step
         self.make_prompt_cache = importlib.import_module("mlx_lm.models.cache").make_prompt_cache
         self.tokenizer_wrapper = importlib.import_module("mlx_lm.tokenizer_utils").TokenizerWrapper
         self.tree_flatten = importlib.import_module("mlx.utils").tree_flatten
@@ -396,6 +510,39 @@ class MlxBackend:
         }
 
 
+    def execute_token_ids(self, input_ids, max_tokens):
+        mx = self.mx
+        prompt = mx.array(input_ids, dtype=mx.uint32)
+        prompt_cache = self.make_prompt_cache(self.model)
+        mx.eval(prompt)
+        mx.synchronize()
+        mx.reset_peak_memory()
+        token_ids = []
+        token_available_ns = []
+        start_ns = time.perf_counter_ns()
+        steps = self.generate_step(
+            prompt,
+            self.model,
+            max_tokens=max_tokens,
+            sampler=self.greedy,
+            prompt_cache=prompt_cache,
+            prefill_step_size=PREFILL_STEP_SIZE,
+            kv_bits=None,
+            max_kv_size=None,
+        )
+        for token, _ in steps:
+            token_available_ns.append(time.perf_counter_ns() - start_ns)
+            token_ids.append(int(token))
+        mx.synchronize()
+        elapsed_ns = time.perf_counter_ns() - start_ns
+        return {
+            "token_ids": token_ids,
+            "elapsed_ns": elapsed_ns,
+            "token_available_ns": token_available_ns,
+            "peak_memory_bytes": mx.get_peak_memory(),
+        }
+
+
 class Run:
     def __init__(self, arguments, argv, backend_factory, verify):
         self.arguments = arguments
@@ -403,6 +550,7 @@ class Run:
         self.verify = verify
         self.output_dir = Path(arguments.output_dir)
         self.stage = "start"
+        self.token_ids = getattr(arguments, "protocol", STREAM_GENERATE) == TOKEN_IDS
         self.report = {
             "schema_version": SCHEMA_VERSION,
             "status": "running",
@@ -423,9 +571,9 @@ class Run:
                 "harness": {"path": str(HARNESS_PATH), "sha256": sha256_file(HARNESS_PATH)},
                 "verifier": {"path": str(VERIFIER_PATH), "sha256": sha256_file(VERIFIER_PATH)},
             },
-            "protocol": PROTOCOL,
-            "timing_boundaries": TIMING_BOUNDARIES,
-            "metrics": METRICS,
+            "protocol": TOKEN_IDS_PROTOCOL if self.token_ids else PROTOCOL,
+            "timing_boundaries": TOKEN_IDS_TIMING_BOUNDARIES if self.token_ids else TIMING_BOUNDARIES,
+            "metrics": TOKEN_IDS_METRICS if self.token_ids else METRICS,
             "executions": [],
         }
 
@@ -451,8 +599,8 @@ class Run:
         report["archived_files"] = archive_files(self.arguments.manifest, self.output_dir)
 
         self.stage = "input"
-        input_ids = make_input_ids()
-        report["input"] = {"token_count": len(input_ids), "sha256": hashlib.sha256(json.dumps(input_ids).encode()).hexdigest(), "token_ids": input_ids}
+        input_ids = load_input_ids() if self.token_ids else make_input_ids()
+        report["input"] = {"token_count": len(input_ids), "sha256": input_sha256(input_ids), "token_ids": input_ids}
 
         self.stage = "load"
         report["loading"] = backend.load(self.arguments.snapshot)
@@ -460,7 +608,10 @@ class Run:
 
         for phase, index in execution_schedule():
             self.stage = f"{phase}[{index}]"
-            record = make_record(phase, index, backend.execute(input_ids, OUTPUT_TOKENS), ignored_eos_ids)
+            if self.token_ids:
+                record = make_token_ids_record(phase, index, backend.execute_token_ids(input_ids, OUTPUT_TOKENS))
+            else:
+                record = make_record(phase, index, backend.execute(input_ids, OUTPUT_TOKENS), ignored_eos_ids)
             report["executions"].append(record)
             if record["generated_count"] != OUTPUT_TOKENS:
                 raise HarnessError(
@@ -468,7 +619,12 @@ class Run:
                 )
 
         self.stage = "statistics"
-        report["statistics"] = summarize(report["executions"])
+        if self.token_ids:
+            report["statistics"] = summarize(
+                report["executions"], TOKEN_IDS_SUMMARIZED_METRICS, TOKEN_IDS_METRICS, TOKEN_IDS_INTEGER_METRICS
+            )
+        else:
+            report["statistics"] = summarize(report["executions"])
         report["status"] = "succeeded"
 
     def run(self):
@@ -493,6 +649,16 @@ def print_summary(report, output_dir):
         print(f"report: {output_dir / REPORT_NAME}", file=sys.stderr)
         return
     elapsed = report["statistics"]["elapsed_ns"]
+    if "decode_tokens_per_s" in report["statistics"]:
+        first = report["statistics"]["first_token_ns"]
+        decode = report["statistics"]["decode_tokens_per_s"]
+        print(
+            f"OK: {len(report['executions'])} executions ({WARMUP_EXECUTIONS} warmup), "
+            f"elapsed median {elapsed['median'] / 1e6:.3f} ms, first token median {first['median'] / 1e6:.3f} ms, "
+            f"decode median {decode['median']:.1f} tok/s, consistent outputs: {report['consistency']['consistent']}"
+        )
+        print(f"report: {output_dir / REPORT_NAME}")
+        return
     generation = report["statistics"]["generation_tps"]
     prompt = report["statistics"]["prompt_tps"]
     print(

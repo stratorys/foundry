@@ -24,8 +24,9 @@ chains support sequential, double-buffered, and triple-buffered plans.
 contract, with a fake backend for tests and cleanup of submitted work on failure.
 The Metal backend executes synthetic workloads on the GPU.
 
-There are no inference kernels or general-purpose scheduler yet. A synthetic
-streaming benchmark measures end-to-end runtime execution on Metal and exports
+`foundry-infer-llama` runs one model, `mlx-community/Llama-3.2-3B-Instruct-4bit`,
+with fully resident weights and Foundry's own Metal kernels. There is no
+general-purpose scheduler. A synthetic streaming benchmark measures end-to-end runtime execution on Metal and exports
 raw samples, provenance, statistics, traces and memory accounting.
 Transfer/compute overlap has not been established.
 
@@ -45,6 +46,8 @@ The backend does not yet claim concurrent copy and compute.
 - `foundry-infer-plan`: execution plans, JSON serialization, and static validation.
 - `foundry-infer-runtime`: backend contract, plan interpreter, and fake backend.
 - `foundry-infer-metal`: macOS Metal backend for synthetic GPU workloads.
+- `foundry-infer-llama`: checkpoint loader and resident Llama 3.2 3B 4-bit
+  inference on Metal (batch 1, up to 512 prompt tokens and 640 positions).
 - `foundry-infer-cli`: the `foundry` binary, with an optional `metal` feature.
 
 ## CLI
@@ -118,6 +121,29 @@ duration hints. The results do not establish transfer/compute overlap or
 inference performance. More resident buffers do not guarantee overlap or a
 speedup.
 
+## Llama inference benchmark
+
+Measure 512 input token IDs → 128 greedy tokens, with 2 warmup and 10 measured
+executions. Use the pinned snapshot and manifest (kept outside version control):
+
+```sh
+cargo run --release -p foundry-infer-cli --features metal -- infer-bench \
+  --snapshot "$snapshot" --manifest "$manifest" --report report.json
+```
+
+The report uses the same `token-ids-512x128-v1` protocol as
+`tools/mlx-baseline/bench.py --protocol token-ids`.
+`tools/mlx-baseline/compare.py` compares the two reports.
+
+Full-model numerical validation against private MLX fixtures, generated with
+`tools/mlx-baseline/fixtures.py`:
+
+```sh
+FOUNDRY_REQUIRE_METAL=1 FOUNDRY_REQUIRE_LLAMA=1 \
+FOUNDRY_LLAMA_SNAPSHOT="$snapshot" FOUNDRY_LLAMA_FIXTURES="$fixtures" \
+  cargo test --release -p foundry-infer-llama --features probe --test mlx_fixtures
+```
+
 ## Build and validate
 
 ```sh
@@ -133,6 +159,7 @@ Require actual GPU execution when validating the backend:
 
 ```sh
 FOUNDRY_REQUIRE_METAL=1 cargo test -p foundry-infer-metal
+FOUNDRY_REQUIRE_METAL=1 cargo test -p foundry-infer-llama --all-features
 FOUNDRY_REQUIRE_METAL=1 cargo test -p foundry-infer-cli --features metal
 ```
 

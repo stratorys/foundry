@@ -509,3 +509,90 @@ fn bench_keeps_a_failure_report() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn infer_bench_requires_its_paths() -> Result<(), Box<dyn Error>> {
+    let stderr = rejected(&["infer-bench", "--snapshot", "/nonexistent"])?;
+    assert!(
+        stderr.contains("--manifest") && stderr.contains("--report"),
+        "missing arguments should be named, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+#[test]
+fn infer_bench_requires_the_metal_feature() -> Result<(), Box<dyn Error>> {
+    let stderr = rejected(&[
+        "infer-bench",
+        "--snapshot",
+        "/nonexistent",
+        "--manifest",
+        "/nonexistent/manifest.json",
+        "--report",
+        "report.json",
+    ])?;
+    assert!(
+        stderr.contains("requires a macOS build of foundry with `--features metal`"),
+        "the missing feature should be explained, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn infer_bench_reports_an_invalid_manifest() -> Result<(), Box<dyn Error>> {
+    let directory = fresh_directory("infer-bench-invalid-manifest")?;
+    let manifest = directory.join("manifest.json");
+    fs::write(&manifest, "{\"schema_version\": 1}")?;
+    let report = directory.join("report.json");
+    let text = |path: &Path| path.to_str().map(str::to_owned).ok_or("non-UTF-8 path");
+    let stderr = rejected(&[
+        "infer-bench",
+        "--snapshot",
+        &text(&directory)?,
+        "--manifest",
+        &text(&manifest)?,
+        "--report",
+        &text(&report)?,
+    ])?;
+    assert!(
+        stderr.contains("manifest"),
+        "the manifest error is reported, got:\n{stderr}"
+    );
+    let document: serde_json::Value = serde_json::from_str(&fs::read_to_string(&report)?)?;
+    let field = |pointer: &str| {
+        document
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+    };
+    assert_eq!(
+        field("/status"),
+        Some("failed"),
+        "the report records the failure"
+    );
+    assert_eq!(
+        field("/failure/stage"),
+        Some("identity"),
+        "the failing stage is named"
+    );
+    assert_eq!(
+        field("/protocol/id"),
+        Some("token-ids-512x128-v1"),
+        "the protocol is identified"
+    );
+    let again = rejected(&[
+        "infer-bench",
+        "--snapshot",
+        &text(&directory)?,
+        "--manifest",
+        &text(&manifest)?,
+        "--report",
+        &text(&report)?,
+    ])?;
+    assert!(
+        again.contains("exists"),
+        "an existing report is never overwritten, got:\n{again}"
+    );
+    Ok(())
+}

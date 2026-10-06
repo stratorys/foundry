@@ -20,11 +20,12 @@ serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+foundry-infer-llama = { workspace = true, optional = true }
 foundry-infer-metal = { workspace = true, optional = true }
 
 [features]
 default = []
-metal = ["dep:foundry-infer-metal", "dep:foundry-infer-runtime"]
+metal = ["dep:foundry-infer-llama", "dep:foundry-infer-metal", "dep:foundry-infer-runtime"]
 
 [dev-dependencies]
 foundry-infer-core.workspace = true

@@ -4,6 +4,7 @@
 )]
 
 mod bench;
+mod infer;
 
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -74,6 +75,11 @@ enum Command {
                  2 and 3 resident GPU buffers"
     )]
     Bench(bench::BenchArgs),
+    #[command(
+        about = "Benchmark resident Llama 3.2 3B 4-bit inference (512 input token IDs, 128 greedy \
+                 tokens) on Foundry Metal kernels"
+    )]
+    InferBench(infer::InferBenchArgs),
 }
 
 fn main() -> ExitCode {
@@ -82,6 +88,7 @@ fn main() -> ExitCode {
             dump,
         }) => dump_plan(&dump),
         Some(Command::Bench(args)) => bench::run(&args).map_err(Box::from),
+        Some(Command::InferBench(args)) => infer::run(&args).map_err(Box::from),
         None => Ok(()),
     };
     match result {

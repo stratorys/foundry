@@ -57,6 +57,19 @@ class FakeBackend:
         }
 
 
+    def execute_token_ids(self, input_ids, max_tokens):
+        call = self.calls
+        self.calls += 1
+        self.inputs.append(list(input_ids))
+        count = self.counts.get(call, max_tokens)
+        return {
+            "token_ids": [128009] + [7] * (count - 1) if count else [],
+            "elapsed_ns": 2_000_000 * (call + 1),
+            "token_available_ns": [100_000 * (call + 1) + 10_000 * position for position in range(count)],
+            "peak_memory_bytes": 2_000_000_000 + call,
+        }
+
+
 class Workspace:
     def __init__(self, root, revision=bench.REVISION, repository=bench.REPOSITORY, manifest=None):
         self.root = Path(root)
@@ -70,16 +83,17 @@ class Workspace:
         (model_dir / "CONFIGURATION.md").write_text("# configuration\n")
         self.output = self.root / "archive"
 
-    def argv(self):
-        return ["--snapshot", str(self.snapshot), "--manifest", str(self.manifest), "--output-dir", str(self.output)]
+    def argv(self, protocol=None):
+        argv = ["--snapshot", str(self.snapshot), "--manifest", str(self.manifest), "--output-dir", str(self.output)]
+        return argv if protocol is None else argv + ["--protocol", protocol]
 
     def report(self):
         return json.loads((self.output / bench.REPORT_NAME).read_text())
 
 
-def run_main(workspace, backend, verify=passing_verifier):
+def run_main(workspace, backend, verify=passing_verifier, protocol=None):
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        return bench.main(workspace.argv(), backend_factory=lambda: backend, verify=verify)
+        return bench.main(workspace.argv(protocol), backend_factory=lambda: backend, verify=verify)
 
 
 def measured_record(index, elapsed_ns, phase="measured"):
@@ -114,6 +128,60 @@ class InputTests(unittest.TestCase):
 
         generator = random.Random(0)
         self.assertEqual(bench.make_input_ids()[1:], [generator.randrange(128000) for _ in range(511)])
+
+
+    def test_committed_input_file_is_the_generator_output(self):
+        input_ids = bench.load_input_ids()
+        self.assertEqual(input_ids, bench.make_input_ids())
+        self.assertEqual(bench.input_sha256(input_ids), "9286ad09d58db9a18214d35afb5d92d2071e1fa9f8f1ccc63d2911401886dc49")
+
+    def test_modified_input_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "input.json"
+            path.write_text(json.dumps([128000] * 512))
+            with self.assertRaises(bench.HarnessError):
+                bench.load_input_ids(path)
+
+
+class TokenIdsProtocolTests(unittest.TestCase):
+    def test_default_protocol_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            backend = FakeBackend()
+            self.assertEqual(run_main(workspace, backend), 0)
+            report = workspace.report()
+            self.assertEqual(report["protocol"]["id"], "stream-generate-v1")
+            self.assertIn("generation_tps", report["statistics"])
+            self.assertNotIn("token_available_ns", report["executions"][0])
+
+    def test_token_ids_protocol_records_token_times(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            backend = FakeBackend()
+            self.assertEqual(run_main(workspace, backend, protocol="token-ids"), 0)
+            report = workspace.report()
+            self.assertEqual(report["protocol"]["id"], "token-ids-512x128-v1")
+            self.assertEqual(report["timing_boundaries"], bench.TOKEN_IDS_TIMING_BOUNDARIES)
+            self.assertEqual(report["input"]["sha256"], bench.input_sha256(bench.make_input_ids()))
+            first = report["executions"][0]
+            self.assertEqual(len(first["token_available_ns"]), bench.OUTPUT_TOKENS)
+            self.assertEqual(first["first_token_ns"], 100_000)
+            self.assertAlmostEqual(first["decode_tokens_per_s"], 127 / (127 * 10_000 / 1e9))
+            self.assertEqual(set(report["statistics"]), set(bench.TOKEN_IDS_SUMMARIZED_METRICS))
+            self.assertTrue(report["consistency"]["consistent"])
+            self.assertEqual(backend.inputs[0], bench.make_input_ids())
+
+    def test_token_ids_protocol_requires_full_length(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Workspace(root)
+            backend = FakeBackend(counts={3: 127})
+            self.assertEqual(run_main(workspace, backend, protocol="token-ids"), 1)
+            self.assertEqual(workspace.report()["failure"]["stage"], "measured[1]")
+
+    def test_decode_throughput_needs_two_distinct_times(self):
+        self.assertIsNone(bench.decode_tokens_per_s([5]))
+        self.assertIsNone(bench.decode_tokens_per_s([5, 5]))
+        self.assertAlmostEqual(bench.decode_tokens_per_s([0, 500_000_000, 1_000_000_000]), 2.0)
 
 
 class StatisticsTests(unittest.TestCase):

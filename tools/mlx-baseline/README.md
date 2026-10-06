@@ -27,6 +27,19 @@ uv run --project tools/mlx-baseline --locked \
   --output-dir "$archive"
 ```
 
+Token-ID protocol (`token-ids-512x128-v1`, shared with `foundry infer-bench`), comparison, and private numerical fixtures:
+
+```fish
+uv run --project tools/mlx-baseline --locked tools/mlx-baseline/bench.py --protocol token-ids \
+  --snapshot "$snapshot" --manifest .private-data/models/llama-3.2-3b-instruct-4bit/manifest.json --output-dir "$archive"
+uv run --project tools/mlx-baseline --locked tools/mlx-baseline/compare.py \
+  --mlx "$archive/report.json" --foundry "$foundry_report" --output-dir "$comparison"
+uv run --project tools/mlx-baseline --locked tools/mlx-baseline/fixtures.py \
+  --snapshot "$snapshot" --manifest .private-data/models/llama-3.2-3b-instruct-4bit/manifest.json --output-dir "$fixtures"
+```
+
+`--protocol token-ids` uses `generate_step`, which yields token IDs without detokenization and does not stop at EOS. The input comes from `inputs/random-512-seed0.json`, which must equal the generator output. The timer starts after `mx.synchronize()`. Each token's availability time (`token_available_ns`) is recorded when its ID reaches the host, and the timer stops after a final `mx.synchronize()`. The derived metrics are `first_token_ns = token_available_ns[0]` and `decode_tokens_per_s = 127 / (t[127] − t[0])`. The default protocol, `stream-generate-v1`, is unchanged. Fixtures are derived from the weights and stay outside version control.
+
 `--output-dir` must not exist. Exit status: `0` succeeded, `1` run failed (a report is still written), `2` invalid arguments (nothing is written).
 
 ## Protocol

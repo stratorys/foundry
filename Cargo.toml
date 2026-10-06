@@ -2,6 +2,7 @@
 members = [
     "crates/foundry-infer-cli",
     "crates/foundry-infer-core",
+    "crates/foundry-infer-llama",
     "crates/foundry-infer-metal",
     "crates/foundry-infer-plan",
     "crates/foundry-infer-runtime",
@@ -17,6 +18,7 @@ license = "MPL-2.0"
 [workspace.dependencies]
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 foundry-infer-core = { path = "crates/foundry-infer-core", default-features = false }
+foundry-infer-llama = { path = "crates/foundry-infer-llama", default-features = false }
 foundry-infer-metal = { path = "crates/foundry-infer-metal", default-features = false }
 foundry-infer-plan = { path = "crates/foundry-infer-plan", default-features = false }
 foundry-infer-runtime = { path = "crates/foundry-infer-runtime", default-features = false }

@@ -3,7 +3,7 @@ mod analysis;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 mod bootstrap;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
-mod error;
+pub(crate) mod error;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod instrument;
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -13,15 +13,15 @@ mod instrument;
 )]
 mod metal;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
-mod output;
+pub(crate) mod output;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
-mod provenance;
+pub(crate) mod provenance;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 mod random;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
-mod report;
+pub(crate) mod report;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
-mod stats;
+pub(crate) mod stats;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 mod trace;
 #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
