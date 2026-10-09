@@ -1,6 +1,7 @@
 mod dtype;
 mod error;
 mod layout;
+pub mod primitive;
 mod shape;
 
 pub use self::dtype::DType;

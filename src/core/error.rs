@@ -1,3 +1,5 @@
+use crate::core::DType;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error("Rank {rank} exceeds the maximum rank {rank_max}.")]
@@ -41,4 +43,40 @@ pub enum CoreError {
 
     #[error("Shape {from:?} cannot be broadcast to shape {to:?}.")]
     BroadcastAsIncompatible { from: Vec<usize>, to: Vec<usize> },
+
+    #[error("DType {dtype:?} is not a float dtype.")]
+    DTypeNotFloat { dtype: DType },
+
+    #[error("DType {lhs:?} does not match dtype {rhs:?}.")]
+    DTypeMismatch { lhs: DType, rhs: DType },
+
+    #[error("DType {dtype:?} was given where {dtype_expected:?} is expected.")]
+    DTypeUnexpected { dtype: DType, dtype_expected: DType },
+
+    #[error("Shapes {lhs:?} and {rhs:?} cannot be multiplied.")]
+    MatmulIncompatible { lhs: Vec<usize>, rhs: Vec<usize> },
+
+    #[error("Table shape {table:?} and indices shape {indices:?} cannot be gathered.")]
+    GatherIncompatible {
+        table: Vec<usize>,
+        indices: Vec<usize>,
+    },
+
+    #[error("Shapes {lhs:?} and {rhs:?} cannot be concatenated on axis {axis}.")]
+    ConcatIncompatible {
+        axis: usize,
+        lhs: Vec<usize>,
+        rhs: Vec<usize>,
+    },
+
+    #[error(
+        "Update shape {update:?} at start {start} on axis {axis} does not fit target shape \
+         {target:?}."
+    )]
+    SliceUpdateOutOfBounds {
+        axis: usize,
+        start: usize,
+        target: Vec<usize>,
+        update: Vec<usize>,
+    },
 }

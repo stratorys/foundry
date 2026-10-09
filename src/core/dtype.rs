@@ -13,4 +13,6 @@ impl DType {
             Self::F16 | Self::BF16 => 2,
         }
     }
+
+    pub const fn is_float(self) -> bool { matches!(self, Self::F32 | Self::F16 | Self::BF16) }
 }
