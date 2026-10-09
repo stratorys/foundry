@@ -96,4 +96,11 @@ pub enum CoreError {
 
     #[error("Slice update requires a contiguous target layout.")]
     SliceUpdateNonContiguous,
+
+    #[error("Query {query:?}, key {key:?} and value {value:?} are incompatible for attention.")]
+    AttentionIncompatible {
+        query: Vec<usize>,
+        key: Vec<usize>,
+        value: Vec<usize>,
+    },
 }

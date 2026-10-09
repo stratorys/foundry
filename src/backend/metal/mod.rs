@@ -1223,7 +1223,9 @@ mod tests {
         Tensor,
     };
     use crate::nn::{
+        Attention,
         Embedding,
+        KvCache,
         Linear,
         RmsNorm,
         Silu,
@@ -2789,5 +2791,189 @@ mod tests {
                 "swiglu mlp: {actual} is not within 1e-2 of {expected}"
             );
         });
+    }
+
+    #[test]
+    fn attention_matches_hand_computed_values() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let [query, key, value, mask] = [
+            (
+                vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
+                vec![2, 2, 2],
+            ),
+            (vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2]),
+            (vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]),
+            (vec![0.0, f32::NEG_INFINITY, 0.0, 0.0], vec![2, 2]),
+        ]
+        .map(|(values, dims)| {
+            Tensor::upload(
+                &mut backend,
+                &values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the upload succeeds")
+            .cast(&mut backend, DType::BF16)
+            .expect("the cast succeeds")
+        });
+        let mut cache =
+            KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
+        let attention = Attention::new(&mut backend, 2).expect("the attention is built");
+        let output = attention
+            .forward(&mut backend, &mut cache, &query, &key, &value, &mask)
+            .expect("the attention succeeds");
+        assert_eq!(output.dtype(), DType::BF16, "output keeps the input dtype");
+        assert_eq!(output.shape().dims(), &[2, 4], "output dims");
+        assert_eq!(cache.length(), 2, "cache length after the prefill");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        let expected = [
+            1.0_f32, 2.0, 1.0, 2.0, 2.339_52, 3.339_52, 1.391_15, 2.391_15,
+        ];
+        assert_eq!(actual.len(), expected.len(), "element count");
+        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+            assert!(
+                (actual - expected).abs() <= 1e-2 * expected.abs(),
+                "attention: {actual} is not within 1e-2 of {expected}"
+            );
+        });
+    }
+
+    #[test]
+    fn attention_decode_after_prefill_matches_full_prefill() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let [query, key, value, causal_mask] = [
+            (
+                vec![
+                    0.5_f32, -1.0, 1.0, 0.25, -0.5, 2.0, 1.0, 1.0, 0.0, -1.0, 1.5, 0.5,
+                ],
+                vec![2, 3, 2],
+            ),
+            (vec![1.0, 0.5, -1.0, 1.0, 0.25, -0.75], vec![1, 3, 2]),
+            (vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0], vec![1, 3, 2]),
+            (
+                vec![
+                    0.0,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                    0.0,
+                    0.0,
+                    f32::NEG_INFINITY,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                vec![3, 3],
+            ),
+        ]
+        .map(|(values, dims)| {
+            Tensor::upload(
+                &mut backend,
+                &values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the upload succeeds")
+            .cast(&mut backend, DType::BF16)
+            .expect("the cast succeeds")
+        });
+        let attention = Attention::new(&mut backend, 2).expect("the attention is built");
+        let mut prefill_cache =
+            KvCache::new(&mut backend, DType::BF16, 1, 3, 2).expect("the cache is built");
+        let prefill: Vec<f32> = attention
+            .forward(
+                &mut backend,
+                &mut prefill_cache,
+                &query,
+                &key,
+                &value,
+                &causal_mask,
+            )
+            .expect("the prefill succeeds")
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        let mut step_cache =
+            KvCache::new(&mut backend, DType::BF16, 1, 3, 2).expect("the cache is built");
+        let steps: Vec<f32> = (0..3)
+            .flat_map(|position| {
+                let mask = Tensor::zeros(
+                    &mut backend,
+                    DType::BF16,
+                    Shape::try_from([1, position + 1].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the zeros succeed");
+                let [query, key, value] = [&query, &key, &value]
+                    .map(|tensor| tensor.narrow(1, position, 1).expect("the narrow succeeds"));
+                attention
+                    .forward(&mut backend, &mut step_cache, &query, &key, &value, &mask)
+                    .expect("the step succeeds")
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect::<Vec<f32>>()
+            })
+            .collect();
+        assert_eq!(
+            step_cache.length(),
+            3,
+            "cache length after the decode steps"
+        );
+        assert_eq!(steps.len(), prefill.len(), "element count");
+        steps.iter().zip(&prefill).for_each(|(&step, &full)| {
+            assert!(
+                (step - full).abs() <= 1e-2 * full.abs(),
+                "decode: {step} is not within 1e-2 of prefill {full}"
+            );
+        });
+    }
+
+    #[test]
+    fn attention_beyond_cache_capacity_is_rejected() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let [query, key, value, mask] = [[2, 3, 2], [1, 3, 2], [1, 3, 2], [1, 3, 3]].map(|dims| {
+            Tensor::zeros(
+                &mut backend,
+                DType::BF16,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the zeros succeed")
+        });
+        let mut cache =
+            KvCache::new(&mut backend, DType::BF16, 1, 2, 2).expect("the cache is built");
+        let attention = Attention::new(&mut backend, 2).expect("the attention is built");
+        assert!(
+            matches!(
+                attention.forward(&mut backend, &mut cache, &query, &key, &value, &mask),
+                Err(MetalError::Core(CoreError::SliceUpdateOutOfBounds { .. }))
+            ),
+            "appending three positions to a cache of two is rejected"
+        );
+        assert_eq!(cache.length(), 0, "the cache length is unchanged");
     }
 }
