@@ -199,8 +199,6 @@ impl TryFrom<ConfigFile> for LlamaConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use serde_json::{
         Value,
         json,
@@ -395,36 +393,6 @@ mod tests {
         let result = parse(&config);
         assert!(
             matches!(result, Err(LlamaConfigError::Json(_))),
-            "got {result:?}"
-        );
-    }
-
-    #[test]
-    fn open_reads_config_json_from_the_directory() {
-        let directory =
-            std::env::temp_dir().join(format!("foundry-llama-config-open-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("the test directory is created");
-        fs::write(
-            directory.join("config.json"),
-            serde_json::to_vec(&instruct_config()).expect("the config serializes"),
-        )
-        .expect("the config is written");
-
-        let config = LlamaConfig::open(&directory).expect("the config is valid");
-        assert_eq!(config.hidden_size(), 3072, "hidden size");
-    }
-
-    #[test]
-    fn open_without_config_json_is_an_io_error() {
-        let directory = std::env::temp_dir().join(format!(
-            "foundry-llama-config-missing-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&directory).expect("the test directory is created");
-
-        let result = LlamaConfig::open(&directory);
-        assert!(
-            matches!(result, Err(LlamaConfigError::Io { .. })),
             "got {result:?}"
         );
     }

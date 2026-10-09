@@ -12,7 +12,7 @@ use objc2_metal::{
     MTLComputeCommandEncoder,
 };
 
-use super::{
+use crate::backend::metal::{
     Buffer,
     CommandBuffer,
     ComputeEncoder,
@@ -25,7 +25,7 @@ const DISPATCHES_PER_BUFFER: usize = 64;
 
 const IN_FLIGHT_MAX: usize = 3;
 
-pub(super) struct CommandStream {
+pub struct CommandStream {
     queue: Queue,
     open: Option<OpenBuffer>,
     in_flight: VecDeque<CommandBuffer>,
@@ -39,7 +39,7 @@ struct OpenBuffer {
 }
 
 impl CommandStream {
-    pub(super) fn new(queue: Queue) -> Self {
+    pub fn new(queue: Queue) -> Self {
         Self {
             queue,
             open: None,
@@ -48,9 +48,9 @@ impl CommandStream {
         }
     }
 
-    pub(super) fn queue(&self) -> &Queue { &self.queue }
+    pub fn queue(&self) -> &Queue { &self.queue }
 
-    pub(super) fn compute(
+    pub fn compute(
         &mut self,
         pipeline: &Pipeline,
         bind: impl FnOnce(&ComputeEncoder),
@@ -62,7 +62,7 @@ impl CommandStream {
         self.count_dispatch()
     }
 
-    pub(super) fn fill_zero(
+    pub fn fill_zero(
         &mut self,
         buffer: &Buffer,
     ) -> Result<(), MetalError> {
@@ -78,7 +78,7 @@ impl CommandStream {
         self.count_dispatch()
     }
 
-    pub(super) fn synchronize(&mut self) -> Result<(), MetalError> {
+    pub fn synchronize(&mut self) -> Result<(), MetalError> {
         self.check_failure()?;
         if let Some(mut open) = self.open.take() {
             self.in_flight.push_back(open.commit());

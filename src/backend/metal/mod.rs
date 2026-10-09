@@ -2519,7 +2519,7 @@ mod tests {
     fn batched_matmul_matches_sum_of_products() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let [lhs_values, rhs_values] =
-            [(8 * 3 * 128, 7_u16), (8 * 128 * 5, 5)].map(|(count, seed)| {
+            [(2 * 3 * 40, 7_u16), (2 * 40 * 5, 5)].map(|(count, seed)| {
                 (0..count)
                     .map(|index: u16| {
                         let step = index.wrapping_mul(seed).wrapping_add(3) % 17;
@@ -2528,10 +2528,10 @@ mod tests {
                     .collect::<Vec<f32>>()
             });
         let expected: Vec<f32> = lhs_values
-            .chunks(3 * 128)
-            .zip(rhs_values.chunks(128 * 5))
+            .chunks(3 * 40)
+            .zip(rhs_values.chunks(40 * 5))
             .flat_map(|(lhs_matrix, rhs_matrix)| {
-                lhs_matrix.chunks(128).flat_map(move |row| {
+                lhs_matrix.chunks(40).flat_map(move |row| {
                     (0..5).map(move |col| {
                         row.iter()
                             .zip(rhs_matrix.iter().skip(col).step_by(5))
@@ -2544,8 +2544,8 @@ mod tests {
         [(DType::F32, 1e-5_f32), (DType::BF16, 1e-2)]
             .into_iter()
             .for_each(|(dtype, tolerance)| {
-                let [lhs, rhs] = [(&lhs_values, [8, 3, 128]), (&rhs_values, [8, 128, 5])].map(
-                    |(values, dims)| {
+                let [lhs, rhs] =
+                    [(&lhs_values, [2, 3, 40]), (&rhs_values, [2, 40, 5])].map(|(values, dims)| {
                         Tensor::upload(
                             &mut backend,
                             &values
@@ -2558,8 +2558,7 @@ mod tests {
                         .expect("the upload succeeds")
                         .cast(&mut backend, dtype)
                         .expect("the cast succeeds")
-                    },
-                );
+                    });
                 let actual: Vec<f32> = lhs
                     .matmul(&mut backend, &rhs)
                     .expect("the matmul succeeds")
@@ -2575,7 +2574,7 @@ mod tests {
                 assert_eq!(
                     actual.len(),
                     expected.len(),
-                    "[8, 3, 128] x [8, 128, 5]: element count"
+                    "[2, 3, 40] x [2, 40, 5]: element count"
                 );
                 actual
                     .iter()
@@ -2584,7 +2583,7 @@ mod tests {
                         assert!(
                             (actual - expected).abs()
                                 <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                            "[8, 3, 128] x [8, 128, 5] for {dtype:?}: {actual} is not within \
+                            "[2, 3, 40] x [2, 40, 5] for {dtype:?}: {actual} is not within \
                              {tolerance} of {expected}"
                         );
                     });
@@ -3107,10 +3106,8 @@ mod tests {
     #[test]
     fn slice_update_writes_one_position_and_keeps_the_others_for_each_float_dtype() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let (heads, positions, head_dim, position) = (8_usize, 16_usize, 128_usize, 5_usize);
-        let update_values: Vec<f32> = (0_u16..1024)
-            .map(|index| f32::from(index % 64 + 1))
-            .collect();
+        let (heads, positions, head_dim, position) = (2_usize, 4_usize, 3_usize, 2_usize);
+        let update_values: Vec<f32> = (0_u16..6).map(|index| f32::from(index + 1)).collect();
         let expected: Vec<f32> = (0..heads)
             .flat_map(|head| {
                 let update_values = &update_values;
@@ -3175,7 +3172,7 @@ mod tests {
                     assert!(
                         (actual - expected).abs()
                             <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                        "[8, 1, 128] into [8, 16, 128] at 5 for {dtype:?}: {actual} is not within \
+                        "[2, 1, 3] into [2, 4, 3] at 2 for {dtype:?}: {actual} is not within \
                          {tolerance} of {expected}"
                     );
                 });

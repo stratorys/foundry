@@ -6,61 +6,10 @@ use crate::core::primitive::{
 use crate::core::{
     CoreError,
     DType,
-    Layout,
+    Operand,
+    OperandMut,
     Shape,
 };
-
-pub struct Operand<'storage, S> {
-    storage: &'storage S,
-    layout: &'storage Layout,
-    dtype: DType,
-}
-
-impl<'storage, S> Operand<'storage, S> {
-    pub(in crate::core) fn new(
-        storage: &'storage S,
-        layout: &'storage Layout,
-        dtype: DType,
-    ) -> Self {
-        Self {
-            storage,
-            layout,
-            dtype,
-        }
-    }
-
-    pub fn storage(&self) -> &'storage S { self.storage }
-
-    pub fn layout(&self) -> &'storage Layout { self.layout }
-
-    pub fn dtype(&self) -> DType { self.dtype }
-}
-
-pub struct OperandMut<'storage, S> {
-    storage: &'storage mut S,
-    layout: &'storage Layout,
-    dtype: DType,
-}
-
-impl<'storage, S> OperandMut<'storage, S> {
-    pub(in crate::core) fn new(
-        storage: &'storage mut S,
-        layout: &'storage Layout,
-        dtype: DType,
-    ) -> Self {
-        Self {
-            storage,
-            layout,
-            dtype,
-        }
-    }
-
-    pub fn storage_mut(&mut self) -> &mut S { self.storage }
-
-    pub fn layout(&self) -> &'storage Layout { self.layout }
-
-    pub fn dtype(&self) -> DType { self.dtype }
-}
 
 pub trait Backend {
     type Storage;

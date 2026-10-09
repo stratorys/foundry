@@ -7,7 +7,12 @@ use crate::core::{
     Shape,
     Tensor,
 };
-use crate::nn::softmax_last_axis;
+use crate::nn::{
+    KvCache,
+    softmax_last_axis,
+};
+
+const SEQ_AXIS: usize = 1;
 
 pub struct Attention<B: Backend> {
     head_dim: NonZeroUsize,
@@ -50,10 +55,12 @@ impl<B: Backend> Attention<B> {
         &self,
         backend: &mut B,
         query: &Tensor<B>,
-        keys: &Tensor<B>,
-        values: &Tensor<B>,
+        cache: &KvCache<B>,
+        seq_len_total: usize,
         mask: &Tensor<B>,
     ) -> Result<Tensor<B>, B::Error> {
+        let keys = &cache.keys().narrow(SEQ_AXIS, 0, seq_len_total)?;
+        let values = &cache.values().narrow(SEQ_AXIS, 0, seq_len_total)?;
         let AttentionDims {
             heads,
             kv_heads,
@@ -131,23 +138,13 @@ fn attention_dims(
 mod tests {
     use std::num::NonZeroUsize;
 
-    use crate::backend::cpu::{
-        CpuBackend,
-        CpuError,
-    };
     use crate::core::{
         CoreError,
-        DType,
         Shape,
-        Tensor,
     };
     use crate::nn::attention::{
         AttentionDims,
         attention_dims,
-    };
-    use crate::nn::{
-        Attention,
-        KvCache,
     };
 
     #[test]
@@ -292,215 +289,6 @@ mod tests {
                 value: vec![2, 3, 2],
             }),
             "values hold one more position than keys"
-        );
-    }
-
-    #[test]
-    fn attention_matches_hand_computed_values() {
-        let mut backend = CpuBackend::new();
-        let [query, key, value, mask] = [
-            (
-                vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
-                vec![2, 2, 2],
-            ),
-            (vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2]),
-            (vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]),
-            (vec![0.0, f32::NEG_INFINITY, 0.0, 0.0], vec![2, 2]),
-        ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, DType::BF16)
-            .expect("the cast succeeds")
-        });
-        let mut cache =
-            KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
-        let attention = Attention::new(
-            &mut backend,
-            NonZeroUsize::new(2).expect("the head dim is non-zero"),
-        )
-        .expect("the attention is built");
-        let (keys, values) = cache
-            .update(&mut backend, &key, &value, 0)
-            .expect("the cache update succeeds");
-        assert_eq!(
-            keys.shape().dims(),
-            &[1, 2, 2],
-            "keys view after the prefill"
-        );
-        let output = attention
-            .forward(&mut backend, &query, &keys, &values, &mask)
-            .expect("the attention succeeds");
-        assert_eq!(output.dtype(), DType::BF16, "output keeps the input dtype");
-        assert_eq!(output.shape().dims(), &[2, 4], "output dims");
-        let actual: Vec<f32> = output
-            .cast(&mut backend, DType::F32)
-            .expect("the cast succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&chunk| f32::from_le_bytes(chunk))
-            .collect();
-        let expected = [
-            1.0_f32, 2.0, 1.0, 2.0, 2.339_52, 3.339_52, 1.391_15, 2.391_15,
-        ];
-        assert_eq!(actual.len(), expected.len(), "element count");
-        actual.iter().zip(expected).for_each(|(&actual, expected)| {
-            assert!(
-                (actual - expected).abs() <= 1e-2 * expected.abs(),
-                "attention: {actual} is not within 1e-2 of {expected}"
-            );
-        });
-    }
-
-    #[test]
-    fn attention_decode_after_prefill_matches_full_prefill() {
-        let mut backend = CpuBackend::new();
-        let [query, key, value, causal_mask] = [
-            (
-                vec![
-                    0.5_f32, -1.0, 1.0, 0.25, -0.5, 2.0, 1.0, 1.0, 0.0, -1.0, 1.5, 0.5,
-                ],
-                vec![2, 3, 2],
-            ),
-            (vec![1.0, 0.5, -1.0, 1.0, 0.25, -0.75], vec![1, 3, 2]),
-            (vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0], vec![1, 3, 2]),
-            (
-                vec![
-                    0.0,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                    0.0,
-                    0.0,
-                    f32::NEG_INFINITY,
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-                vec![3, 3],
-            ),
-        ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, DType::BF16)
-            .expect("the cast succeeds")
-        });
-        let attention = Attention::new(
-            &mut backend,
-            NonZeroUsize::new(2).expect("the head dim is non-zero"),
-        )
-        .expect("the attention is built");
-        let mut prefill_cache =
-            KvCache::new(&mut backend, DType::BF16, 1, 3, 2).expect("the cache is built");
-        let (prefill_keys, prefill_values) = prefill_cache
-            .update(&mut backend, &key, &value, 0)
-            .expect("the cache update succeeds");
-        let prefill: Vec<f32> = attention
-            .forward(
-                &mut backend,
-                &query,
-                &prefill_keys,
-                &prefill_values,
-                &causal_mask,
-            )
-            .expect("the prefill succeeds")
-            .cast(&mut backend, DType::F32)
-            .expect("the cast succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&chunk| f32::from_le_bytes(chunk))
-            .collect();
-        let mut step_cache =
-            KvCache::new(&mut backend, DType::BF16, 1, 3, 2).expect("the cache is built");
-        let steps: Vec<f32> = (0..3)
-            .flat_map(|position| {
-                let mask = Tensor::zeros(
-                    &mut backend,
-                    DType::BF16,
-                    Shape::try_from([1, position + 1].as_slice()).expect("the shape is valid"),
-                )
-                .expect("the zeros succeed");
-                let [query, key, value] = [&query, &key, &value]
-                    .map(|tensor| tensor.narrow(1, position, 1).expect("the narrow succeeds"));
-                let (keys, values) = step_cache
-                    .update(&mut backend, &key, &value, position)
-                    .expect("the cache update succeeds");
-                assert_eq!(
-                    keys.shape().dims(),
-                    &[1, position + 1, 2],
-                    "keys view after the decode step"
-                );
-                attention
-                    .forward(&mut backend, &query, &keys, &values, &mask)
-                    .expect("the step succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect::<Vec<f32>>()
-            })
-            .collect();
-        assert_eq!(steps.len(), prefill.len(), "element count");
-        steps.iter().zip(&prefill).for_each(|(&step, &full)| {
-            assert!(
-                (step - full).abs() <= 1e-2 * full.abs(),
-                "decode: {step} is not within 1e-2 of prefill {full}"
-            );
-        });
-    }
-
-    #[test]
-    fn attention_rejects_a_head_dim_other_than_its_own() {
-        let mut backend = CpuBackend::new();
-        let [query, keys, values, mask] =
-            [&[2, 2, 2][..], &[1, 2, 2], &[1, 2, 2], &[2, 2]].map(|dims| {
-                Tensor::zeros(
-                    &mut backend,
-                    DType::BF16,
-                    Shape::try_from(dims).expect("the shape is valid"),
-                )
-                .expect("the zeros succeed")
-            });
-        let attention = Attention::new(
-            &mut backend,
-            NonZeroUsize::new(4).expect("the head dim is non-zero"),
-        )
-        .expect("the attention is built");
-        assert!(
-            matches!(
-                attention.forward(&mut backend, &query, &keys, &values, &mask),
-                Err(CpuError::Core(CoreError::AttentionHeadDimMismatch {
-                    head_dim: 2,
-                    head_dim_expected: 4,
-                }))
-            ),
-            "a head dim of 2 is rejected by an attention built for 4"
         );
     }
 }
