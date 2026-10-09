@@ -36,6 +36,9 @@ pub enum CoreError {
         dim: usize,
     },
 
+    #[error("Dimension {dim} exceeds {dim_max}, the largest dimension converted exactly to f32.")]
+    DimensionTooLargeForF32 { dim: usize, dim_max: usize },
+
     #[error("Reshape requires a contiguous layout.")]
     ReshapeNonContiguous,
 

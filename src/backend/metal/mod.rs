@@ -1219,6 +1219,14 @@ mod tests {
         Shape,
         Tensor,
     };
+    use crate::nn::{
+        Embedding,
+        Linear,
+        RmsNorm,
+        Silu,
+        SwigluMlp,
+        softmax_last_axis,
+    };
 
     fn backend() -> MetalBackend { MetalBackend::new().expect("a Metal device is available") }
 
@@ -2479,5 +2487,304 @@ mod tests {
             ),
             "concat rejects u32 on Metal"
         );
+    }
+
+    #[test]
+    fn rms_norm_of_constant_rows_is_the_weight() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let weight = Tensor::upload(
+            &mut backend,
+            &[1.0_f32, 2.0, 0.5, -1.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([4].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let norm = RmsNorm::new(&mut backend, weight, 1e-5).expect("the norm is built");
+        let x = Tensor::upload(
+            &mut backend,
+            &[2.0_f32, 2.0, 2.0, 2.0, -3.0, -3.0, -3.0, -3.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([2, 4].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let output = norm.forward(&mut backend, &x).expect("the norm succeeds");
+        assert_eq!(output.dtype(), DType::BF16, "output keeps the input dtype");
+        assert_eq!(output.shape().dims(), &[2, 4], "output dims");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        let expected = [1.0_f32, 2.0, 0.5, -1.0, -1.0, -2.0, -0.5, 1.0];
+        assert_eq!(actual.len(), expected.len(), "element count");
+        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+            assert!(
+                (actual - expected).abs() <= 1e-2 * expected.abs(),
+                "rms_norm: {actual} is not within 1e-2 of {expected}"
+            );
+        });
+    }
+
+    #[test]
+    fn rms_norm_rejects_a_dimension_beyond_u16() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let weight = Tensor::zeros(
+            &mut backend,
+            DType::BF16,
+            Shape::try_from([65_536].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the zeros succeed");
+        assert!(
+            matches!(
+                RmsNorm::new(&mut backend, weight, 1e-5),
+                Err(MetalError::Core(CoreError::DimensionTooLargeForF32 {
+                    dim: 65_536,
+                    dim_max: 65_535,
+                }))
+            ),
+            "a dimension above u16::MAX is rejected"
+        );
+    }
+
+    #[test]
+    fn softmax_rows_match_hand_computed_values_and_sum_to_one() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let x = Tensor::upload(
+            &mut backend,
+            &[1.0_f32, 2.0, 3.0, 0.0, 0.0, 0.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let output = softmax_last_axis(&mut backend, &x).expect("the softmax succeeds");
+        assert_eq!(output.dtype(), DType::BF16, "output keeps the input dtype");
+        assert_eq!(output.shape().dims(), &[2, 3], "output dims");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        let third = 1.0_f32 / 3.0;
+        let expected = [0.090_030_6_f32, 0.244_728_5, 0.665_241, third, third, third];
+        assert_eq!(actual.len(), expected.len(), "element count");
+        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+            assert!(
+                (actual - expected).abs() <= 1e-2 * expected.abs(),
+                "softmax: {actual} is not within 1e-2 of {expected}"
+            );
+        });
+        actual.chunks(3).for_each(|row| {
+            let row_sum: f32 = row.iter().sum();
+            assert!(
+                (row_sum - 1.0).abs() <= 1e-2,
+                "softmax row sum {row_sum} is not within 1e-2 of 1"
+            );
+        });
+    }
+
+    #[test]
+    fn silu_matches_hand_computed_values() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let silu = Silu::new(&mut backend).expect("the silu is built");
+        let x = Tensor::upload(
+            &mut backend,
+            &[0.0_f32, 1.0, -1.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([3].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let output = silu.forward(&mut backend, &x).expect("the silu succeeds");
+        assert_eq!(output.dtype(), DType::BF16, "output keeps the input dtype");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        let expected = [0.0_f32, 0.731_058_6, -0.268_941_4];
+        assert_eq!(actual.len(), expected.len(), "element count");
+        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+            assert!(
+                (actual - expected).abs() <= 1e-2 * expected.abs(),
+                "silu: {actual} is not within 1e-2 of {expected}"
+            );
+        });
+    }
+
+    #[test]
+    fn linear_multiplies_by_the_transposed_weight() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let weight = Tensor::upload(
+            &mut backend,
+            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let linear = Linear::new(weight);
+        let x = Tensor::upload(
+            &mut backend,
+            &[1.0_f32, 0.0, -1.0, 2.0, 1.0, 0.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let output = linear
+            .forward(&mut backend, &x)
+            .expect("the linear succeeds");
+        assert_eq!(output.shape().dims(), &[2, 2], "output dims");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![-2.0, -2.0, 4.0, 13.0],
+            "x times the transposed weight"
+        );
+    }
+
+    #[test]
+    fn embedding_gathers_the_rows_of_the_token_ids() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let table = Tensor::upload(
+            &mut backend,
+            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let embedding = Embedding::new(table);
+        let token_ids = Tensor::upload(
+            &mut backend,
+            &[2_u32, 0]
+                .iter()
+                .flat_map(|token_id| token_id.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::U32,
+            Shape::try_from([2].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds");
+        let output = embedding
+            .forward(&mut backend, &token_ids)
+            .expect("the embedding succeeds");
+        assert_eq!(output.shape().dims(), &[2, 2], "output dims");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        assert_eq!(actual, vec![5.0, 6.0, 1.0, 2.0], "rows 2 then 0");
+    }
+
+    #[test]
+    fn swiglu_mlp_with_identity_projections_gives_silu_of_x_times_x() {
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let identity_bytes: Vec<u8> = [1.0_f32, 0.0, 0.0, 1.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let identity_shape = Shape::try_from([2, 2].as_slice()).expect("the shape is valid");
+        let [gate, up, down] = [(); 3].map(|()| {
+            Linear::new(
+                Tensor::upload(&mut backend, &identity_bytes, DType::F32, identity_shape)
+                    .expect("the upload succeeds")
+                    .cast(&mut backend, DType::BF16)
+                    .expect("the cast succeeds"),
+            )
+        });
+        let mlp = SwigluMlp::new(&mut backend, gate, up, down).expect("the mlp is built");
+        let x = Tensor::upload(
+            &mut backend,
+            &[1.0_f32, 0.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([1, 2].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let output = mlp.forward(&mut backend, &x).expect("the mlp succeeds");
+        assert_eq!(output.shape().dims(), &[1, 2], "output dims");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        let expected = [0.731_058_6_f32, 0.0];
+        assert_eq!(actual.len(), expected.len(), "element count");
+        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+            assert!(
+                (actual - expected).abs() <= 1e-2 * expected.abs(),
+                "swiglu mlp: {actual} is not within 1e-2 of {expected}"
+            );
+        });
     }
 }
