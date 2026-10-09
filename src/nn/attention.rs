@@ -108,9 +108,10 @@ fn attention_dims(
         );
         CoreError::AttentionIncompatible
     };
-    let (&[heads, seq_len, head_dim], &[kv_heads, seq_len_total, key_head_dim]) =
-        (query.dims(), keys.dims())
-    else {
+    let &[heads, seq_len, head_dim] = query.dims() else {
+        return Err(incompatible());
+    };
+    let &[kv_heads, seq_len_total, key_head_dim] = keys.dims() else {
         return Err(incompatible());
     };
     let is_grouped = heads.checked_rem(kv_heads) == Some(0);

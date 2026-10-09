@@ -61,7 +61,8 @@ impl Layout {
             error!(message = "Reshape requires a contiguous layout.", layout = ?self);
             return Err(CoreError::ReshapeNonContiguous);
         }
-        let (from, to) = (self.shape.element_count(), shape.element_count());
+        let from = self.shape.element_count();
+        let to = shape.element_count();
         if from != to {
             error!(message = "Element counts do not match.", from, to);
             return Err(CoreError::ElementCountMismatch);
@@ -185,15 +186,26 @@ impl Layout {
     }
 }
 
+struct StrideFold {
+    strides: Vec<usize>,
+    stride_next: usize,
+}
+
 fn contiguous_strides(shape: &Shape) -> [usize; RANK_MAX] {
-    let (strides_reversed, _) = shape.dims().iter().rev().fold(
-        (Vec::with_capacity(RANK_MAX), 1_usize),
-        |(mut strides, stride_next), &dim| {
-            strides.push(stride_next);
-            (strides, stride_next.saturating_mul(dim))
+    let strides_reversed = shape.dims().iter().rev().fold(
+        StrideFold {
+            strides: Vec::with_capacity(RANK_MAX),
+            stride_next: 1,
+        },
+        |mut fold, &dim| {
+            fold.strides.push(fold.stride_next);
+            StrideFold {
+                stride_next: fold.stride_next.saturating_mul(dim),
+                strides: fold.strides,
+            }
         },
     );
-    let strides: Vec<usize> = strides_reversed.into_iter().rev().collect();
+    let strides: Vec<usize> = strides_reversed.strides.into_iter().rev().collect();
     padded(&strides)
 }
 
@@ -339,6 +351,16 @@ mod tests {
 
     const WIDENED_DIMS: [usize; 4] = [2, 6, 5, 7];
 
+    struct AddressFold {
+        rest: usize,
+        address: usize,
+    }
+
+    struct Window {
+        start: usize,
+        len: usize,
+    }
+
     fn addresses(layout: &Layout) -> Vec<usize> {
         let dims = layout.shape().dims();
         (0..layout.shape().element_count())
@@ -347,19 +369,25 @@ mod tests {
                     .zip(layout.strides())
                     .rev()
                     .fold(
-                        (flat, layout.offset()),
-                        |(rest, address), (&dim, &stride)| {
-                            let index = rest
+                        AddressFold {
+                            rest: flat,
+                            address: layout.offset(),
+                        },
+                        |fold, (&dim, &stride)| {
+                            let index = fold
+                                .rest
                                 .checked_rem(dim)
                                 .expect("a non-empty view has no zero dim");
-                            let address = index
-                                .checked_mul(stride)
-                                .and_then(|delta| address.checked_add(delta))
-                                .expect("the address fits in usize");
-                            (rest.checked_div(dim).expect("dim is non-zero"), address)
+                            AddressFold {
+                                rest: fold.rest.checked_div(dim).expect("dim is non-zero"),
+                                address: index
+                                    .checked_mul(stride)
+                                    .and_then(|delta| fold.address.checked_add(delta))
+                                    .expect("the address fits in usize"),
+                            }
                         },
                     )
-                    .1
+                    .address
             })
             .collect()
     }
@@ -384,15 +412,24 @@ mod tests {
             .enumerate()
             .flat_map(|(axis, &dim)| {
                 [
-                    Some((0, dim)),
-                    dim.checked_sub(1).map(|len| (1, len)),
-                    Some((dim, 0)),
+                    Some(Window {
+                        start: 0,
+                        len: dim,
+                    }),
+                    dim.checked_sub(1).map(|len| Window {
+                        start: 1,
+                        len,
+                    }),
+                    Some(Window {
+                        start: dim,
+                        len: 0,
+                    }),
                 ]
                 .into_iter()
                 .flatten()
-                .map(move |(start, len)| {
+                .map(move |window| {
                     layout
-                        .narrow(axis, start, len)
+                        .narrow(axis, window.start, window.len)
                         .expect("the window is in bounds")
                 })
             })

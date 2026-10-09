@@ -30,17 +30,28 @@ const HEADER_LEN_BYTES: usize = 8;
 const HEADER_BYTES_MAX: usize = 100 * 1024 * 1024;
 const INDEX_BYTES_MAX: u64 = 100 * 1024 * 1024;
 
+pub struct Shard<S> {
+    pub name: String,
+    pub bytes: S,
+}
+
 pub struct Weights<S = Mmap> {
-    shards: Vec<S>,
+    shards: Vec<Shard<S>>,
     tensors: HashMap<String, TensorEntry>,
     bytes_declared: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WeightView<'weights> {
+    pub name: &'weights str,
     pub dtype: DType,
     pub shape: Shape,
     pub bytes: &'weights [u8],
+}
+
+struct IndexedTensor {
+    shard_index: usize,
+    tensor: ShardTensor,
 }
 
 struct TensorEntry {
@@ -98,10 +109,12 @@ impl Weights {
         let shards = shard_names
             .into_iter()
             .map(|name| {
-                let shard = open_shard(directory, &name)?;
-                Ok((name, shard))
+                Ok(Shard {
+                    bytes: open_shard(directory, &name)?,
+                    name,
+                })
             })
-            .collect::<Result<Vec<(String, Mmap)>, WeightsError>>()?;
+            .collect::<Result<Vec<Shard<Mmap>>, WeightsError>>()?;
         Self::assemble(directory, index, shards)
     }
 }
@@ -109,7 +122,7 @@ impl Weights {
 impl<S: AsRef<[u8]>> Weights<S> {
     pub fn from_shards(
         index: Option<&[u8]>,
-        shards: Vec<(String, S)>,
+        shards: Vec<Shard<S>>,
     ) -> Result<Self, WeightsError> {
         let index = index
             .map(|bytes| parse_index(Path::new(INDEX_FILE), bytes))
@@ -121,29 +134,33 @@ impl<S: AsRef<[u8]>> Weights<S> {
         &self,
         name: &str,
     ) -> Option<WeightView<'_>> {
-        self.view(self.tensors.get(name)?)
+        let (name, entry) = self.tensors.get_key_value(name)?;
+        self.view(name, entry)
     }
 
-    pub fn tensors(&self) -> impl Iterator<Item = (&str, WeightView<'_>)> {
+    pub fn tensors(&self) -> impl Iterator<Item = WeightView<'_>> {
         self.tensors
             .iter()
-            .filter_map(|(name, entry)| Some((name.as_str(), self.view(entry)?)))
+            .filter_map(|(name, entry)| self.view(name, entry))
     }
 
     pub fn shard_count(&self) -> usize { self.shards.len() }
 
     pub fn bytes_declared(&self) -> Option<u64> { self.bytes_declared }
 
-    fn view(
-        &self,
+    fn view<'weights>(
+        &'weights self,
+        name: &'weights str,
         entry: &TensorEntry,
-    ) -> Option<WeightView<'_>> {
+    ) -> Option<WeightView<'weights>> {
         let bytes = self
             .shards
             .get(entry.shard_index)?
+            .bytes
             .as_ref()
             .get(entry.byte_range.clone())?;
         Some(WeightView {
+            name,
             dtype: entry.dtype,
             shape: entry.shape,
             bytes,
@@ -153,21 +170,26 @@ impl<S: AsRef<[u8]>> Weights<S> {
     fn assemble(
         directory: &Path,
         index: Option<IndexFile>,
-        shards: Vec<(String, S)>,
+        shards: Vec<Shard<S>>,
     ) -> Result<Self, WeightsError> {
-        let (shard_names, shards): (Vec<String>, Vec<S>) = shards.into_iter().unzip();
-        let shard_tensors = shard_names
+        let shard_tensors = shards
             .iter()
-            .zip(&shards)
-            .map(|(name, shard)| parse_shard(&directory.join(name), shard.as_ref()))
+            .map(|shard| parse_shard(&directory.join(&shard.name), shard.bytes.as_ref()))
             .collect::<Result<Vec<Vec<ShardTensor>>, WeightsError>>()?;
         let tensors = shard_tensors
             .into_iter()
             .enumerate()
             .flat_map(|(shard_index, tensors)| {
-                tensors.into_iter().map(move |tensor| (shard_index, tensor))
+                tensors.into_iter().map(move |tensor| IndexedTensor {
+                    shard_index,
+                    tensor,
+                })
             })
-            .try_fold(HashMap::new(), |mut tensors, (shard_index, tensor)| {
+            .try_fold(HashMap::new(), |mut tensors, indexed| {
+                let IndexedTensor {
+                    shard_index,
+                    tensor,
+                } = indexed;
                 if tensors.contains_key(&tensor.name) {
                     error!(
                         message = "Tensor appears in more than one shard.",
@@ -187,7 +209,7 @@ impl<S: AsRef<[u8]>> Weights<S> {
                 Ok(tensors)
             })?;
         if let Some(index) = &index {
-            check_index(&index.weight_map, &shard_names, &tensors)?;
+            check_index(&index.weight_map, &shards, &tensors)?;
         }
         let bytes_declared = index
             .and_then(|index| index.metadata)
@@ -380,8 +402,10 @@ fn parse_tensor(
         );
         return Err(WeightsError::SizeMismatch);
     }
-    let (Some(start), Some(stop)) = (data_start.checked_add(begin), data_start.checked_add(end))
-    else {
+    let Some(start) = data_start.checked_add(begin) else {
+        return Err(out_of_data_region());
+    };
+    let Some(stop) = data_start.checked_add(end) else {
         return Err(out_of_data_region());
     };
     Ok(ShardTensor {
@@ -421,15 +445,16 @@ fn check_overlaps(tensors: &[ShardTensor]) -> Result<(), WeightsError> {
         .map_or(Ok(()), Err)
 }
 
-fn check_index(
+fn check_index<S>(
     weight_map: &BTreeMap<String, String>,
-    shard_names: &[String],
+    shards: &[Shard<S>],
     tensors: &HashMap<String, TensorEntry>,
 ) -> Result<(), WeightsError> {
     weight_map.iter().try_for_each(|(name, shard)| {
         let shard_found = tensors
             .get(name)
-            .and_then(|entry| shard_names.get(entry.shard_index));
+            .and_then(|entry| shards.get(entry.shard_index))
+            .map(|found| &found.name);
         if shard_found == Some(shard) {
             Ok(())
         } else {
@@ -452,6 +477,7 @@ mod tests {
     };
     use crate::weights::{
         HEADER_BYTES_MAX,
+        Shard,
         WeightView,
         Weights,
         WeightsError,
@@ -473,13 +499,20 @@ mod tests {
             .chain(header)
             .chain(0..28)
             .collect();
-        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
-            .expect("the file is valid");
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the file is valid");
         let a_bytes: Vec<u8> = (0..12).collect();
         let b_bytes: Vec<u8> = (12..28).collect();
         assert_eq!(
             weights.get("a"),
             Some(WeightView {
+                name: "a",
                 dtype: DType::BF16,
                 shape: Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
                 bytes: &a_bytes,
@@ -489,6 +522,7 @@ mod tests {
         assert_eq!(
             weights.get("b"),
             Some(WeightView {
+                name: "b",
                 dtype: DType::F32,
                 shape: Shape::try_from([4].as_slice()).expect("the shape is valid"),
                 bytes: &b_bytes,
@@ -502,26 +536,35 @@ mod tests {
 
     #[test]
     fn index_with_two_shards_loads_both() {
+        struct HeaderDataCase<T0, T1> {
+            header: T0,
+            data: T1,
+        }
         let [first, second] = [
-            (
-                json!({ "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] } }),
-                vec![0, 1, 2, 3],
-            ),
-            (
-                json!({ "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
-                vec![9, 8, 7, 6],
-            ),
+            HeaderDataCase {
+                header: json!({ "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] } }),
+                data: vec![0, 1, 2, 3],
+            },
+            HeaderDataCase {
+                header: json!({ "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+                data: vec![9, 8, 7, 6],
+            },
         ]
-        .map(|(header, data)| {
-            let header = serde_json::to_vec(&header).expect("the header serializes");
-            u64::try_from(header.len())
-                .expect("the header length fits in u64")
-                .to_le_bytes()
-                .into_iter()
-                .chain(header)
-                .chain(data)
-                .collect::<Vec<u8>>()
-        });
+        .map(
+            |HeaderDataCase {
+                 header,
+                 data,
+             }| {
+                let header = serde_json::to_vec(&header).expect("the header serializes");
+                u64::try_from(header.len())
+                    .expect("the header length fits in u64")
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(header)
+                    .chain(data)
+                    .collect::<Vec<u8>>()
+            },
+        );
         let index = serde_json::to_vec(&json!({
             "metadata": { "total_size": 8 },
             "weight_map": { "a": "s1.safetensors", "b": "s2.safetensors" },
@@ -530,8 +573,14 @@ mod tests {
         let weights = Weights::from_shards(
             Some(&index),
             vec![
-                ("s1.safetensors".to_owned(), first),
-                ("s2.safetensors".to_owned(), second),
+                Shard {
+                    name: "s1.safetensors".to_owned(),
+                    bytes: first,
+                },
+                Shard {
+                    name: "s2.safetensors".to_owned(),
+                    bytes: second,
+                },
             ],
         )
         .expect("the shards are valid");
@@ -567,7 +616,14 @@ mod tests {
         )
         .expect("the index serializes");
         assert_eq!(
-            Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                Some(&index),
+                vec![Shard {
+                    name: "s1.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::IndexMismatch),
             "the index names a tensor the shard does not hold"
         );
@@ -596,8 +652,14 @@ mod tests {
             Weights::from_shards(
                 Some(&index),
                 vec![
-                    ("s1.safetensors".to_owned(), first),
-                    ("s2.safetensors".to_owned(), second),
+                    Shard {
+                        name: "s1.safetensors".to_owned(),
+                        bytes: first
+                    },
+                    Shard {
+                        name: "s2.safetensors".to_owned(),
+                        bytes: second
+                    },
                 ],
             )
             .err(),
@@ -621,8 +683,14 @@ mod tests {
             .collect();
         let index = serde_json::to_vec(&json!({ "weight_map": { "a": "s1.safetensors" } }))
             .expect("the index serializes");
-        let weights = Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)])
-            .expect("the shard is valid");
+        let weights = Weights::from_shards(
+            Some(&index),
+            vec![Shard {
+                name: "s1.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the shard is valid");
         assert_eq!(
             weights.bytes_declared(),
             None,
@@ -651,7 +719,7 @@ mod tests {
 
     #[test]
     fn duplicate_tensor_across_shards_is_rejected() {
-        let [first, second] = [(); 2].map(|()| {
+        let [first, second] = [0_u8; 2].map(|_| {
             let header = serde_json::to_vec(
                 &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
             )
@@ -668,8 +736,14 @@ mod tests {
             Weights::from_shards(
                 None,
                 vec![
-                    ("s1.safetensors".to_owned(), first),
-                    ("s2.safetensors".to_owned(), second),
+                    Shard {
+                        name: "s1.safetensors".to_owned(),
+                        bytes: first
+                    },
+                    Shard {
+                        name: "s2.safetensors".to_owned(),
+                        bytes: second
+                    },
                 ],
             )
             .err(),
@@ -701,7 +775,10 @@ mod tests {
         assert_eq!(
             Weights::from_shards(
                 None,
-                vec![("model.safetensors".to_owned(), vec![1, 0, 0, 0])]
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: vec![1, 0, 0, 0]
+                }]
             )
             .err(),
             Some(WeightsError::TruncatedHeader),
@@ -713,7 +790,14 @@ mod tests {
     fn header_longer_than_the_file_is_truncated() {
         let file: Vec<u8> = 100_u64.to_le_bytes().into_iter().chain(*b"{}").collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::TruncatedHeader),
             "a header of 100 bytes does not fit in 10 bytes"
         );
@@ -725,10 +809,10 @@ mod tests {
         assert_eq!(
             Weights::from_shards(
                 None,
-                vec![(
-                    "model.safetensors".to_owned(),
-                    header_bytes.to_le_bytes().to_vec()
-                )]
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: header_bytes.to_le_bytes().to_vec()
+                }]
             )
             .err(),
             Some(WeightsError::HeaderTooLarge),
@@ -742,10 +826,10 @@ mod tests {
         assert_eq!(
             Weights::from_shards(
                 None,
-                vec![(
-                    "model.safetensors".to_owned(),
-                    header_bytes.to_le_bytes().to_vec()
-                )]
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: header_bytes.to_le_bytes().to_vec()
+                }]
             )
             .err(),
             Some(WeightsError::TruncatedHeader),
@@ -765,7 +849,14 @@ mod tests {
                     .chain(header.iter().copied())
                     .collect();
                 assert_eq!(
-                    Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+                    Weights::from_shards(
+                        None,
+                        vec![Shard {
+                            name: "model.safetensors".to_owned(),
+                            bytes: file
+                        }]
+                    )
+                    .err(),
                     Some(WeightsError::HeaderJson),
                     "header {header:?} is rejected"
                 );
@@ -789,7 +880,14 @@ mod tests {
                 .chain(0..8)
                 .collect();
             assert_eq!(
-                Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+                Weights::from_shards(
+                    None,
+                    vec![Shard {
+                        name: "model.safetensors".to_owned(),
+                        bytes: file
+                    }]
+                )
+                .err(),
                 Some(WeightsError::TensorHeaderJson),
                 "entry {entry} is rejected"
             );
@@ -810,7 +908,14 @@ mod tests {
             .chain(0..1)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::UnknownDType),
             "dtype Q4 is unknown"
         );
@@ -830,7 +935,14 @@ mod tests {
             .chain(0..4)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::UnknownDType),
             "dtype names are case sensitive"
         );
@@ -850,8 +962,14 @@ mod tests {
             .chain(header)
             .chain(0..8)
             .collect();
-        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
-            .expect("the file is valid");
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the file is valid");
         assert_eq!(
             weights.get("a").map(|view| view.dtype),
             Some(DType::F16),
@@ -878,7 +996,14 @@ mod tests {
             .chain(0..4)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::InvalidShape),
             "a rank 5 shape is rejected"
         );
@@ -898,7 +1023,14 @@ mod tests {
             .chain(0..8)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::InvalidRange),
             "a range that begins after its end is rejected"
         );
@@ -918,7 +1050,14 @@ mod tests {
             .chain(0..4)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::OutOfDataRegion),
             "a range ending after the data is rejected"
         );
@@ -938,7 +1077,14 @@ mod tests {
             .chain(0..8)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::SizeMismatch),
             "8 bytes do not hold six bf16 values"
         );
@@ -947,8 +1093,14 @@ mod tests {
     #[test]
     fn empty_header_has_no_tensors() {
         let file: Vec<u8> = 2_u64.to_le_bytes().into_iter().chain(*b"{}").collect();
-        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
-            .expect("an empty header is valid");
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("an empty header is valid");
         assert_eq!(weights.tensors().count(), 0, "no tensors");
     }
 
@@ -966,11 +1118,18 @@ mod tests {
             .chain(header)
             .chain(0..4)
             .collect();
-        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
-            .expect("the file is valid");
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the file is valid");
         assert_eq!(
             weights.get("s"),
             Some(WeightView {
+                name: "s",
                 dtype: DType::F32,
                 shape: Shape::try_from([].as_slice()).expect("the shape is valid"),
                 bytes: &[0, 1, 2, 3],
@@ -980,6 +1139,7 @@ mod tests {
         assert_eq!(
             weights.get("z"),
             Some(WeightView {
+                name: "z",
                 dtype: DType::F32,
                 shape: Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
                 bytes: &[],
@@ -1003,7 +1163,14 @@ mod tests {
             .chain(0..12)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::OverlappingRanges),
             "ranges [0, 8] and [4, 12] overlap"
         );
@@ -1024,7 +1191,14 @@ mod tests {
             .chain(0..12)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::OverlappingRanges),
             "ranges are compared in offset order, not in name order"
         );
@@ -1045,8 +1219,14 @@ mod tests {
             .chain(header)
             .chain(0..4)
             .collect();
-        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
-            .expect("empty ranges do not overlap");
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("empty ranges do not overlap");
         assert_eq!(weights.tensors().count(), 3, "three tensors");
     }
 
@@ -1065,7 +1245,14 @@ mod tests {
             .chain(0..8)
             .collect();
         assert_eq!(
-            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Weights::from_shards(
+                None,
+                vec![Shard {
+                    name: "model.safetensors".to_owned(),
+                    bytes: file
+                }]
+            )
+            .err(),
             Some(WeightsError::OverlappingRanges),
             "an empty range that starts inside another range is rejected"
         );
@@ -1084,8 +1271,14 @@ mod tests {
             .chain(header)
             .chain(0..4)
             .collect();
-        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
-            .expect("the file is valid");
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the file is valid");
         assert_eq!(weights.get("b"), None, "tensor b is not in the file");
     }
 }

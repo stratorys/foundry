@@ -46,6 +46,18 @@ pub enum ReduceOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinarySpec {
+    dtype: FloatDType,
+    output: Shape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CastSpec {
+    from: FloatDType,
+    to: FloatDType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReduceSpec {
     op: ReduceOp,
     dtype: FloatDType,
@@ -97,6 +109,23 @@ pub struct SliceUpdateSpec {
     offset: usize,
 }
 
+struct StrideFold {
+    strides: Vec<usize>,
+    stride_next: usize,
+}
+
+impl BinarySpec {
+    pub fn dtype(&self) -> FloatDType { self.dtype }
+
+    pub fn output(&self) -> &Shape { &self.output }
+}
+
+impl CastSpec {
+    pub fn from(&self) -> FloatDType { self.from }
+
+    pub fn to(&self) -> FloatDType { self.to }
+}
+
 impl ReduceSpec {
     pub fn op(&self) -> ReduceOp { self.op }
 
@@ -123,14 +152,20 @@ impl MatrixLayout {
         cols: usize,
     ) -> Self {
         let matrix_len = rows.saturating_mul(cols);
-        let (batch_strides_reversed, _) = batch.dims().iter().rev().fold(
-            (Vec::with_capacity(RANK_MAX), matrix_len),
-            |(mut strides, stride_next), &dim| {
-                strides.push(stride_next);
-                (strides, stride_next.saturating_mul(dim))
+        let batch_strides_reversed = batch.dims().iter().rev().fold(
+            StrideFold {
+                strides: Vec::with_capacity(RANK_MAX),
+                stride_next: matrix_len,
+            },
+            |mut fold, &dim| {
+                fold.strides.push(fold.stride_next);
+                StrideFold {
+                    stride_next: fold.stride_next.saturating_mul(dim),
+                    strides: fold.strides,
+                }
             },
         );
-        let batch_strides: Vec<usize> = batch_strides_reversed.into_iter().rev().collect();
+        let batch_strides: Vec<usize> = batch_strides_reversed.strides.into_iter().rev().collect();
         Self {
             offset: 0,
             row_stride: cols,
@@ -211,9 +246,11 @@ pub fn binary_rule(
     lhs_shape: &Shape,
     rhs_dtype: DType,
     rhs_shape: &Shape,
-) -> Result<(FloatDType, Shape), CoreError> {
-    let dtype = require_same_float(lhs_dtype, rhs_dtype)?;
-    Ok((dtype, Shape::broadcast(lhs_shape, rhs_shape)?))
+) -> Result<BinarySpec, CoreError> {
+    Ok(BinarySpec {
+        dtype: require_same_float(lhs_dtype, rhs_dtype)?,
+        output: Shape::broadcast(lhs_shape, rhs_shape)?,
+    })
 }
 
 pub fn reduce_rule(
@@ -259,17 +296,19 @@ pub fn matmul_rule(
         );
         CoreError::MatmulIncompatible
     };
-    let (Some((lhs_batch, &[m, lhs_k])), Some((rhs_batch, &[rhs_k, n]))) = (
-        lhs.shape().dims().split_last_chunk::<2>(),
-        rhs.shape().dims().split_last_chunk::<2>(),
-    ) else {
+    let Some((lhs_batch, &[m, lhs_k])) = lhs.shape().dims().split_last_chunk::<2>() else {
+        return Err(incompatible());
+    };
+    let Some((rhs_batch, &[rhs_k, n])) = rhs.shape().dims().split_last_chunk::<2>() else {
         return Err(incompatible());
     };
     if lhs_batch != rhs_batch || lhs_k != rhs_k {
         return Err(incompatible());
     }
-    let (Some(lhs_matrix), Some(rhs_matrix)) = (MatrixLayout::of(lhs), MatrixLayout::of(rhs))
-    else {
+    let Some(lhs_matrix) = MatrixLayout::of(lhs) else {
+        return Err(incompatible());
+    };
+    let Some(rhs_matrix) = MatrixLayout::of(rhs) else {
         return Err(incompatible());
     };
     let dims: Vec<usize> = lhs_batch.iter().copied().chain([m, n]).collect();
@@ -288,8 +327,11 @@ pub fn matmul_rule(
 pub fn cast_rule(
     dtype_from: DType,
     dtype_to: DType,
-) -> Result<(FloatDType, FloatDType), CoreError> {
-    Ok((require_float(dtype_from)?, require_float(dtype_to)?))
+) -> Result<CastSpec, CoreError> {
+    Ok(CastSpec {
+        from: require_float(dtype_from)?,
+        to: require_float(dtype_to)?,
+    })
 }
 
 pub fn gather_rule(
@@ -303,15 +345,22 @@ pub fn gather_rule(
         error!(message = "Gather indices are not u32.", dtype = ?indices_dtype);
         return Err(CoreError::IndicesNotU32);
     }
-    let (&[rows, cols], &[row_stride, col_stride], &[index_count]) =
-        (table.shape().dims(), table.strides(), indices_shape.dims())
-    else {
+    let incompatible = || {
         error!(
             message = "Table and indices cannot be gathered.",
             table = ?table.shape().dims(),
             indices = ?indices_shape.dims(),
         );
-        return Err(CoreError::GatherIncompatible);
+        CoreError::GatherIncompatible
+    };
+    let &[rows, cols] = table.shape().dims() else {
+        return Err(incompatible());
+    };
+    let &[row_stride, col_stride] = table.strides() else {
+        return Err(incompatible());
+    };
+    let &[index_count] = indices_shape.dims() else {
+        return Err(incompatible());
     };
     Ok(GatherSpec {
         dtype,
@@ -340,7 +389,8 @@ pub fn concat_rule(
         );
         CoreError::ConcatIncompatible
     };
-    let (lhs_dim, rhs_dim) = (lhs_shape.dim(axis)?, rhs_shape.dim(axis)?);
+    let lhs_dim = lhs_shape.dim(axis)?;
+    let rhs_dim = rhs_shape.dim(axis)?;
     if !dims_equal_except(lhs_shape, rhs_shape, axis) {
         return Err(incompatible());
     }
@@ -376,7 +426,8 @@ pub fn slice_update_rule(
         );
         CoreError::SliceUpdateOutOfBounds
     };
-    let (target_dim, update_dim) = (target_shape.dim(axis)?, update_shape.dim(axis)?);
+    let target_dim = target_shape.dim(axis)?;
+    let update_dim = update_shape.dim(axis)?;
     let fits = start
         .checked_add(update_dim)
         .is_some_and(|end| end <= target_dim);
@@ -447,7 +498,15 @@ fn padded(values: &[usize]) -> [usize; RANK_MAX] {
 #[cfg(test)]
 mod tests {
     use crate::core::primitive::{
+        BinarySpec,
+        CastSpec,
+        ConcatSpec,
+        GatherSpec,
+        MatmulSpec,
+        MatrixLayout,
         ReduceOp,
+        ReduceSpec,
+        SliceUpdateSpec,
         binary_rule,
         cast_rule,
         concat_rule,
@@ -492,10 +551,10 @@ mod tests {
                 DType::BF16,
                 &Shape::try_from([3].as_slice()).expect("valid shape"),
             ),
-            Ok((
-                FloatDType::BF16,
-                Shape::try_from([2, 3].as_slice()).expect("valid shape")
-            )),
+            Ok(BinarySpec {
+                dtype: FloatDType::BF16,
+                output: Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+            }),
             "dtype and broadcast shape"
         );
     }
@@ -544,16 +603,17 @@ mod tests {
         )
         .expect("valid reduction");
         assert_eq!(
-            (
-                spec.dtype(),
-                spec.dtype_output(),
-                spec.output().dims(),
-                spec.axis_len(),
-                spec.axis_stride(),
-            ),
-            (FloatDType::BF16, DType::BF16, [2, 1, 4].as_slice(), 3, 4),
+            spec,
+            ReduceSpec {
+                op: ReduceOp::Sum,
+                dtype: FloatDType::BF16,
+                output: Shape::try_from([2, 1, 4].as_slice()).expect("valid shape"),
+                axis_len: 3,
+                axis_stride: 4,
+            },
             "dtype, output dims, axis length and stride"
         );
+        assert_eq!(spec.dtype_output(), DType::BF16, "a sum keeps the dtype");
     }
 
     #[test]
@@ -566,8 +626,19 @@ mod tests {
         )
         .expect("valid reduction");
         assert_eq!(
-            (spec.dtype_output(), spec.output().dims()),
-            (DType::U32, [2, 1].as_slice()),
+            spec,
+            ReduceSpec {
+                op: ReduceOp::Argmax,
+                dtype: FloatDType::F32,
+                output: Shape::try_from([2, 1].as_slice()).expect("valid shape"),
+                axis_len: 3,
+                axis_stride: 1,
+            },
+            "argmax over axis 1"
+        );
+        assert_eq!(
+            spec.dtype_output(),
+            DType::U32,
             "argmax outputs u32 indices"
         );
     }
@@ -636,35 +707,28 @@ mod tests {
         )
         .expect("compatible shapes");
         assert_eq!(
-            (
-                spec.dtype(),
-                spec.output().dims(),
-                spec.batch().dims(),
-                spec.m(),
-                spec.k(),
-                spec.n(),
-            ),
-            (
-                FloatDType::BF16,
-                [5, 2, 4].as_slice(),
-                [5].as_slice(),
-                2,
-                3,
-                4
-            ),
-            "dtype, output, batch and matrix dims"
-        );
-        assert_eq!(
-            (
-                spec.lhs().row_stride(),
-                spec.lhs().col_stride(),
-                spec.lhs().batch_strides(),
-                spec.rhs().row_stride(),
-                spec.rhs().col_stride(),
-                spec.rhs().batch_strides(),
-            ),
-            (3, 1, &[6, 0, 0, 0], 4, 1, &[12, 0, 0, 0]),
-            "operand strides"
+            spec,
+            MatmulSpec {
+                dtype: FloatDType::BF16,
+                output: Shape::try_from([5, 2, 4].as_slice()).expect("valid shape"),
+                batch: Shape::try_from([5].as_slice()).expect("valid shape"),
+                m: 2,
+                k: 3,
+                n: 4,
+                lhs: MatrixLayout {
+                    offset: 0,
+                    row_stride: 3,
+                    col_stride: 1,
+                    batch_strides: [6, 0, 0, 0],
+                },
+                rhs: MatrixLayout {
+                    offset: 0,
+                    row_stride: 4,
+                    col_stride: 1,
+                    batch_strides: [12, 0, 0, 0],
+                },
+            },
+            "dtype, output, batch, matrix dims and operand strides"
         );
     }
 
@@ -681,8 +745,13 @@ mod tests {
         )
         .expect("compatible shapes");
         assert_eq!(
-            (spec.rhs().row_stride(), spec.rhs().col_stride()),
-            (1, 3),
+            spec.rhs(),
+            &MatrixLayout {
+                offset: 0,
+                row_stride: 1,
+                col_stride: 3,
+                batch_strides: [0, 0, 0, 0],
+            },
             "the transposed rhs walks rows with stride 1"
         );
     }
@@ -717,9 +786,26 @@ mod tests {
 
     #[test]
     fn matmul_rejects_rank_below_two() {
-        [([3].as_slice(), [3, 4].as_slice()), (&[2, 3], &[3])]
-            .into_iter()
-            .for_each(|(lhs, rhs)| {
+        struct LhsRhsCase<T0, T1> {
+            lhs: T0,
+            rhs: T1,
+        }
+        [
+            LhsRhsCase {
+                lhs: [3].as_slice(),
+                rhs: [3, 4].as_slice(),
+            },
+            LhsRhsCase {
+                lhs: &[2, 3],
+                rhs: &[3],
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |LhsRhsCase {
+                 lhs,
+                 rhs,
+             }| {
                 assert_eq!(
                     matmul_rule(
                         DType::F32,
@@ -730,7 +816,8 @@ mod tests {
                     Err(CoreError::MatmulIncompatible),
                     "lhs {lhs:?} and rhs {rhs:?}"
                 );
-            });
+            },
+        );
     }
 
     #[test]
@@ -779,22 +866,43 @@ mod tests {
     fn cast_returns_both_float_dtypes() {
         assert_eq!(
             cast_rule(DType::F32, DType::BF16),
-            Ok((FloatDType::F32, FloatDType::BF16)),
+            Ok(CastSpec {
+                from: FloatDType::F32,
+                to: FloatDType::BF16,
+            }),
             "source and target dtypes"
         );
     }
 
     #[test]
     fn cast_rejects_integer_source_and_target() {
-        [(DType::U32, DType::F32), (DType::F32, DType::U32)]
-            .into_iter()
-            .for_each(|(from, to)| {
+        struct FromToCase<T0, T1> {
+            from: T0,
+            to: T1,
+        }
+        [
+            FromToCase {
+                from: DType::U32,
+                to: DType::F32,
+            },
+            FromToCase {
+                from: DType::F32,
+                to: DType::U32,
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |FromToCase {
+                 from,
+                 to,
+             }| {
                 assert_eq!(
                     cast_rule(from, to),
                     Err(CoreError::DTypeNotFloat),
                     "cast from {from:?} to {to:?}"
                 );
-            });
+            },
+        );
     }
 
     #[test]
@@ -810,15 +918,15 @@ mod tests {
         )
         .expect("valid gather");
         assert_eq!(
-            (
-                spec.dtype(),
-                spec.output().dims(),
-                spec.rows(),
-                spec.cols(),
-                spec.row_stride(),
-                spec.col_stride(),
-            ),
-            (FloatDType::BF16, [5, 4].as_slice(), 3, 4, 1, 3),
+            spec,
+            GatherSpec {
+                dtype: FloatDType::BF16,
+                output: Shape::try_from([5, 4].as_slice()).expect("valid shape"),
+                rows: 3,
+                cols: 4,
+                row_stride: 1,
+                col_stride: 3,
+            },
             "dtype, output dims, table dims and strides"
         );
     }
@@ -853,24 +961,42 @@ mod tests {
 
     #[test]
     fn gather_rejects_invalid_ranks() {
+        struct TableIndicesCase<T0, T1> {
+            table: T0,
+            indices: T1,
+        }
         [
-            ([4].as_slice(), [2].as_slice()),
-            (&[2, 3, 4], &[2]),
-            (&[4, 3], &[2, 1]),
+            TableIndicesCase {
+                table: [4].as_slice(),
+                indices: [2].as_slice(),
+            },
+            TableIndicesCase {
+                table: &[2, 3, 4],
+                indices: &[2],
+            },
+            TableIndicesCase {
+                table: &[4, 3],
+                indices: &[2, 1],
+            },
         ]
         .into_iter()
-        .for_each(|(table, indices)| {
-            assert_eq!(
-                gather_rule(
-                    DType::F32,
-                    &Layout::contiguous(Shape::try_from(table).expect("valid shape")),
-                    DType::U32,
-                    &Shape::try_from(indices).expect("valid shape"),
-                ),
-                Err(CoreError::GatherIncompatible),
-                "table {table:?} and indices {indices:?}"
-            );
-        });
+        .for_each(
+            |TableIndicesCase {
+                 table,
+                 indices,
+             }| {
+                assert_eq!(
+                    gather_rule(
+                        DType::F32,
+                        &Layout::contiguous(Shape::try_from(table).expect("valid shape")),
+                        DType::U32,
+                        &Shape::try_from(indices).expect("valid shape"),
+                    ),
+                    Err(CoreError::GatherIncompatible),
+                    "table {table:?} and indices {indices:?}"
+                );
+            },
+        );
     }
 
     #[test]
@@ -898,8 +1024,12 @@ mod tests {
         )
         .expect("compatible shapes");
         assert_eq!(
-            (spec.dtype(), spec.output().dims(), spec.rhs_offset()),
-            (FloatDType::BF16, [2, 8, 4].as_slice(), 12),
+            spec,
+            ConcatSpec {
+                dtype: FloatDType::BF16,
+                output: Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"),
+                rhs_offset: 12,
+            },
             "dtype, output dims and rhs offset"
         );
     }
@@ -951,24 +1081,39 @@ mod tests {
 
     #[test]
     fn concat_rejects_axis_out_of_range() {
+        struct LhsRhsCase<T0, T1> {
+            lhs: T0,
+            rhs: T1,
+        }
         [
-            ([2, 3].as_slice(), [2, 3].as_slice()),
-            (&[2, 3, 4], &[2, 3]),
+            LhsRhsCase {
+                lhs: [2, 3].as_slice(),
+                rhs: [2, 3].as_slice(),
+            },
+            LhsRhsCase {
+                lhs: &[2, 3, 4],
+                rhs: &[2, 3],
+            },
         ]
         .into_iter()
-        .for_each(|(lhs, rhs)| {
-            assert_eq!(
-                concat_rule(
-                    DType::F32,
-                    &Shape::try_from(lhs).expect("valid shape"),
-                    DType::F32,
-                    &Shape::try_from(rhs).expect("valid shape"),
-                    2,
-                ),
-                Err(CoreError::AxisOutOfRange),
-                "lhs {lhs:?} and rhs {rhs:?}"
-            );
-        });
+        .for_each(
+            |LhsRhsCase {
+                 lhs,
+                 rhs,
+             }| {
+                assert_eq!(
+                    concat_rule(
+                        DType::F32,
+                        &Shape::try_from(lhs).expect("valid shape"),
+                        DType::F32,
+                        &Shape::try_from(rhs).expect("valid shape"),
+                        2,
+                    ),
+                    Err(CoreError::AxisOutOfRange),
+                    "lhs {lhs:?} and rhs {rhs:?}"
+                );
+            },
+        );
     }
 
     #[test]
@@ -995,37 +1140,66 @@ mod tests {
                 &Shape::try_from([1, 2, 4].as_slice()).expect("valid shape"),
                 1,
                 3,
-            )
-            .map(|spec| (spec.dtype(), spec.offset())),
-            Ok((FloatDType::BF16, 44)),
+            ),
+            Ok(SliceUpdateSpec {
+                dtype: FloatDType::BF16,
+                offset: 44,
+            }),
             "target offset 32 plus start 3 times stride 4"
         );
     }
 
     #[test]
     fn slice_update_rejects_out_of_bounds_and_mismatches() {
+        struct UpdateAxisStartCase<T0, T1, T2> {
+            update: T0,
+            axis: T1,
+            start: T2,
+        }
         let target = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"));
         [
-            ([1, 3].as_slice(), 0, usize::MAX),
-            (&[2, 3], 0, 1),
-            (&[1, 2], 0, 0),
-            (&[1, 3, 1], 0, 0),
+            UpdateAxisStartCase {
+                update: [1, 3].as_slice(),
+                axis: 0,
+                start: usize::MAX,
+            },
+            UpdateAxisStartCase {
+                update: &[2, 3],
+                axis: 0,
+                start: 1,
+            },
+            UpdateAxisStartCase {
+                update: &[1, 2],
+                axis: 0,
+                start: 0,
+            },
+            UpdateAxisStartCase {
+                update: &[1, 3, 1],
+                axis: 0,
+                start: 0,
+            },
         ]
         .into_iter()
-        .for_each(|(update, axis, start)| {
-            assert_eq!(
-                slice_update_rule(
-                    DType::F32,
-                    &target,
-                    DType::F32,
-                    &Shape::try_from(update).expect("valid shape"),
-                    axis,
-                    start,
-                ),
-                Err(CoreError::SliceUpdateOutOfBounds),
-                "update {update:?} at start {start}"
-            );
-        });
+        .for_each(
+            |UpdateAxisStartCase {
+                 update,
+                 axis,
+                 start,
+             }| {
+                assert_eq!(
+                    slice_update_rule(
+                        DType::F32,
+                        &target,
+                        DType::F32,
+                        &Shape::try_from(update).expect("valid shape"),
+                        axis,
+                        start,
+                    ),
+                    Err(CoreError::SliceUpdateOutOfBounds),
+                    "update {update:?} at start {start}"
+                );
+            },
+        );
     }
 
     #[test]

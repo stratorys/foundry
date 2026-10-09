@@ -33,6 +33,21 @@ pub struct CpuStorage {
 
 pub struct CpuBackend;
 
+struct StrideTerm {
+    coordinate: usize,
+    stride: usize,
+}
+
+struct StridedCursor {
+    index: usize,
+    rest: usize,
+}
+
+struct ArgmaxFold {
+    value: f32,
+    position: usize,
+}
+
 impl CpuBackend {
     pub fn new() -> Self { Self }
 }
@@ -122,8 +137,14 @@ impl Backend for CpuBackend {
                     strided_index(spec.output().dims(), layout.strides(), layout.offset(), row)?;
                 (0..spec.axis_len())
                     .map(|position| {
-                        let index = offset_by(base, &[(position, spec.axis_stride())])
-                            .ok_or_else(|| index_overflow(row))?;
+                        let index = offset_by(
+                            base,
+                            &[StrideTerm {
+                                coordinate: position,
+                                stride: spec.axis_stride(),
+                            }],
+                        )
+                        .ok_or_else(|| index_overflow(row))?;
                         read_float(&input.storage().bytes, input.dtype(), index)
                     })
                     .collect::<Result<Vec<f32>, CpuError>>()
@@ -148,17 +169,23 @@ impl Backend for CpuBackend {
                 let indices = rows
                     .iter()
                     .map(|row| {
-                        let (_, position) = row.iter().enumerate().fold(
-                            (f32::NEG_INFINITY, 0_usize),
-                            |(best, best_position), (position, &value)| {
-                                if value > best {
-                                    (value, position)
+                        let best = row.iter().enumerate().fold(
+                            ArgmaxFold {
+                                value: f32::NEG_INFINITY,
+                                position: 0,
+                            },
+                            |best, (position, &value)| {
+                                if value > best.value {
+                                    ArgmaxFold {
+                                        value,
+                                        position,
+                                    }
                                 } else {
-                                    (best, best_position)
+                                    best
                                 }
                             },
                         );
-                        u32::try_from(position).map_err(|_| index_overflow(position))
+                        u32::try_from(best.position).map_err(|_| index_overflow(best.position))
                     })
                     .collect::<Result<Vec<u32>, CpuError>>()?;
                 Ok(CpuStorage {
@@ -177,8 +204,11 @@ impl Backend for CpuBackend {
         rhs: Operand<'_, CpuStorage, FloatDType>,
         spec: &MatmulSpec,
     ) -> Result<CpuStorage, CpuError> {
-        let (m, k, n) = (spec.m(), spec.k(), spec.n());
-        let (lhs_matrix, rhs_matrix) = (spec.lhs(), spec.rhs());
+        let m = spec.m();
+        let k = spec.k();
+        let n = spec.n();
+        let lhs_matrix = spec.lhs();
+        let rhs_matrix = spec.rhs();
         let batch_dims = spec.batch().dims();
         let values = (0..spec.output().element_count())
             .map(|linear| {
@@ -208,16 +238,28 @@ impl Backend for CpuBackend {
                     let lhs_index = offset_by(
                         lhs_base,
                         &[
-                            (row, lhs_matrix.row_stride()),
-                            (inner, lhs_matrix.col_stride()),
+                            StrideTerm {
+                                coordinate: row,
+                                stride: lhs_matrix.row_stride(),
+                            },
+                            StrideTerm {
+                                coordinate: inner,
+                                stride: lhs_matrix.col_stride(),
+                            },
                         ],
                     )
                     .ok_or_else(overflow)?;
                     let rhs_index = offset_by(
                         rhs_base,
                         &[
-                            (inner, rhs_matrix.row_stride()),
-                            (col, rhs_matrix.col_stride()),
+                            StrideTerm {
+                                coordinate: inner,
+                                stride: rhs_matrix.row_stride(),
+                            },
+                            StrideTerm {
+                                coordinate: col,
+                                stride: rhs_matrix.col_stride(),
+                            },
                         ],
                     )
                     .ok_or_else(overflow)?;
@@ -290,7 +332,16 @@ impl Backend for CpuBackend {
                 } else {
                     let index = offset_by(
                         table.layout().offset(),
-                        &[(row, spec.row_stride()), (col, spec.col_stride())],
+                        &[
+                            StrideTerm {
+                                coordinate: row,
+                                stride: spec.row_stride(),
+                            },
+                            StrideTerm {
+                                coordinate: col,
+                                stride: spec.col_stride(),
+                            },
+                        ],
                     )
                     .ok_or_else(overflow)?;
                     bytes.extend_from_slice(element_bytes(&table.storage().bytes, size, index)?);
@@ -359,23 +410,32 @@ fn strided_index(
     dims.iter()
         .zip(strides)
         .rev()
-        .try_fold((offset, linear), |(index, rest), (&dim, &stride)| {
-            let index = rest
-                .checked_rem(dim)?
-                .checked_mul(stride)?
-                .checked_add(index)?;
-            Some((index, rest.checked_div(dim)?))
-        })
-        .map(|(index, _)| index)
+        .try_fold(
+            StridedCursor {
+                index: offset,
+                rest: linear,
+            },
+            |cursor, (&dim, &stride)| {
+                Some(StridedCursor {
+                    index: cursor
+                        .rest
+                        .checked_rem(dim)?
+                        .checked_mul(stride)?
+                        .checked_add(cursor.index)?,
+                    rest: cursor.rest.checked_div(dim)?,
+                })
+            },
+        )
+        .map(|cursor| cursor.index)
         .ok_or_else(|| index_overflow(linear))
 }
 
 fn offset_by(
     base: usize,
-    terms: &[(usize, usize)],
+    terms: &[StrideTerm],
 ) -> Option<usize> {
-    terms.iter().try_fold(base, |index, &(coordinate, stride)| {
-        coordinate.checked_mul(stride)?.checked_add(index)
+    terms.iter().try_fold(base, |index, term| {
+        term.coordinate.checked_mul(term.stride)?.checked_add(index)
     })
 }
 
@@ -384,10 +444,14 @@ fn element_bytes(
     size: usize,
     index: usize,
 ) -> Result<&[u8], CpuError> {
-    index
+    let start = index
         .checked_mul(size)
-        .and_then(|start| Some((start, start.checked_add(size)?)))
-        .and_then(|(start, end)| bytes.get(start..end))
+        .ok_or_else(|| out_of_storage(index, bytes.len()))?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| out_of_storage(index, bytes.len()))?;
+    bytes
+        .get(start..end)
         .ok_or_else(|| out_of_storage(index, bytes.len()))
 }
 
@@ -473,10 +537,14 @@ fn write_window(
         let destination = strided_index(dims, target_layout.strides(), offset, linear)?;
         let value = element_bytes(&update.storage().bytes, size, source)?;
         let bytes_len = target.len();
-        destination
+        let begin = destination
             .checked_mul(size)
-            .and_then(|begin| Some((begin, begin.checked_add(size)?)))
-            .and_then(|(begin, end)| target.get_mut(begin..end))
+            .ok_or_else(|| out_of_storage(destination, bytes_len))?;
+        let end = begin
+            .checked_add(size)
+            .ok_or_else(|| out_of_storage(destination, bytes_len))?;
+        target
+            .get_mut(begin..end)
             .ok_or_else(|| out_of_storage(destination, bytes_len))?
             .copy_from_slice(value);
         Ok(())
@@ -495,27 +563,48 @@ mod tests {
 
     #[test]
     fn upload_then_download_returns_the_same_bytes_for_each_dtype() {
+        struct DtypeLenCase<T0, T1> {
+            dtype: T0,
+            len: T1,
+        }
         let mut backend = CpuBackend::new();
         [
-            (DType::F32, 2),
-            (DType::F16, 4),
-            (DType::BF16, 4),
-            (DType::U32, 2),
+            DtypeLenCase {
+                dtype: DType::F32,
+                len: 2,
+            },
+            DtypeLenCase {
+                dtype: DType::F16,
+                len: 4,
+            },
+            DtypeLenCase {
+                dtype: DType::BF16,
+                len: 4,
+            },
+            DtypeLenCase {
+                dtype: DType::U32,
+                len: 2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, len)| {
-            let bytes: Vec<u8> = (1_u8..=8).collect();
-            let downloaded = Tensor::upload(
-                &mut backend,
-                &bytes,
-                dtype,
-                Shape::try_from([len].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds");
-            assert_eq!(downloaded, bytes, "{dtype:?} round trip");
-        });
+        .for_each(
+            |DtypeLenCase {
+                 dtype,
+                 len,
+             }| {
+                let bytes: Vec<u8> = (1_u8..=8).collect();
+                let downloaded = Tensor::upload(
+                    &mut backend,
+                    &bytes,
+                    dtype,
+                    Shape::try_from([len].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .download(&mut backend)
+                .expect("the download succeeds");
+                assert_eq!(downloaded, bytes, "{dtype:?} round trip");
+            },
+        );
     }
 
     #[test]
@@ -535,16 +624,15 @@ mod tests {
     #[test]
     fn upload_with_wrong_byte_length_is_rejected() {
         let mut backend = CpuBackend::new();
-        assert!(
-            matches!(
-                Tensor::upload(
-                    &mut backend,
-                    &[0; 6],
-                    DType::F32,
-                    Shape::try_from([2].as_slice()).expect("the shape is valid"),
-                ),
-                Err(CoreError::ByteLengthMismatch)
-            ),
+        assert_eq!(
+            Tensor::upload(
+                &mut backend,
+                &[0; 6],
+                DType::F32,
+                Shape::try_from([2].as_slice()).expect("the shape is valid"),
+            )
+            .err(),
+            Some(CoreError::ByteLengthMismatch),
             "six bytes for two f32 are rejected"
         );
     }
@@ -560,11 +648,9 @@ mod tests {
         .expect("the zeros succeed")
         .permute(&[1, 0])
         .expect("the permutation is valid");
-        assert!(
-            matches!(
-                tensor.download(&mut backend),
-                Err(CoreError::DownloadNonContiguous)
-            ),
+        assert_eq!(
+            tensor.download(&mut backend).err(),
+            Some(CoreError::DownloadNonContiguous),
             "a permuted view is not downloaded"
         );
     }
@@ -722,58 +808,109 @@ mod tests {
 
     #[test]
     fn unary_ops_match_hand_computed_values_for_each_float_dtype() {
+        struct NameOutputExpectedCase<T0, T1, T2> {
+            name: T0,
+            output: T1,
+            expected: T2,
+        }
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = CpuBackend::new();
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let input = Tensor::upload(
-                &mut backend,
-                &[1.0_f32, 4.0]
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from([2].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, dtype)
-            .expect("the cast succeeds");
-            [
-                ("neg", input.neg(&mut backend), [-1.0_f32, -4.0]),
-                ("exp", input.exp(&mut backend), [2.718_281_7, 54.598_15]),
-                ("sqrt", input.sqrt(&mut backend), [1.0, 2.0]),
-                ("recip", input.recip(&mut backend), [1.0, 0.25]),
-            ]
-            .into_iter()
-            .for_each(|(name, output, expected)| {
-                let actual: Vec<f32> = output
-                    .expect("the unary succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                assert_eq!(actual.len(), expected.len(), "{name} element count");
-                actual.iter().zip(expected).for_each(|(&actual, expected)| {
-                    assert!(
-                        (actual - expected).abs() <= tolerance * expected.abs(),
-                        "{name} {dtype:?}: {actual} is not within {tolerance} of {expected}"
-                    );
-                });
-            });
-        });
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let input = Tensor::upload(
+                    &mut backend,
+                    &[1.0_f32, 4.0]
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([2].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .cast(&mut backend, dtype)
+                .expect("the cast succeeds");
+                [
+                    NameOutputExpectedCase {
+                        name: "neg",
+                        output: input.neg(&mut backend),
+                        expected: [-1.0_f32, -4.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "exp",
+                        output: input.exp(&mut backend),
+                        expected: [2.718_281_7, 54.598_15],
+                    },
+                    NameOutputExpectedCase {
+                        name: "sqrt",
+                        output: input.sqrt(&mut backend),
+                        expected: [1.0, 2.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "recip",
+                        output: input.recip(&mut backend),
+                        expected: [1.0, 0.25],
+                    },
+                ]
+                .into_iter()
+                .for_each(
+                    |NameOutputExpectedCase {
+                         name,
+                         output,
+                         expected,
+                     }| {
+                        let actual: Vec<f32> = output
+                            .expect("the unary succeeds")
+                            .cast(&mut backend, DType::F32)
+                            .expect("the cast succeeds")
+                            .download(&mut backend)
+                            .expect("the download succeeds")
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&chunk| f32::from_le_bytes(chunk))
+                            .collect();
+                        assert_eq!(actual.len(), expected.len(), "{name} element count");
+                        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+                            assert!(
+                                (actual - expected).abs() <= tolerance * expected.abs(),
+                                "{name} {dtype:?}: {actual} is not within {tolerance} of \
+                                 {expected}"
+                            );
+                        });
+                    },
+                );
+            },
+        );
     }
 
     #[test]
     fn binary_ops_match_hand_computed_values_for_each_float_dtype() {
+        struct NameOutputExpectedCase<T0, T1, T2> {
+            name: T0,
+            output: T1,
+            expected: T2,
+        }
         let mut backend = CpuBackend::new();
         [DType::F32, DType::F16, DType::BF16]
             .into_iter()
@@ -793,48 +930,85 @@ mod tests {
                     .expect("the cast succeeds")
                 });
                 [
-                    ("add", lhs.add(&mut backend, &rhs), [8.0_f32, 12.0]),
-                    ("sub", lhs.sub(&mut backend, &rhs), [4.0, 4.0]),
-                    ("mul", lhs.mul(&mut backend, &rhs), [12.0, 32.0]),
-                    ("div", lhs.div(&mut backend, &rhs), [3.0, 2.0]),
+                    NameOutputExpectedCase {
+                        name: "add",
+                        output: lhs.add(&mut backend, &rhs),
+                        expected: [8.0_f32, 12.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "sub",
+                        output: lhs.sub(&mut backend, &rhs),
+                        expected: [4.0, 4.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "mul",
+                        output: lhs.mul(&mut backend, &rhs),
+                        expected: [12.0, 32.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "div",
+                        output: lhs.div(&mut backend, &rhs),
+                        expected: [3.0, 2.0],
+                    },
                 ]
                 .into_iter()
-                .for_each(|(name, output, expected)| {
-                    let actual: Vec<f32> = output
-                        .expect("the binary succeeds")
-                        .cast(&mut backend, DType::F32)
-                        .expect("the cast succeeds")
-                        .download(&mut backend)
-                        .expect("the download succeeds")
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|&chunk| f32::from_le_bytes(chunk))
-                        .collect();
-                    assert_eq!(actual, expected.to_vec(), "{name} {dtype:?}");
-                });
+                .for_each(
+                    |NameOutputExpectedCase {
+                         name,
+                         output,
+                         expected,
+                     }| {
+                        let actual: Vec<f32> = output
+                            .expect("the binary succeeds")
+                            .cast(&mut backend, DType::F32)
+                            .expect("the cast succeeds")
+                            .download(&mut backend)
+                            .expect("the download succeeds")
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&chunk| f32::from_le_bytes(chunk))
+                            .collect();
+                        assert_eq!(actual, expected.to_vec(), "{name} {dtype:?}");
+                    },
+                );
             });
     }
 
     #[test]
     fn add_broadcasts_a_row_over_a_matrix() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = CpuBackend::new();
         let [matrix, row] = [
-            (vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
-            (vec![10.0, 20.0, 30.0], vec![3]),
+            ValuesDimsCase {
+                values: vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+                dims: vec![2, 3],
+            },
+            ValuesDimsCase {
+                values: vec![10.0, 20.0, 30.0],
+                dims: vec![3],
+            },
         ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         let actual: Vec<f32> = matrix
             .add(&mut backend, &row)
             .expect("the add succeeds")
@@ -861,17 +1035,20 @@ mod tests {
             Shape::try_from([2].as_slice()).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        assert!(
-            matches!(
-                tensor.add(&mut backend, &tensor),
-                Err(CoreError::DTypeNotFloat)
-            ),
+        assert_eq!(
+            tensor.add(&mut backend, &tensor).err(),
+            Some(CoreError::DTypeNotFloat),
             "add rejects u32"
         );
     }
 
     #[test]
     fn sum_max_and_argmax_over_each_axis_match_hand_computed_values() {
+        struct NameOutputExpectedCase<T0, T1, T2> {
+            name: T0,
+            output: T1,
+            expected: T2,
+        }
         let mut backend = CpuBackend::new();
         let matrix = Tensor::upload(
             &mut backend,
@@ -884,50 +1061,78 @@ mod tests {
         )
         .expect("the upload succeeds");
         [
-            (
-                "sum 0",
-                matrix.sum(&mut backend, 0),
-                vec![5.0_f32, 7.0, 9.0],
-            ),
-            ("sum 1", matrix.sum(&mut backend, 1), vec![9.0, 12.0]),
-            ("max 0", matrix.max(&mut backend, 0), vec![4.0, 5.0, 6.0]),
-            ("max 1", matrix.max(&mut backend, 1), vec![5.0, 6.0]),
+            NameOutputExpectedCase {
+                name: "sum 0",
+                output: matrix.sum(&mut backend, 0),
+                expected: vec![5.0_f32, 7.0, 9.0],
+            },
+            NameOutputExpectedCase {
+                name: "sum 1",
+                output: matrix.sum(&mut backend, 1),
+                expected: vec![9.0, 12.0],
+            },
+            NameOutputExpectedCase {
+                name: "max 0",
+                output: matrix.max(&mut backend, 0),
+                expected: vec![4.0, 5.0, 6.0],
+            },
+            NameOutputExpectedCase {
+                name: "max 1",
+                output: matrix.max(&mut backend, 1),
+                expected: vec![5.0, 6.0],
+            },
         ]
         .into_iter()
-        .for_each(|(name, output, expected)| {
-            let actual: Vec<f32> = output
-                .expect("the reduction succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            assert_eq!(actual, expected, "{name}");
-        });
+        .for_each(
+            |NameOutputExpectedCase {
+                 name,
+                 output,
+                 expected,
+             }| {
+                let actual: Vec<f32> = output
+                    .expect("the reduction succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect();
+                assert_eq!(actual, expected, "{name}");
+            },
+        );
         [
-            (
-                "argmax 0",
-                matrix.argmax(&mut backend, 0),
-                vec![1_u32, 0, 1],
-            ),
-            ("argmax 1", matrix.argmax(&mut backend, 1), vec![1, 2]),
+            NameOutputExpectedCase {
+                name: "argmax 0",
+                output: matrix.argmax(&mut backend, 0),
+                expected: vec![1_u32, 0, 1],
+            },
+            NameOutputExpectedCase {
+                name: "argmax 1",
+                output: matrix.argmax(&mut backend, 1),
+                expected: vec![1, 2],
+            },
         ]
         .into_iter()
-        .for_each(|(name, output, expected)| {
-            let output = output.expect("the argmax succeeds");
-            assert_eq!(output.dtype(), DType::U32, "{name} dtype");
-            let actual: Vec<u32> = output
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| u32::from_le_bytes(chunk))
-                .collect();
-            assert_eq!(actual, expected, "{name}");
-        });
+        .for_each(
+            |NameOutputExpectedCase {
+                 name,
+                 output,
+                 expected,
+             }| {
+                let output = output.expect("the argmax succeeds");
+                assert_eq!(output.dtype(), DType::U32, "{name} dtype");
+                let actual: Vec<u32> = output
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| u32::from_le_bytes(chunk))
+                    .collect();
+                assert_eq!(actual, expected, "{name}");
+            },
+        );
     }
 
     #[test]
@@ -977,28 +1182,43 @@ mod tests {
 
     #[test]
     fn matmul_matches_hand_computed_values_for_each_float_dtype() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = CpuBackend::new();
         [DType::F32, DType::F16, DType::BF16]
             .into_iter()
             .for_each(|dtype| {
                 let [lhs, rhs] = [
-                    (vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
-                    (vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]),
+                    ValuesDimsCase {
+                        values: vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+                        dims: vec![2, 3],
+                    },
+                    ValuesDimsCase {
+                        values: vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                        dims: vec![3, 2],
+                    },
                 ]
-                .map(|(values, dims)| {
-                    Tensor::upload(
-                        &mut backend,
-                        &values
-                            .iter()
-                            .flat_map(|value| value.to_le_bytes())
-                            .collect::<Vec<u8>>(),
-                        DType::F32,
-                        Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-                    )
-                    .expect("the upload succeeds")
-                    .cast(&mut backend, dtype)
-                    .expect("the cast succeeds")
-                });
+                .map(
+                    |ValuesDimsCase {
+                         values,
+                         dims,
+                     }| {
+                        Tensor::upload(
+                            &mut backend,
+                            &values
+                                .iter()
+                                .flat_map(|value| value.to_le_bytes())
+                                .collect::<Vec<u8>>(),
+                            DType::F32,
+                            Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                        )
+                        .expect("the upload succeeds")
+                        .cast(&mut backend, dtype)
+                        .expect("the cast succeeds")
+                    },
+                );
                 let actual: Vec<f32> = lhs
                     .matmul(&mut backend, &rhs)
                     .expect("the matmul succeeds")
@@ -1056,23 +1276,38 @@ mod tests {
 
     #[test]
     fn batched_matmul_reads_permuted_batch_axes() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = CpuBackend::new();
         let [lhs, rhs] = [
-            (vec![1.0_f32, 2.0, 3.0, 4.0], vec![1, 2, 2]),
-            (vec![5.0, 6.0, 7.0, 8.0], vec![2, 2, 1]),
+            ValuesDimsCase {
+                values: vec![1.0_f32, 2.0, 3.0, 4.0],
+                dims: vec![1, 2, 2],
+            },
+            ValuesDimsCase {
+                values: vec![5.0, 6.0, 7.0, 8.0],
+                dims: vec![2, 2, 1],
+            },
         ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         let output = lhs
             .permute(&[1, 0, 2])
             .expect("the permutation is valid")
@@ -1132,6 +1367,10 @@ mod tests {
 
     #[test]
     fn concat_on_first_and_last_axis_matches_hand_computed_values() {
+        struct AxisDimsCase<T0, T1> {
+            axis: T0,
+            dims: T1,
+        }
         let mut backend = CpuBackend::new();
         let [lhs, rhs] = [[1.0_f32, 2.0], [3.0, 4.0]].map(|values| {
             Tensor::upload(
@@ -1145,9 +1384,22 @@ mod tests {
             )
             .expect("the upload succeeds")
         });
-        [(0, [2, 2]), (1, [1, 4])]
-            .into_iter()
-            .for_each(|(axis, dims)| {
+        [
+            AxisDimsCase {
+                axis: 0,
+                dims: [2, 2],
+            },
+            AxisDimsCase {
+                axis: 1,
+                dims: [1, 4],
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |AxisDimsCase {
+                 axis,
+                 dims,
+             }| {
                 let output = lhs
                     .concat(&mut backend, &rhs, axis)
                     .expect("the concat succeeds");
@@ -1161,7 +1413,8 @@ mod tests {
                     .map(|&chunk| f32::from_le_bytes(chunk))
                     .collect();
                 assert_eq!(actual, vec![1.0, 2.0, 3.0, 4.0], "concat on axis {axis}");
-            });
+            },
+        );
     }
 
     #[test]
@@ -1173,11 +1426,9 @@ mod tests {
             Shape::try_from([2].as_slice()).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        assert!(
-            matches!(
-                tensor.concat(&mut backend, &tensor, 0),
-                Err(CoreError::DTypeNotFloat)
-            ),
+        assert_eq!(
+            tensor.concat(&mut backend, &tensor, 0).err(),
+            Some(CoreError::DTypeNotFloat),
             "concat rejects u32"
         );
     }

@@ -4,7 +4,10 @@ use foundry::models::llama::{
     LlamaError,
     LlamaWeights,
 };
-use foundry::weights::Weights;
+use foundry::weights::{
+    Shard,
+    Weights,
+};
 use hf_hub::HFClientSync;
 use serde_json::json;
 
@@ -55,78 +58,103 @@ fn llama_weights_load_every_tensor_once() {
         "tie_word_embeddings": true,
         "eos_token_id": [7]
     });
-    let tensors: Vec<(String, &str, Vec<usize>)> = [
-        ("model.embed_tokens.weight".to_owned(), "BF16", vec![8, 4]),
-        ("model.norm.weight".to_owned(), "BF16", vec![4]),
+    struct TensorEntry {
+        name: String,
+        dtype: &'static str,
+        dims: Vec<usize>,
+    }
+    struct HeaderFold {
+        entries: serde_json::Map<String, serde_json::Value>,
+        end: usize,
+    }
+    let tensors: Vec<TensorEntry> = [
+        TensorEntry {
+            name: "model.embed_tokens.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![8, 4],
+        },
+        TensorEntry {
+            name: "model.norm.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![4],
+        },
     ]
     .into_iter()
     .chain((0..2).flat_map(|index| {
         [
-            (
-                format!("model.layers.{index}.input_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.q_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.k_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.v_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.o_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.post_attention_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.gate_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.up_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.down_proj.weight"),
-                "BF16",
-                vec![4, 6],
-            ),
+            TensorEntry {
+                name: format!("model.layers.{index}.input_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.q_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.k_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.v_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.o_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.post_attention_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.gate_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.up_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.down_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 6],
+            },
         ]
     }))
     .collect();
-    let (header, bytes_data) = tensors.iter().fold(
-        (serde_json::Map::new(), 0_usize),
-        |(mut header, begin), (name, dtype, dims)| {
-            let element_bytes: usize = if *dtype == "F32" { 4 } else { 2 };
-            let end = dims
+    let header = tensors.iter().fold(
+        HeaderFold {
+            entries: serde_json::Map::new(),
+            end: 0,
+        },
+        |mut fold, entry| {
+            let element_bytes: usize = if entry.dtype == "F32" { 4 } else { 2 };
+            let end = entry
+                .dims
                 .iter()
                 .try_fold(element_bytes, |bytes, &dim| bytes.checked_mul(dim))
-                .and_then(|bytes| begin.checked_add(bytes))
+                .and_then(|bytes| fold.end.checked_add(bytes))
                 .expect("the tensor end fits in usize");
-            header.insert(
-                name.clone(),
-                json!({ "dtype": dtype, "shape": dims, "data_offsets": [begin, end] }),
+            fold.entries.insert(
+                entry.name.clone(),
+                json!({ "dtype": entry.dtype, "shape": entry.dims, "data_offsets": [fold.end, end] }),
             );
-            (header, end)
+            HeaderFold {
+                entries: fold.entries,
+                end,
+            }
         },
     );
-    let header = serde_json::to_vec(&header).expect("the header serializes");
+    let bytes_data = header.end;
+    let header = serde_json::to_vec(&header.entries).expect("the header serializes");
     let header_len = u64::try_from(header.len()).expect("the header length fits in u64");
     let shard: Vec<u8> = header_len
         .to_le_bytes()
@@ -134,8 +162,14 @@ fn llama_weights_load_every_tensor_once() {
         .chain(header)
         .chain(vec![0_u8; bytes_data])
         .collect::<Vec<u8>>();
-    let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), shard)])
-        .expect("the safetensors bytes are valid");
+    let weights = Weights::from_shards(
+        None,
+        vec![Shard {
+            name: "model.safetensors".to_owned(),
+            bytes: shard,
+        }],
+    )
+    .expect("the safetensors bytes are valid");
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 
@@ -173,85 +207,113 @@ fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
         "tie_word_embeddings": true,
         "eos_token_id": [7]
     });
-    let tensors: Vec<(String, &str, Vec<usize>)> = [
-        ("model.embed_tokens.weight".to_owned(), "BF16", vec![8, 4]),
-        ("model.norm.weight".to_owned(), "BF16", vec![4]),
+    struct TensorEntry {
+        name: String,
+        dtype: &'static str,
+        dims: Vec<usize>,
+    }
+    struct HeaderFold {
+        entries: serde_json::Map<String, serde_json::Value>,
+        end: usize,
+    }
+    let tensors: Vec<TensorEntry> = [
+        TensorEntry {
+            name: "model.embed_tokens.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![8, 4],
+        },
+        TensorEntry {
+            name: "model.norm.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![4],
+        },
     ]
     .into_iter()
     .chain((0..2).flat_map(|index| {
         [
-            (
-                format!("model.layers.{index}.input_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.q_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.k_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.v_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.o_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.post_attention_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.gate_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.up_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.down_proj.weight"),
-                "BF16",
-                vec![4, 6],
-            ),
+            TensorEntry {
+                name: format!("model.layers.{index}.input_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.q_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.k_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.v_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.o_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.post_attention_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.gate_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.up_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.down_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 6],
+            },
         ]
     }))
-    .map(|(name, dtype, dims)| {
-        if name == "model.layers.1.self_attn.k_proj.weight" {
-            (name, dtype, vec![4, 4])
+    .map(|entry| {
+        if entry.name == "model.layers.1.self_attn.k_proj.weight" {
+            TensorEntry {
+                dims: vec![4, 4],
+                ..entry
+            }
         } else {
-            (name, dtype, dims)
+            entry
         }
     })
     .collect();
-    let (header, bytes_data) = tensors.iter().fold(
-        (serde_json::Map::new(), 0_usize),
-        |(mut header, begin), (name, dtype, dims)| {
-            let element_bytes: usize = if *dtype == "F32" { 4 } else { 2 };
-            let end = dims
+    let header = tensors.iter().fold(
+        HeaderFold {
+            entries: serde_json::Map::new(),
+            end: 0,
+        },
+        |mut fold, entry| {
+            let element_bytes: usize = if entry.dtype == "F32" { 4 } else { 2 };
+            let end = entry
+                .dims
                 .iter()
                 .try_fold(element_bytes, |bytes, &dim| bytes.checked_mul(dim))
-                .and_then(|bytes| begin.checked_add(bytes))
+                .and_then(|bytes| fold.end.checked_add(bytes))
                 .expect("the tensor end fits in usize");
-            header.insert(
-                name.clone(),
-                json!({ "dtype": dtype, "shape": dims, "data_offsets": [begin, end] }),
+            fold.entries.insert(
+                entry.name.clone(),
+                json!({ "dtype": entry.dtype, "shape": entry.dims, "data_offsets": [fold.end, end] }),
             );
-            (header, end)
+            HeaderFold {
+                entries: fold.entries,
+                end,
+            }
         },
     );
-    let header = serde_json::to_vec(&header).expect("the header serializes");
+    let bytes_data = header.end;
+    let header = serde_json::to_vec(&header.entries).expect("the header serializes");
     let header_len = u64::try_from(header.len()).expect("the header length fits in u64");
     let shard: Vec<u8> = header_len
         .to_le_bytes()
@@ -259,8 +321,14 @@ fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
         .chain(header)
         .chain(vec![0_u8; bytes_data])
         .collect::<Vec<u8>>();
-    let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), shard)])
-        .expect("the safetensors bytes are valid");
+    let weights = Weights::from_shards(
+        None,
+        vec![Shard {
+            name: "model.safetensors".to_owned(),
+            bytes: shard,
+        }],
+    )
+    .expect("the safetensors bytes are valid");
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 
@@ -296,85 +364,113 @@ fn llama_weights_reject_a_non_bf16_tensor() {
         "tie_word_embeddings": true,
         "eos_token_id": [7]
     });
-    let tensors: Vec<(String, &str, Vec<usize>)> = [
-        ("model.embed_tokens.weight".to_owned(), "BF16", vec![8, 4]),
-        ("model.norm.weight".to_owned(), "BF16", vec![4]),
+    struct TensorEntry {
+        name: String,
+        dtype: &'static str,
+        dims: Vec<usize>,
+    }
+    struct HeaderFold {
+        entries: serde_json::Map<String, serde_json::Value>,
+        end: usize,
+    }
+    let tensors: Vec<TensorEntry> = [
+        TensorEntry {
+            name: "model.embed_tokens.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![8, 4],
+        },
+        TensorEntry {
+            name: "model.norm.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![4],
+        },
     ]
     .into_iter()
     .chain((0..2).flat_map(|index| {
         [
-            (
-                format!("model.layers.{index}.input_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.q_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.k_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.v_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.o_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.post_attention_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.gate_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.up_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.down_proj.weight"),
-                "BF16",
-                vec![4, 6],
-            ),
+            TensorEntry {
+                name: format!("model.layers.{index}.input_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.q_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.k_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.v_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.o_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.post_attention_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.gate_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.up_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.down_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 6],
+            },
         ]
     }))
-    .map(|(name, dtype, dims)| {
-        if name == "model.norm.weight" {
-            (name, "F32", dims)
+    .map(|entry| {
+        if entry.name == "model.norm.weight" {
+            TensorEntry {
+                dtype: "F32",
+                ..entry
+            }
         } else {
-            (name, dtype, dims)
+            entry
         }
     })
     .collect();
-    let (header, bytes_data) = tensors.iter().fold(
-        (serde_json::Map::new(), 0_usize),
-        |(mut header, begin), (name, dtype, dims)| {
-            let element_bytes: usize = if *dtype == "F32" { 4 } else { 2 };
-            let end = dims
+    let header = tensors.iter().fold(
+        HeaderFold {
+            entries: serde_json::Map::new(),
+            end: 0,
+        },
+        |mut fold, entry| {
+            let element_bytes: usize = if entry.dtype == "F32" { 4 } else { 2 };
+            let end = entry
+                .dims
                 .iter()
                 .try_fold(element_bytes, |bytes, &dim| bytes.checked_mul(dim))
-                .and_then(|bytes| begin.checked_add(bytes))
+                .and_then(|bytes| fold.end.checked_add(bytes))
                 .expect("the tensor end fits in usize");
-            header.insert(
-                name.clone(),
-                json!({ "dtype": dtype, "shape": dims, "data_offsets": [begin, end] }),
+            fold.entries.insert(
+                entry.name.clone(),
+                json!({ "dtype": entry.dtype, "shape": entry.dims, "data_offsets": [fold.end, end] }),
             );
-            (header, end)
+            HeaderFold {
+                entries: fold.entries,
+                end,
+            }
         },
     );
-    let header = serde_json::to_vec(&header).expect("the header serializes");
+    let bytes_data = header.end;
+    let header = serde_json::to_vec(&header.entries).expect("the header serializes");
     let header_len = u64::try_from(header.len()).expect("the header length fits in u64");
     let shard: Vec<u8> = header_len
         .to_le_bytes()
@@ -382,8 +478,14 @@ fn llama_weights_reject_a_non_bf16_tensor() {
         .chain(header)
         .chain(vec![0_u8; bytes_data])
         .collect::<Vec<u8>>();
-    let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), shard)])
-        .expect("the safetensors bytes are valid");
+    let weights = Weights::from_shards(
+        None,
+        vec![Shard {
+            name: "model.safetensors".to_owned(),
+            bytes: shard,
+        }],
+    )
+    .expect("the safetensors bytes are valid");
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 
@@ -419,79 +521,104 @@ fn llama_weights_reject_a_missing_tensor() {
         "tie_word_embeddings": true,
         "eos_token_id": [7]
     });
-    let tensors: Vec<(String, &str, Vec<usize>)> = [
-        ("model.embed_tokens.weight".to_owned(), "BF16", vec![8, 4]),
-        ("model.norm.weight".to_owned(), "BF16", vec![4]),
+    struct TensorEntry {
+        name: String,
+        dtype: &'static str,
+        dims: Vec<usize>,
+    }
+    struct HeaderFold {
+        entries: serde_json::Map<String, serde_json::Value>,
+        end: usize,
+    }
+    let tensors: Vec<TensorEntry> = [
+        TensorEntry {
+            name: "model.embed_tokens.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![8, 4],
+        },
+        TensorEntry {
+            name: "model.norm.weight".to_owned(),
+            dtype: "BF16",
+            dims: vec![4],
+        },
     ]
     .into_iter()
     .chain((0..2).flat_map(|index| {
         [
-            (
-                format!("model.layers.{index}.input_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.q_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.k_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.v_proj.weight"),
-                "BF16",
-                vec![2, 4],
-            ),
-            (
-                format!("model.layers.{index}.self_attn.o_proj.weight"),
-                "BF16",
-                vec![4, 4],
-            ),
-            (
-                format!("model.layers.{index}.post_attention_layernorm.weight"),
-                "BF16",
-                vec![4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.gate_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.up_proj.weight"),
-                "BF16",
-                vec![6, 4],
-            ),
-            (
-                format!("model.layers.{index}.mlp.down_proj.weight"),
-                "BF16",
-                vec![4, 6],
-            ),
+            TensorEntry {
+                name: format!("model.layers.{index}.input_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.q_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.k_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.v_proj.weight"),
+                dtype: "BF16",
+                dims: vec![2, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.self_attn.o_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.post_attention_layernorm.weight"),
+                dtype: "BF16",
+                dims: vec![4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.gate_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.up_proj.weight"),
+                dtype: "BF16",
+                dims: vec![6, 4],
+            },
+            TensorEntry {
+                name: format!("model.layers.{index}.mlp.down_proj.weight"),
+                dtype: "BF16",
+                dims: vec![4, 6],
+            },
         ]
     }))
-    .filter(|(name, _, _)| name != "model.norm.weight")
+    .filter(|entry| entry.name != "model.norm.weight")
     .collect();
-    let (header, bytes_data) = tensors.iter().fold(
-        (serde_json::Map::new(), 0_usize),
-        |(mut header, begin), (name, dtype, dims)| {
-            let element_bytes: usize = if *dtype == "F32" { 4 } else { 2 };
-            let end = dims
+    let header = tensors.iter().fold(
+        HeaderFold {
+            entries: serde_json::Map::new(),
+            end: 0,
+        },
+        |mut fold, entry| {
+            let element_bytes: usize = if entry.dtype == "F32" { 4 } else { 2 };
+            let end = entry
+                .dims
                 .iter()
                 .try_fold(element_bytes, |bytes, &dim| bytes.checked_mul(dim))
-                .and_then(|bytes| begin.checked_add(bytes))
+                .and_then(|bytes| fold.end.checked_add(bytes))
                 .expect("the tensor end fits in usize");
-            header.insert(
-                name.clone(),
-                json!({ "dtype": dtype, "shape": dims, "data_offsets": [begin, end] }),
+            fold.entries.insert(
+                entry.name.clone(),
+                json!({ "dtype": entry.dtype, "shape": entry.dims, "data_offsets": [fold.end, end] }),
             );
-            (header, end)
+            HeaderFold {
+                entries: fold.entries,
+                end,
+            }
         },
     );
-    let header = serde_json::to_vec(&header).expect("the header serializes");
+    let bytes_data = header.end;
+    let header = serde_json::to_vec(&header.entries).expect("the header serializes");
     let header_len = u64::try_from(header.len()).expect("the header length fits in u64");
     let shard: Vec<u8> = header_len
         .to_le_bytes()
@@ -499,8 +626,14 @@ fn llama_weights_reject_a_missing_tensor() {
         .chain(header)
         .chain(vec![0_u8; bytes_data])
         .collect::<Vec<u8>>();
-    let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), shard)])
-        .expect("the safetensors bytes are valid");
+    let weights = Weights::from_shards(
+        None,
+        vec![Shard {
+            name: "model.safetensors".to_owned(),
+            bytes: shard,
+        }],
+    )
+    .expect("the safetensors bytes are valid");
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 

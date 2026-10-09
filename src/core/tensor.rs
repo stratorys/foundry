@@ -291,11 +291,11 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         dtype: DType,
     ) -> Result<Self, CoreError> {
-        let (dtype_from, dtype_to) = cast_rule(self.dtype, dtype)?;
+        let spec = cast_rule(self.dtype, dtype)?;
         let storage = backend
-            .cast(self.float_operand(dtype_from), dtype_to)
+            .cast(self.float_operand(spec.from()), spec.to())
             .map_err(backend_failed("cast"))?;
-        Ok(Self::from_storage(storage, dtype_to.into(), *self.shape()))
+        Ok(Self::from_storage(storage, spec.to().into(), *self.shape()))
     }
 
     pub fn gather(
@@ -388,12 +388,21 @@ impl<B: Backend> Tensor<B> {
         op: BinaryOp,
         rhs: &Self,
     ) -> Result<Self, CoreError> {
-        let (dtype, shape) = binary_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape())?;
-        let (lhs, rhs) = (self.broadcast_as(shape)?, rhs.broadcast_as(shape)?);
+        let spec = binary_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape())?;
+        let lhs = self.broadcast_as(*spec.output())?;
+        let rhs = rhs.broadcast_as(*spec.output())?;
         let storage = backend
-            .binary(op, lhs.float_operand(dtype), rhs.float_operand(dtype))
+            .binary(
+                op,
+                lhs.float_operand(spec.dtype()),
+                rhs.float_operand(spec.dtype()),
+            )
             .map_err(backend_failed("binary"))?;
-        Ok(Self::from_storage(storage, dtype.into(), shape))
+        Ok(Self::from_storage(
+            storage,
+            spec.dtype().into(),
+            *spec.output(),
+        ))
     }
 
     fn reduce(

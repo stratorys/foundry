@@ -218,7 +218,7 @@ fn summarize_weights<S: AsRef<[u8]>>(
     model: &ModelId,
     weights: &Weights<S>,
 ) -> Result<WeightsSummary, CliError> {
-    let bytes = weights.tensors().try_fold(0_usize, |bytes, (_, view)| {
+    let bytes = weights.tensors().try_fold(0_usize, |bytes, view| {
         bytes.checked_add(view.bytes.len()).ok_or_else(|| {
             error!(message = "Total tensor byte count overflows usize.", %model);
             CliError::TotalByteCountOverflow
@@ -238,7 +238,7 @@ fn summarize_weights<S: AsRef<[u8]>>(
     }
     let dtypes = weights
         .tensors()
-        .map(|(_, view)| {
+        .map(|view| {
             let dtype = view.dtype;
             format!("{dtype:?}")
         })
@@ -273,11 +273,11 @@ fn load_architecture(directory: &Path) -> Result<Option<LlamaConfig>, CliError> 
 fn tensor_rows<S: AsRef<[u8]>>(weights: &Weights<S>) -> Vec<TensorRow> {
     let mut rows: Vec<TensorRow> = weights
         .tensors()
-        .map(|(name, view)| {
+        .map(|view| {
             let dtype = view.dtype;
             let dims = view.shape.dims();
             TensorRow {
-                name: name.to_owned(),
+                name: view.name.to_owned(),
                 dtype: format!("{dtype:?}"),
                 shape: format!("{dims:?}"),
                 bytes: view.bytes.len(),
@@ -425,7 +425,10 @@ mod tests {
         CommandFactory,
         Parser,
     };
-    use foundry::weights::Weights;
+    use foundry::weights::{
+        Shard,
+        Weights,
+    };
     use serde_json::json;
 
     use crate::{
@@ -480,29 +483,41 @@ mod tests {
 
     #[test]
     fn inspect_parses_model_and_tensors_flag() {
+        struct ArgsTensorsCase<T0, T1> {
+            args: T0,
+            tensors: T1,
+        }
         [
-            (vec!["foundry", "inspect", "--model", "a/b"], false),
-            (
-                vec!["foundry", "inspect", "--model", "a/b", "--tensors"],
-                true,
-            ),
+            ArgsTensorsCase {
+                args: vec!["foundry", "inspect", "--model", "a/b"],
+                tensors: false,
+            },
+            ArgsTensorsCase {
+                args: vec!["foundry", "inspect", "--model", "a/b", "--tensors"],
+                tensors: true,
+            },
         ]
         .into_iter()
-        .for_each(|(args, tensors)| {
-            assert_eq!(
-                Cli::try_parse_from(&args)
-                    .map(|cli| cli.command)
-                    .map_err(|error| error.kind()),
-                Ok(Command::Inspect {
-                    model: ModelId {
-                        owner: "a".to_owned(),
-                        name: "b".to_owned(),
-                    },
-                    tensors,
-                }),
-                "args {args:?}"
-            );
-        });
+        .for_each(
+            |ArgsTensorsCase {
+                 args,
+                 tensors,
+             }| {
+                assert_eq!(
+                    Cli::try_parse_from(&args)
+                        .map(|cli| cli.command)
+                        .map_err(|error| error.kind()),
+                    Ok(Command::Inspect {
+                        model: ModelId {
+                            owner: "a".to_owned(),
+                            name: "b".to_owned(),
+                        },
+                        tensors,
+                    }),
+                    "args {args:?}"
+                );
+            },
+        );
     }
 
     #[test]
@@ -551,52 +566,91 @@ mod tests {
 
     #[test]
     fn format_gib_truncates_to_two_decimals() {
+        struct BytesExpectedCase<T0, T1> {
+            bytes: T0,
+            expected: T1,
+        }
         [
-            (0, "0.00"),
-            (GIB_BYTES, "1.00"),
-            (1_610_612_736, "1.50"),
-            (1_127_428_916, "1.05"),
-            (1_073_741_823, "0.99"),
+            BytesExpectedCase {
+                bytes: 0,
+                expected: "0.00",
+            },
+            BytesExpectedCase {
+                bytes: GIB_BYTES,
+                expected: "1.00",
+            },
+            BytesExpectedCase {
+                bytes: 1_610_612_736,
+                expected: "1.50",
+            },
+            BytesExpectedCase {
+                bytes: 1_127_428_916,
+                expected: "1.05",
+            },
+            BytesExpectedCase {
+                bytes: 1_073_741_823,
+                expected: "0.99",
+            },
         ]
         .into_iter()
-        .for_each(|(bytes, expected)| {
-            assert_eq!(
-                format_gib(bytes),
-                Some(expected.to_owned()),
-                "{bytes} bytes"
-            );
-        });
+        .for_each(
+            |BytesExpectedCase {
+                 bytes,
+                 expected,
+             }| {
+                assert_eq!(
+                    format_gib(bytes),
+                    Some(expected.to_owned()),
+                    "{bytes} bytes"
+                );
+            },
+        );
     }
 
     #[test]
     fn write_weights_prints_declared_size_when_present() {
+        struct BytesDeclaredDeclaredLineCase<T0, T1> {
+            bytes_declared: T0,
+            declared_line: T1,
+        }
         [
-            (Some(16), "  Declared    16 bytes (match)\n"),
-            (None, "  Declared    no index\n"),
+            BytesDeclaredDeclaredLineCase {
+                bytes_declared: Some(16),
+                declared_line: "  Declared    16 bytes (match)\n",
+            },
+            BytesDeclaredDeclaredLineCase {
+                bytes_declared: None,
+                declared_line: "  Declared    no index\n",
+            },
         ]
         .into_iter()
-        .for_each(|(bytes_declared, declared_line)| {
-            let mut out = Vec::new();
-            write_weights(
-                &mut out,
-                &WeightsSummary {
-                    shard_count: 1,
-                    tensor_count: 2,
-                    bytes: 16,
-                    bytes_declared,
-                    dtypes: BTreeSet::from(["BF16".to_owned(), "F32".to_owned()]),
-                },
-            )
-            .expect("writing to a vector succeeds");
-            assert_eq!(
-                String::from_utf8(out),
-                Ok(format!(
-                    "\nWeights\n  Shards      1\n  Tensors     2\n  Size        16 bytes (0.00 \
-                     GiB)\n{declared_line}  Dtypes      BF16, F32\n"
-                )),
-                "declared size {bytes_declared:?}"
-            );
-        });
+        .for_each(
+            |BytesDeclaredDeclaredLineCase {
+                 bytes_declared,
+                 declared_line,
+             }| {
+                let mut out = Vec::new();
+                write_weights(
+                    &mut out,
+                    &WeightsSummary {
+                        shard_count: 1,
+                        tensor_count: 2,
+                        bytes: 16,
+                        bytes_declared,
+                        dtypes: BTreeSet::from(["BF16".to_owned(), "F32".to_owned()]),
+                    },
+                )
+                .expect("writing to a vector succeeds");
+                assert_eq!(
+                    String::from_utf8(out),
+                    Ok(format!(
+                        "\nWeights\n  Shards      1\n  Tensors     2\n  Size        16 bytes \
+                         (0.00 GiB)\n{declared_line}  Dtypes      BF16, F32\n"
+                    )),
+                    "declared size {bytes_declared:?}"
+                );
+            },
+        );
     }
 
     #[test]
@@ -653,8 +707,14 @@ mod tests {
             "weight_map": { "a": "s1.safetensors", "b": "s1.safetensors" },
         }))
         .expect("the index serializes");
-        let weights = Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)])
-            .expect("the shard is valid");
+        let weights = Weights::from_shards(
+            Some(&index),
+            vec![Shard {
+                name: "s1.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the shard is valid");
         assert_eq!(
             summarize_weights(
                 &ModelId {
@@ -692,8 +752,14 @@ mod tests {
             "weight_map": { "a": "s1.safetensors" },
         }))
         .expect("the index serializes");
-        let weights = Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)])
-            .expect("the shard is valid");
+        let weights = Weights::from_shards(
+            Some(&index),
+            vec![Shard {
+                name: "s1.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the shard is valid");
         assert_eq!(
             summarize_weights(
                 &ModelId {
@@ -721,8 +787,14 @@ mod tests {
             .chain(header)
             .chain(0..8)
             .collect();
-        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
-            .expect("the file is valid");
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the file is valid");
         assert_eq!(
             tensor_rows(&weights),
             vec![

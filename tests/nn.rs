@@ -164,11 +164,9 @@ fn rms_norm_rejects_a_dimension_beyond_u16() {
         Shape::try_from([65_536].as_slice()).expect("the shape is valid"),
     )
     .expect("the zeros succeed");
-    assert!(
-        matches!(
-            RmsNorm::new(&mut backend, weight, 1e-5),
-            Err(CoreError::DimensionTooLargeForF32)
-        ),
+    assert_eq!(
+        RmsNorm::new(&mut backend, weight, 1e-5).err(),
+        Some(CoreError::DimensionTooLargeForF32),
         "a dimension above u16::MAX is rejected"
     );
 }
@@ -336,11 +334,9 @@ fn kv_cache_update_beyond_capacity_is_rejected() {
         .expect("the zeros succeed")
     });
     let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 2, 2).expect("the cache is built");
-    assert!(
-        matches!(
-            cache.update(&mut backend, &key, &value, 0),
-            Err(CoreError::SliceUpdateOutOfBounds)
-        ),
+    assert_eq!(
+        cache.update(&mut backend, &key, &value, 0),
+        Err(CoreError::SliceUpdateOutOfBounds),
         "writing three positions to a cache of two is rejected"
     );
 }
@@ -357,41 +353,58 @@ fn kv_cache_update_rejects_keys_and_values_of_different_shapes() {
         .expect("the zeros succeed")
     });
     let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
-    assert!(
-        matches!(
-            cache.update(&mut backend, &key, &value, 0),
-            Err(CoreError::KvIncompatible)
-        ),
+    assert_eq!(
+        cache.update(&mut backend, &key, &value, 0),
+        Err(CoreError::KvIncompatible),
         "keys of two positions with values of one position are rejected"
     );
 }
 
 #[test]
 fn kv_cache_keeps_earlier_positions_across_updates() {
+    struct PositionKeyValueCase<T0, T1, T2> {
+        position: T0,
+        key: T1,
+        value: T2,
+    }
     let mut backend = CpuBackend::new();
     let mut cache = KvCache::new(&mut backend, DType::F32, 1, 3, 2).expect("the cache is built");
     [
-        (0, [1.0_f32, 2.0], [5.0_f32, 6.0]),
-        (1, [3.0, 4.0], [7.0, 8.0]),
+        PositionKeyValueCase {
+            position: 0,
+            key: [1.0_f32, 2.0],
+            value: [5.0_f32, 6.0],
+        },
+        PositionKeyValueCase {
+            position: 1,
+            key: [3.0, 4.0],
+            value: [7.0, 8.0],
+        },
     ]
     .into_iter()
-    .for_each(|(position, key, value)| {
-        let [key, value] = [key, value].map(|values| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from([1, 1, 2].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
-        cache
-            .update(&mut backend, &key, &value, position)
-            .expect("the cache update succeeds");
-    });
+    .for_each(
+        |PositionKeyValueCase {
+             position,
+             key,
+             value,
+         }| {
+            let [key, value] = [key, value].map(|values| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([1, 1, 2].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            });
+            cache
+                .update(&mut backend, &key, &value, position)
+                .expect("the cache update succeeds");
+        },
+    );
     let [keys, values] = [cache.keys(), cache.values()].map(|tensor| {
         tensor
             .download(&mut backend)
@@ -416,30 +429,48 @@ fn kv_cache_keeps_earlier_positions_across_updates() {
 
 #[test]
 fn attention_matches_hand_computed_values() {
+    struct ValuesDimsCase<T0, T1> {
+        values: T0,
+        dims: T1,
+    }
     let mut backend = CpuBackend::new();
     let [query, key, value, mask] = [
-        (
-            vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
-            vec![2, 2, 2],
-        ),
-        (vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2]),
-        (vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]),
-        (vec![0.0, f32::NEG_INFINITY, 0.0, 0.0], vec![2, 2]),
+        ValuesDimsCase {
+            values: vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
+            dims: vec![2, 2, 2],
+        },
+        ValuesDimsCase {
+            values: vec![1.0, 0.0, 0.0, 1.0],
+            dims: vec![1, 2, 2],
+        },
+        ValuesDimsCase {
+            values: vec![1.0, 2.0, 3.0, 4.0],
+            dims: vec![1, 2, 2],
+        },
+        ValuesDimsCase {
+            values: vec![0.0, f32::NEG_INFINITY, 0.0, 0.0],
+            dims: vec![2, 2],
+        },
     ]
-    .map(|(values, dims)| {
-        Tensor::upload(
-            &mut backend,
-            &values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<u8>>(),
-            DType::F32,
-            Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-        )
-        .expect("the upload succeeds")
-        .cast(&mut backend, DType::BF16)
-        .expect("the cast succeeds")
-    });
+    .map(
+        |ValuesDimsCase {
+             values,
+             dims,
+         }| {
+            Tensor::upload(
+                &mut backend,
+                &values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the upload succeeds")
+            .cast(&mut backend, DType::BF16)
+            .expect("the cast succeeds")
+        },
+    );
     let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
     let attention = Attention::new(
         &mut backend,
@@ -478,18 +509,28 @@ fn attention_matches_hand_computed_values() {
 
 #[test]
 fn attention_decode_after_prefill_matches_full_prefill() {
+    struct ValuesDimsCase<T0, T1> {
+        values: T0,
+        dims: T1,
+    }
     let mut backend = CpuBackend::new();
     let [query, key, value, causal_mask] = [
-        (
-            vec![
+        ValuesDimsCase {
+            values: vec![
                 0.5_f32, -1.0, 1.0, 0.25, -0.5, 2.0, 1.0, 1.0, 0.0, -1.0, 1.5, 0.5,
             ],
-            vec![2, 3, 2],
-        ),
-        (vec![1.0, 0.5, -1.0, 1.0, 0.25, -0.75], vec![1, 3, 2]),
-        (vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0], vec![1, 3, 2]),
-        (
-            vec![
+            dims: vec![2, 3, 2],
+        },
+        ValuesDimsCase {
+            values: vec![1.0, 0.5, -1.0, 1.0, 0.25, -0.75],
+            dims: vec![1, 3, 2],
+        },
+        ValuesDimsCase {
+            values: vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0],
+            dims: vec![1, 3, 2],
+        },
+        ValuesDimsCase {
+            values: vec![
                 0.0,
                 f32::NEG_INFINITY,
                 f32::NEG_INFINITY,
@@ -500,23 +541,28 @@ fn attention_decode_after_prefill_matches_full_prefill() {
                 0.0,
                 0.0,
             ],
-            vec![3, 3],
-        ),
+            dims: vec![3, 3],
+        },
     ]
-    .map(|(values, dims)| {
-        Tensor::upload(
-            &mut backend,
-            &values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<u8>>(),
-            DType::F32,
-            Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-        )
-        .expect("the upload succeeds")
-        .cast(&mut backend, DType::BF16)
-        .expect("the cast succeeds")
-    });
+    .map(
+        |ValuesDimsCase {
+             values,
+             dims,
+         }| {
+            Tensor::upload(
+                &mut backend,
+                &values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the upload succeeds")
+            .cast(&mut backend, DType::BF16)
+            .expect("the cast succeeds")
+        },
+    );
     let attention = Attention::new(
         &mut backend,
         NonZeroUsize::new(2).expect("the head dim is non-zero"),
@@ -594,11 +640,11 @@ fn attention_rejects_a_head_dim_other_than_its_own() {
         NonZeroUsize::new(4).expect("the head dim is non-zero"),
     )
     .expect("the attention is built");
-    assert!(
-        matches!(
-            attention.forward(&mut backend, &query, &cache, 2, &mask),
-            Err(CoreError::AttentionHeadDimMismatch)
-        ),
+    assert_eq!(
+        attention
+            .forward(&mut backend, &query, &cache, 2, &mask)
+            .err(),
+        Some(CoreError::AttentionHeadDimMismatch),
         "a head dim of 2 is rejected by an attention built for 4"
     );
 }

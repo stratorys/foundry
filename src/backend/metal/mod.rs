@@ -123,6 +123,17 @@ struct MatmulArgs {
     rhs: MatmulOperand,
 }
 
+struct MatmulDispatch {
+    args: MatmulArgs,
+    grid: MTLSize,
+}
+
+struct MatmulInput<'buffer> {
+    view: BufferView<'buffer>,
+    layout: MatrixLayout,
+    copy: Option<MetalStorage>,
+}
+
 #[repr(C)]
 struct GatherArgs {
     count: u32,
@@ -206,14 +217,14 @@ impl MatmulOperand {
     }
 }
 
-impl MatmulArgs {
+impl MatmulDispatch {
     fn new(
         spec: &MatmulSpec,
         lhs: &MatrixLayout,
         rhs: &MatrixLayout,
-    ) -> Result<(Self, MTLSize), MetalError> {
+    ) -> Result<Self, MetalError> {
         let batch_dims = spec.batch().dims();
-        let args = Self {
+        let args = MatmulArgs {
             m: index_u32(spec.m())?,
             n: index_u32(spec.n())?,
             k: index_u32(spec.k())?,
@@ -227,7 +238,10 @@ impl MatmulArgs {
             height: spec.m().div_ceil(MATMUL_TILE),
             depth: spec.batch().element_count(),
         };
-        Ok((args, grid))
+        Ok(Self {
+            args,
+            grid,
+        })
     }
 }
 
@@ -663,16 +677,20 @@ impl MetalBackend {
         spec: &MatmulSpec,
         rows: usize,
         cols: usize,
-    ) -> Result<(BufferView<'buffer>, MatrixLayout, Option<MetalStorage>), MetalError> {
+    ) -> Result<MatmulInput<'buffer>, MetalError> {
         if is_matmul_ready(matrix, rows, cols) {
-            return Ok((operand, *matrix, None));
+            return Ok(MatmulInput {
+                view: operand,
+                layout: *matrix,
+                copy: None,
+            });
         }
         let storage = self.copy_view(&operand, spec.dtype().into())?;
-        Ok((
-            operand,
-            MatrixLayout::contiguous(spec.batch(), rows, cols),
-            Some(storage),
-        ))
+        Ok(MatmulInput {
+            view: operand,
+            layout: MatrixLayout::contiguous(spec.batch(), rows, cols),
+            copy: Some(storage),
+        })
     }
 }
 
@@ -807,21 +825,19 @@ impl Backend for MetalBackend {
         if spec.output().element_count() == 0 {
             return Ok(output);
         }
-        let (lhs, lhs_matrix, lhs_copy) =
-            self.matmul_operand(lhs, spec.lhs(), spec, spec.m(), spec.k())?;
-        let (rhs, rhs_matrix, rhs_copy) =
-            self.matmul_operand(rhs, spec.rhs(), spec, spec.k(), spec.n())?;
-        let lhs_layout = Layout::contiguous(*lhs.layout.shape());
-        let rhs_layout = Layout::contiguous(*rhs.layout.shape());
-        let lhs = copied_view(lhs, lhs_copy.as_ref(), &lhs_layout);
-        let rhs = copied_view(rhs, rhs_copy.as_ref(), &rhs_layout);
-        let (args, grid) = MatmulArgs::new(spec, &lhs_matrix, &rhs_matrix)?;
+        let lhs_input = self.matmul_operand(lhs, spec.lhs(), spec, spec.m(), spec.k())?;
+        let rhs_input = self.matmul_operand(rhs, spec.rhs(), spec, spec.k(), spec.n())?;
+        let lhs_layout = Layout::contiguous(*lhs_input.view.layout.shape());
+        let rhs_layout = Layout::contiguous(*rhs_input.view.layout.shape());
+        let dispatch = MatmulDispatch::new(spec, &lhs_input.layout, &rhs_input.layout)?;
+        let lhs = copied_view(lhs_input.view, lhs_input.copy.as_ref(), &lhs_layout);
+        let rhs = copied_view(rhs_input.view, rhs_input.copy.as_ref(), &rhs_layout);
         self.dispatch_matmul(
             matmul_kernel(spec.dtype()),
             &lhs,
             &rhs,
-            &args,
-            grid,
+            &dispatch.args,
+            dispatch.grid,
             &output,
         )?;
         Ok(output)
@@ -1249,8 +1265,9 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
         );
-        assert!(
-            matches!(result, Err(CoreError::ByteLengthMismatch)),
+        assert_eq!(
+            result.err(),
+            Some(CoreError::ByteLengthMismatch),
             "a byte length that does not match shape × dtype is rejected"
         );
     }
@@ -1264,10 +1281,10 @@ mod tests {
             DType::F32,
             Shape::try_from([(1 << 31) - 1].as_slice()).expect("the shape is valid"),
         );
-        assert!(
-            matches!(result, Err(CoreError::ByteLengthMismatch)),
-            "the byte length is checked before allocation, got {:?}",
-            result.err()
+        assert_eq!(
+            result.err(),
+            Some(CoreError::ByteLengthMismatch),
+            "the byte length is checked before allocation"
         );
     }
 
@@ -1307,11 +1324,9 @@ mod tests {
         .expect("the upload succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid");
-        assert!(
-            matches!(
-                permuted.download(&mut backend),
-                Err(CoreError::DownloadNonContiguous)
-            ),
+        assert_eq!(
+            permuted.download(&mut backend).err(),
+            Some(CoreError::DownloadNonContiguous),
             "a non-contiguous layout cannot be downloaded"
         );
     }
@@ -1604,76 +1619,234 @@ mod tests {
 
     #[test]
     fn unary_ops_match_hand_computed_values_for_each_float_dtype() {
+        struct NameOutputExpectedCase<T0, T1, T2> {
+            name: T0,
+            output: T1,
+            expected: T2,
+        }
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let [neg_input, exp_input, sqrt_input, recip_input] = [
-                [1.0_f32, -2.5, 0.0],
-                [0.0, 1.0, -1.0],
-                [4.0, 2.25, 0.0],
-                [2.0, -4.0, 0.5],
-            ]
-            .map(|values| {
-                Tensor::upload(
-                    &mut backend,
-                    &values
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    DType::F32,
-                    Shape::try_from([3].as_slice()).expect("the shape is valid"),
-                )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
-            });
-            [
-                ("neg", neg_input.neg(&mut backend), [-1.0_f32, 2.5, 0.0]),
-                ("exp", exp_input.exp(&mut backend), [1.0, E, 1.0 / E]),
-                ("sqrt", sqrt_input.sqrt(&mut backend), [2.0, 1.5, 0.0]),
-                ("recip", recip_input.recip(&mut backend), [0.5, -0.25, 2.0]),
-            ]
-            .into_iter()
-            .for_each(|(name, output, expected)| {
-                let actual: Vec<f32> = output
-                    .expect("the op succeeds")
-                    .cast(&mut backend, DType::F32)
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let [neg_input, exp_input, sqrt_input, recip_input] = [
+                    [1.0_f32, -2.5, 0.0],
+                    [0.0, 1.0, -1.0],
+                    [4.0, 2.25, 0.0],
+                    [2.0, -4.0, 0.5],
+                ]
+                .map(|values| {
+                    Tensor::upload(
+                        &mut backend,
+                        &values
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        DType::F32,
+                        Shape::try_from([3].as_slice()).expect("the shape is valid"),
+                    )
+                    .expect("the upload succeeds")
+                    .cast(&mut backend, dtype)
                     .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                assert_eq!(actual.len(), expected.len(), "{name}: element count");
-                actual.iter().zip(expected).for_each(|(&actual, expected)| {
-                    assert!(
-                        (actual - expected).abs()
-                            <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                        "{name} for {dtype:?}: {actual} is not within {tolerance} of {expected}"
-                    );
                 });
-            });
-        });
+                [
+                    NameOutputExpectedCase {
+                        name: "neg",
+                        output: neg_input.neg(&mut backend),
+                        expected: [-1.0_f32, 2.5, 0.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "exp",
+                        output: exp_input.exp(&mut backend),
+                        expected: [1.0, E, 1.0 / E],
+                    },
+                    NameOutputExpectedCase {
+                        name: "sqrt",
+                        output: sqrt_input.sqrt(&mut backend),
+                        expected: [2.0, 1.5, 0.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "recip",
+                        output: recip_input.recip(&mut backend),
+                        expected: [0.5, -0.25, 2.0],
+                    },
+                ]
+                .into_iter()
+                .for_each(
+                    |NameOutputExpectedCase {
+                         name,
+                         output,
+                         expected,
+                     }| {
+                        let actual: Vec<f32> = output
+                            .expect("the op succeeds")
+                            .cast(&mut backend, DType::F32)
+                            .expect("the cast succeeds")
+                            .download(&mut backend)
+                            .expect("the download succeeds")
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&chunk| f32::from_le_bytes(chunk))
+                            .collect();
+                        assert_eq!(actual.len(), expected.len(), "{name}: element count");
+                        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+                            assert!(
+                                (actual - expected).abs()
+                                    <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                                "{name} for {dtype:?}: {actual} is not within {tolerance} of \
+                                 {expected}"
+                            );
+                        });
+                    },
+                );
+            },
+        );
     }
 
     #[test]
     fn binary_ops_match_hand_computed_values_for_each_float_dtype() {
+        struct NameOutputExpectedCase<T0, T1, T2> {
+            name: T0,
+            output: T1,
+            expected: T2,
+        }
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let [lhs, rhs] = [[1.0_f32, 2.0, 3.0, 4.0], [2.0, 4.0, 0.5, -1.0]].map(|values| {
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let [lhs, rhs] = [[1.0_f32, 2.0, 3.0, 4.0], [2.0, 4.0, 0.5, -1.0]].map(|values| {
+                    Tensor::upload(
+                        &mut backend,
+                        &values
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        DType::F32,
+                        Shape::try_from([4].as_slice()).expect("the shape is valid"),
+                    )
+                    .expect("the upload succeeds")
+                    .cast(&mut backend, dtype)
+                    .expect("the cast succeeds")
+                });
+                [
+                    NameOutputExpectedCase {
+                        name: "add",
+                        output: lhs.add(&mut backend, &rhs),
+                        expected: [3.0_f32, 6.0, 3.5, 3.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "sub",
+                        output: lhs.sub(&mut backend, &rhs),
+                        expected: [-1.0, -2.0, 2.5, 5.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "mul",
+                        output: lhs.mul(&mut backend, &rhs),
+                        expected: [2.0, 8.0, 1.5, -4.0],
+                    },
+                    NameOutputExpectedCase {
+                        name: "div",
+                        output: lhs.div(&mut backend, &rhs),
+                        expected: [0.5, 0.5, 6.0, -4.0],
+                    },
+                ]
+                .into_iter()
+                .for_each(
+                    |NameOutputExpectedCase {
+                         name,
+                         output,
+                         expected,
+                     }| {
+                        let actual: Vec<f32> = output
+                            .expect("the op succeeds")
+                            .cast(&mut backend, DType::F32)
+                            .expect("the cast succeeds")
+                            .download(&mut backend)
+                            .expect("the download succeeds")
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&chunk| f32::from_le_bytes(chunk))
+                            .collect();
+                        assert_eq!(actual.len(), expected.len(), "{name}: element count");
+                        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+                            assert!(
+                                (actual - expected).abs()
+                                    <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                                "{name} for {dtype:?}: {actual} is not within {tolerance} of \
+                                 {expected}"
+                            );
+                        });
+                    },
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn add_broadcasts_a_row_over_a_matrix() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let [matrix, row] = [
+            ValuesDimsCase {
+                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                dims: vec![2, 3],
+            },
+            ValuesDimsCase {
+                values: vec![10.0, 20.0, 30.0],
+                dims: vec![3],
+            },
+        ]
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
                 Tensor::upload(
                     &mut backend,
                     &values
@@ -1681,62 +1854,11 @@ mod tests {
                         .flat_map(|value| value.to_le_bytes())
                         .collect::<Vec<u8>>(),
                     DType::F32,
-                    Shape::try_from([4].as_slice()).expect("the shape is valid"),
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
                 .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
-            });
-            [
-                ("add", lhs.add(&mut backend, &rhs), [3.0_f32, 6.0, 3.5, 3.0]),
-                ("sub", lhs.sub(&mut backend, &rhs), [-1.0, -2.0, 2.5, 5.0]),
-                ("mul", lhs.mul(&mut backend, &rhs), [2.0, 8.0, 1.5, -4.0]),
-                ("div", lhs.div(&mut backend, &rhs), [0.5, 0.5, 6.0, -4.0]),
-            ]
-            .into_iter()
-            .for_each(|(name, output, expected)| {
-                let actual: Vec<f32> = output
-                    .expect("the op succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                assert_eq!(actual.len(), expected.len(), "{name}: element count");
-                actual.iter().zip(expected).for_each(|(&actual, expected)| {
-                    assert!(
-                        (actual - expected).abs()
-                            <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                        "{name} for {dtype:?}: {actual} is not within {tolerance} of {expected}"
-                    );
-                });
-            });
-        });
-    }
-
-    #[test]
-    fn add_broadcasts_a_row_over_a_matrix() {
-        let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let [matrix, row] = [
-            (vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0], vec![2, 3]),
-            (vec![10.0, 20.0, 30.0], vec![3]),
-        ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+            },
+        );
         let sum = matrix.add(&mut backend, &row).expect("the add succeeds");
         assert_eq!(sum.shape().dims(), &[2, 3], "broadcast dims");
         let actual: Vec<f32> = sum
@@ -1789,23 +1911,38 @@ mod tests {
 
     #[test]
     fn mul_of_permuted_and_contiguous_operands_reads_both_layouts() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let [transposed, contiguous] = [
-            (vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0], vec![3, 2]),
-            (vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
+            ValuesDimsCase {
+                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                dims: vec![3, 2],
+            },
+            ValuesDimsCase {
+                values: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                dims: vec![2, 3],
+            },
         ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         let actual: Vec<f32> = transposed
             .permute(&[1, 0])
             .expect("the permutation is valid")
@@ -1836,11 +1973,9 @@ mod tests {
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
         .expect("the upload succeeds");
-        assert!(
-            matches!(
-                indices.add(&mut backend, &indices),
-                Err(CoreError::DTypeNotFloat)
-            ),
+        assert_eq!(
+            indices.add(&mut backend, &indices).err(),
+            Some(CoreError::DTypeNotFloat),
             "binary ops reject u32 on Metal"
         );
     }
@@ -1899,7 +2034,7 @@ mod tests {
     #[test]
     fn zeros_interleaved_with_adds_keep_submission_order() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let [ones, start] = [(); 2].map(|()| {
+        let [ones, start] = [0_u8; 2].map(|_| {
             Tensor::upload(
                 &mut backend,
                 &[1.0_f32; 3]
@@ -1937,92 +2072,144 @@ mod tests {
 
     #[test]
     fn sum_and_max_over_each_axis_match_hand_computed_values_for_each_float_dtype() {
+        struct NameReducedDimsExpectedCase<T0, T1, T2, T3> {
+            name: T0,
+            reduced: T1,
+            dims: T2,
+            expected: T3,
+        }
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let input = Tensor::upload(
-                &mut backend,
-                &[1.0_f32, 5.0, 3.0, 4.0, 2.0, 6.0]
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, dtype)
-            .expect("the cast succeeds");
-            [
-                (
-                    "sum axis 0",
-                    input.sum(&mut backend, 0),
-                    &[1, 3][..],
-                    &[5.0_f32, 7.0, 9.0][..],
-                ),
-                (
-                    "sum axis 1",
-                    input.sum(&mut backend, 1),
-                    &[2, 1],
-                    &[9.0, 12.0],
-                ),
-                (
-                    "max axis 0",
-                    input.max(&mut backend, 0),
-                    &[1, 3],
-                    &[4.0, 5.0, 6.0],
-                ),
-                (
-                    "max axis 1",
-                    input.max(&mut backend, 1),
-                    &[2, 1],
-                    &[5.0, 6.0],
-                ),
-            ]
-            .into_iter()
-            .for_each(|(name, reduced, dims, expected)| {
-                let reduced = reduced.expect("the reduction succeeds");
-                assert_eq!(reduced.dtype(), dtype, "{name} keeps the dtype");
-                assert_eq!(reduced.shape().dims(), dims, "{name} keeps the axis");
-                let actual: Vec<f32> = reduced
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                assert_eq!(actual.len(), expected.len(), "{name}: element count");
-                actual
-                    .iter()
-                    .zip(expected)
-                    .for_each(|(&actual, &expected)| {
-                        assert!(
-                            (actual - expected).abs()
-                                <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                            "{name} for {dtype:?}: {actual} is not within {tolerance} of \
-                             {expected}"
-                        );
-                    });
-            });
-        });
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let input = Tensor::upload(
+                    &mut backend,
+                    &[1.0_f32, 5.0, 3.0, 4.0, 2.0, 6.0]
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .cast(&mut backend, dtype)
+                .expect("the cast succeeds");
+                [
+                    NameReducedDimsExpectedCase {
+                        name: "sum axis 0",
+                        reduced: input.sum(&mut backend, 0),
+                        dims: &[1, 3][..],
+                        expected: &[5.0_f32, 7.0, 9.0][..],
+                    },
+                    NameReducedDimsExpectedCase {
+                        name: "sum axis 1",
+                        reduced: input.sum(&mut backend, 1),
+                        dims: &[2, 1],
+                        expected: &[9.0, 12.0],
+                    },
+                    NameReducedDimsExpectedCase {
+                        name: "max axis 0",
+                        reduced: input.max(&mut backend, 0),
+                        dims: &[1, 3],
+                        expected: &[4.0, 5.0, 6.0],
+                    },
+                    NameReducedDimsExpectedCase {
+                        name: "max axis 1",
+                        reduced: input.max(&mut backend, 1),
+                        dims: &[2, 1],
+                        expected: &[5.0, 6.0],
+                    },
+                ]
+                .into_iter()
+                .for_each(
+                    |NameReducedDimsExpectedCase {
+                         name,
+                         reduced,
+                         dims,
+                         expected,
+                     }| {
+                        let reduced = reduced.expect("the reduction succeeds");
+                        assert_eq!(reduced.dtype(), dtype, "{name} keeps the dtype");
+                        assert_eq!(reduced.shape().dims(), dims, "{name} keeps the axis");
+                        let actual: Vec<f32> = reduced
+                            .cast(&mut backend, DType::F32)
+                            .expect("the cast succeeds")
+                            .download(&mut backend)
+                            .expect("the download succeeds")
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&chunk| f32::from_le_bytes(chunk))
+                            .collect();
+                        assert_eq!(actual.len(), expected.len(), "{name}: element count");
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .for_each(|(&actual, &expected)| {
+                                assert!(
+                                    (actual - expected).abs()
+                                        <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                                    "{name} for {dtype:?}: {actual} is not within {tolerance} of \
+                                     {expected}"
+                                );
+                            });
+                    },
+                );
+            },
+        );
     }
 
     #[test]
     fn argmax_over_each_axis_matches_hand_computed_indices_for_each_float_dtype() {
+        struct AxisDimsExpectedCase<T0, T1, T2> {
+            axis: T0,
+            dims: T1,
+            expected: T2,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [DType::F32, DType::F16, DType::BF16]
             .into_iter()
             .for_each(|dtype| {
-                [(0, &[1, 3][..], &[1_u32, 0, 1][..]), (1, &[2, 1], &[1, 2])]
-                    .into_iter()
-                    .for_each(|(axis, dims, expected)| {
+                [
+                    AxisDimsExpectedCase {
+                        axis: 0,
+                        dims: &[1, 3][..],
+                        expected: &[1_u32, 0, 1][..],
+                    },
+                    AxisDimsExpectedCase {
+                        axis: 1,
+                        dims: &[2, 1],
+                        expected: &[1, 2],
+                    },
+                ]
+                .into_iter()
+                .for_each(
+                    |AxisDimsExpectedCase {
+                         axis,
+                         dims,
+                         expected,
+                     }| {
                         let indices = Tensor::upload(
                             &mut backend,
                             &[1.0_f32, 5.0, 3.0, 4.0, 2.0, 6.0]
@@ -2048,7 +2235,8 @@ mod tests {
                             .map(|&chunk| u32::from_le_bytes(chunk))
                             .collect();
                         assert_eq!(actual, expected, "argmax over axis {axis} for {dtype:?}");
-                    });
+                    },
+                );
             });
     }
 
@@ -2208,195 +2396,291 @@ mod tests {
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
         .expect("the upload succeeds");
-        assert!(
-            matches!(indices.sum(&mut backend, 0), Err(CoreError::DTypeNotFloat)),
+        assert_eq!(
+            indices.sum(&mut backend, 0).err(),
+            Some(CoreError::DTypeNotFloat),
             "reductions reject u32 on Metal"
         );
     }
 
     #[test]
     fn matmul_matches_hand_computed_values_for_each_float_dtype() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let [lhs, rhs] = [
-                (vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]),
-                (vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]),
-            ]
-            .map(|(values, dims)| {
-                Tensor::upload(
-                    &mut backend,
-                    &values
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    DType::F32,
-                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-                )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
-            });
-            let actual: Vec<f32> = lhs
-                .matmul(&mut backend, &rhs)
-                .expect("the matmul succeeds")
-                .cast(&mut backend, DType::F32)
-                .expect("the cast succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            let expected = [58.0_f32, 64.0, 139.0, 154.0];
-            assert_eq!(
-                actual.len(),
-                expected.len(),
-                "[2, 3] x [3, 2]: element count"
-            );
-            actual.iter().zip(expected).for_each(|(&actual, expected)| {
-                assert!(
-                    (actual - expected).abs() <= tolerance * expected.abs(),
-                    "[2, 3] x [3, 2] for {dtype:?}: {actual} is not within {tolerance} of \
-                     {expected}"
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let [lhs, rhs] = [
+                    ValuesDimsCase {
+                        values: vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+                        dims: vec![2, 3],
+                    },
+                    ValuesDimsCase {
+                        values: vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                        dims: vec![3, 2],
+                    },
+                ]
+                .map(
+                    |ValuesDimsCase {
+                         values,
+                         dims,
+                     }| {
+                        Tensor::upload(
+                            &mut backend,
+                            &values
+                                .iter()
+                                .flat_map(|value| value.to_le_bytes())
+                                .collect::<Vec<u8>>(),
+                            DType::F32,
+                            Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                        )
+                        .expect("the upload succeeds")
+                        .cast(&mut backend, dtype)
+                        .expect("the cast succeeds")
+                    },
                 );
-            });
-        });
+                let actual: Vec<f32> = lhs
+                    .matmul(&mut backend, &rhs)
+                    .expect("the matmul succeeds")
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect();
+                let expected = [58.0_f32, 64.0, 139.0, 154.0];
+                assert_eq!(
+                    actual.len(),
+                    expected.len(),
+                    "[2, 3] x [3, 2]: element count"
+                );
+                actual.iter().zip(expected).for_each(|(&actual, expected)| {
+                    assert!(
+                        (actual - expected).abs() <= tolerance * expected.abs(),
+                        "[2, 3] x [3, 2] for {dtype:?}: {actual} is not within {tolerance} of \
+                         {expected}"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
     fn matmul_reads_transposed_right_operand_without_copy() {
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let [x, weight] = [
-                [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-                [1.0, 0.0, -1.0, 2.0, 1.0, 0.0],
-            ]
-            .map(|values| {
-                Tensor::upload(
-                    &mut backend,
-                    &values
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    DType::F32,
-                    Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
-                )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
-            });
-            let weight_transposed = weight.permute(&[1, 0]).expect("the permutation is valid");
-            assert!(
-                !weight_transposed.layout().is_contiguous()
-                    && matmul_rule(dtype, x.layout(), dtype, weight_transposed.layout())
-                        .is_ok_and(|spec| is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
-                "a transposed weight is read in place"
-            );
-            let actual: Vec<f32> = x
-                .matmul(&mut backend, &weight_transposed)
-                .expect("the matmul succeeds")
-                .cast(&mut backend, DType::F32)
-                .expect("the cast succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            let expected = [-2.0_f32, 4.0, -2.0, 13.0];
-            assert_eq!(actual.len(), expected.len(), "x . W^T: element count");
-            actual.iter().zip(expected).for_each(|(&actual, expected)| {
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let [x, weight] = [
+                    [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    [1.0, 0.0, -1.0, 2.0, 1.0, 0.0],
+                ]
+                .map(|values| {
+                    Tensor::upload(
+                        &mut backend,
+                        &values
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        DType::F32,
+                        Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                    )
+                    .expect("the upload succeeds")
+                    .cast(&mut backend, dtype)
+                    .expect("the cast succeeds")
+                });
+                let weight_transposed = weight.permute(&[1, 0]).expect("the permutation is valid");
                 assert!(
-                    (actual - expected).abs() <= tolerance * expected.abs(),
-                    "x . W^T for {dtype:?}: {actual} is not within {tolerance} of {expected}"
+                    !weight_transposed.layout().is_contiguous()
+                        && matmul_rule(dtype, x.layout(), dtype, weight_transposed.layout())
+                            .is_ok_and(|spec| is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
+                    "a transposed weight is read in place"
                 );
-            });
-        });
+                let actual: Vec<f32> = x
+                    .matmul(&mut backend, &weight_transposed)
+                    .expect("the matmul succeeds")
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect();
+                let expected = [-2.0_f32, 4.0, -2.0, 13.0];
+                assert_eq!(actual.len(), expected.len(), "x . W^T: element count");
+                actual.iter().zip(expected).for_each(|(&actual, expected)| {
+                    assert!(
+                        (actual - expected).abs() <= tolerance * expected.abs(),
+                        "x . W^T for {dtype:?}: {actual} is not within {tolerance} of {expected}"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
     fn matmul_reads_transposed_left_operand_without_copy() {
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let [lhs, rhs] = [
-                [1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0],
-                [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-            ]
-            .map(|values| {
-                Tensor::upload(
-                    &mut backend,
-                    &values
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    DType::F32,
-                    Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
-                )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
-            });
-            let lhs_transposed = lhs.permute(&[1, 0]).expect("the permutation is valid");
-            assert!(
-                matmul_rule(dtype, lhs_transposed.layout(), dtype, rhs.layout())
-                    .is_ok_and(|spec| is_matmul_ready(spec.lhs(), spec.m(), spec.k())),
-                "a transposed lhs is read in place"
-            );
-            let actual: Vec<f32> = lhs_transposed
-                .matmul(&mut backend, &rhs)
-                .expect("the matmul succeeds")
-                .cast(&mut backend, DType::F32)
-                .expect("the cast succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            let expected = [58.0_f32, 64.0, 139.0, 154.0];
-            assert_eq!(actual.len(), expected.len(), "L^T x R: element count");
-            actual.iter().zip(expected).for_each(|(&actual, expected)| {
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let [lhs, rhs] = [
+                    [1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0],
+                    [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                ]
+                .map(|values| {
+                    Tensor::upload(
+                        &mut backend,
+                        &values
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        DType::F32,
+                        Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
+                    )
+                    .expect("the upload succeeds")
+                    .cast(&mut backend, dtype)
+                    .expect("the cast succeeds")
+                });
+                let lhs_transposed = lhs.permute(&[1, 0]).expect("the permutation is valid");
                 assert!(
-                    (actual - expected).abs() <= tolerance * expected.abs(),
-                    "L^T x R for {dtype:?}: {actual} is not within {tolerance} of {expected}"
+                    matmul_rule(dtype, lhs_transposed.layout(), dtype, rhs.layout())
+                        .is_ok_and(|spec| is_matmul_ready(spec.lhs(), spec.m(), spec.k())),
+                    "a transposed lhs is read in place"
                 );
-            });
-        });
+                let actual: Vec<f32> = lhs_transposed
+                    .matmul(&mut backend, &rhs)
+                    .expect("the matmul succeeds")
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect();
+                let expected = [58.0_f32, 64.0, 139.0, 154.0];
+                assert_eq!(actual.len(), expected.len(), "L^T x R: element count");
+                actual.iter().zip(expected).for_each(|(&actual, expected)| {
+                    assert!(
+                        (actual - expected).abs() <= tolerance * expected.abs(),
+                        "L^T x R for {dtype:?}: {actual} is not within {tolerance} of {expected}"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
     fn batched_matmul_matches_sum_of_products() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
+        struct CountSeedCase<T0, T1> {
+            count: T0,
+            seed: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let [lhs_values, rhs_values] =
-            [(2 * 3 * 40, 7_u16), (2 * 40 * 5, 5)].map(|(count, seed)| {
+        let [lhs_values, rhs_values] = [
+            CountSeedCase {
+                count: 2 * 3 * 40,
+                seed: 7_u16,
+            },
+            CountSeedCase {
+                count: 2 * 40 * 5,
+                seed: 5,
+            },
+        ]
+        .map(
+            |CountSeedCase {
+                 count,
+                 seed,
+             }| {
                 (0..count)
                     .map(|index: u16| {
                         let step = index.wrapping_mul(seed).wrapping_add(3) % 17;
                         (f32::from(step) - 8.0) / 8.0
                     })
                     .collect::<Vec<f32>>()
-            });
+            },
+        );
         let expected: Vec<f32> = lhs_values
             .chunks(3 * 40)
             .zip(rhs_values.chunks(40 * 5))
@@ -2411,11 +2695,37 @@ mod tests {
                 })
             })
             .collect();
-        [(DType::F32, 1e-5_f32), (DType::BF16, 1e-2)]
-            .into_iter()
-            .for_each(|(dtype, tolerance)| {
-                let [lhs, rhs] =
-                    [(&lhs_values, [2, 3, 40]), (&rhs_values, [2, 40, 5])].map(|(values, dims)| {
+        [
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let [lhs, rhs] = [
+                    ValuesDimsCase {
+                        values: &lhs_values,
+                        dims: [2, 3, 40],
+                    },
+                    ValuesDimsCase {
+                        values: &rhs_values,
+                        dims: [2, 40, 5],
+                    },
+                ]
+                .map(
+                    |ValuesDimsCase {
+                         values,
+                         dims,
+                     }| {
                         Tensor::upload(
                             &mut backend,
                             &values
@@ -2428,7 +2738,8 @@ mod tests {
                         .expect("the upload succeeds")
                         .cast(&mut backend, dtype)
                         .expect("the cast succeeds")
-                    });
+                    },
+                );
                 let actual: Vec<f32> = lhs
                     .matmul(&mut backend, &rhs)
                     .expect("the matmul succeeds")
@@ -2457,20 +2768,44 @@ mod tests {
                              {tolerance} of {expected}"
                         );
                     });
-            });
+            },
+        );
     }
 
     #[test]
     fn matmul_spans_several_tiles() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
+        struct CountSeedCase<T0, T1> {
+            count: T0,
+            seed: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let [lhs_values, rhs_values] = [(37 * 20, 3_u16), (20 * 33, 11)].map(|(count, seed)| {
-            (0..count)
-                .map(|index: u16| {
-                    let step = index.wrapping_mul(seed).wrapping_add(3) % 17;
-                    (f32::from(step) - 8.0) / 8.0
-                })
-                .collect::<Vec<f32>>()
-        });
+        let [lhs_values, rhs_values] = [
+            CountSeedCase {
+                count: 37 * 20,
+                seed: 3_u16,
+            },
+            CountSeedCase {
+                count: 20 * 33,
+                seed: 11,
+            },
+        ]
+        .map(
+            |CountSeedCase {
+                 count,
+                 seed,
+             }| {
+                (0..count)
+                    .map(|index: u16| {
+                        let step = index.wrapping_mul(seed).wrapping_add(3) % 17;
+                        (f32::from(step) - 8.0) / 8.0
+                    })
+                    .collect::<Vec<f32>>()
+            },
+        );
         let expected: Vec<f32> = lhs_values
             .chunks(20)
             .flat_map(|row| {
@@ -2483,8 +2818,21 @@ mod tests {
                 })
             })
             .collect();
-        let [lhs, rhs] =
-            [(&lhs_values, [37, 20]), (&rhs_values, [20, 33])].map(|(values, dims)| {
+        let [lhs, rhs] = [
+            ValuesDimsCase {
+                values: &lhs_values,
+                dims: [37, 20],
+            },
+            ValuesDimsCase {
+                values: &rhs_values,
+                dims: [20, 33],
+            },
+        ]
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
                 Tensor::upload(
                     &mut backend,
                     &values
@@ -2495,7 +2843,8 @@ mod tests {
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
                 .expect("the upload succeeds")
-            });
+            },
+        );
         let actual: Vec<f32> = lhs
             .matmul(&mut backend, &rhs)
             .expect("the matmul succeeds")
@@ -2524,6 +2873,10 @@ mod tests {
 
     #[test]
     fn matmul_copies_operand_without_unit_stride() {
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let rhs_contiguous: Vec<f32> = [
             0_u16, 4, 8, 12, 16, 20, 1, 5, 9, 13, 17, 21, 2, 6, 10, 14, 18, 22, 3, 7, 11, 15, 19,
@@ -2548,87 +2901,120 @@ mod tests {
             })
             .collect();
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let rhs = Tensor::upload(
-                &mut backend,
-                &(0_u16..24)
-                    .flat_map(|value| f32::from(value).to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, dtype)
-            .expect("the cast succeeds")
-            .permute(&[2, 0, 1])
-            .expect("the permutation is valid");
-            let lhs = Tensor::upload(
-                &mut backend,
-                &lhs_values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, dtype)
-            .expect("the cast succeeds");
-            assert!(
-                matmul_rule(dtype, lhs.layout(), dtype, rhs.layout())
-                    .is_ok_and(|spec| !is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
-                "strides (12, 4) on the last two axes need a copy"
-            );
-            let actual: Vec<f32> = lhs
-                .matmul(&mut backend, &rhs)
-                .expect("the matmul succeeds")
-                .cast(&mut backend, DType::F32)
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let rhs = Tensor::upload(
+                    &mut backend,
+                    &(0_u16..24)
+                        .flat_map(|value| f32::from(value).to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .cast(&mut backend, dtype)
                 .expect("the cast succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            assert_eq!(
-                actual.len(),
-                expected.len(),
-                "[4, 2, 2] x permuted [4, 2, 3]: element count"
-            );
-            actual
-                .iter()
-                .zip(&expected)
-                .for_each(|(&actual, &expected)| {
-                    assert!(
-                        (actual - expected).abs()
-                            <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                        "[4, 2, 2] x permuted [4, 2, 3] for {dtype:?}: {actual} is not within \
-                         {tolerance} of {expected}"
-                    );
-                });
-        });
+                .permute(&[2, 0, 1])
+                .expect("the permutation is valid");
+                let lhs = Tensor::upload(
+                    &mut backend,
+                    &lhs_values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .cast(&mut backend, dtype)
+                .expect("the cast succeeds");
+                assert!(
+                    matmul_rule(dtype, lhs.layout(), dtype, rhs.layout())
+                        .is_ok_and(|spec| !is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
+                    "strides (12, 4) on the last two axes need a copy"
+                );
+                let actual: Vec<f32> = lhs
+                    .matmul(&mut backend, &rhs)
+                    .expect("the matmul succeeds")
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect();
+                assert_eq!(
+                    actual.len(),
+                    expected.len(),
+                    "[4, 2, 2] x permuted [4, 2, 3]: element count"
+                );
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .for_each(|(&actual, &expected)| {
+                        assert!(
+                            (actual - expected).abs()
+                                <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                            "[4, 2, 2] x permuted [4, 2, 3] for {dtype:?}: {actual} is not within \
+                             {tolerance} of {expected}"
+                        );
+                    });
+            },
+        );
     }
 
     #[test]
     fn matmul_reads_permuted_batch_axes_in_place() {
+        struct CountDimsCase<T0, T1> {
+            count: T0,
+            dims: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let [lhs, rhs] = [(48_u16, [2, 3, 2, 4]), (24, [3, 2, 4, 1])].map(|(count, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &(0..count)
-                    .flat_map(|value| f32::from(value).to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        let [lhs, rhs] = [
+            CountDimsCase {
+                count: 48_u16,
+                dims: [2, 3, 2, 4],
+            },
+            CountDimsCase {
+                count: 24,
+                dims: [3, 2, 4, 1],
+            },
+        ]
+        .map(
+            |CountDimsCase {
+                 count,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &(0..count)
+                        .flat_map(|value| f32::from(value).to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         let lhs = lhs
             .permute(&[1, 0, 2, 3])
             .expect("the permutation is valid");
@@ -2650,23 +3036,38 @@ mod tests {
 
     #[test]
     fn matmul_with_empty_output_downloads_nothing() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let [lhs, rhs] = [
-            (vec![], vec![0, 3]),
-            (vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0], vec![3, 2]),
+            ValuesDimsCase {
+                values: vec![],
+                dims: vec![0, 3],
+            },
+            ValuesDimsCase {
+                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                dims: vec![3, 2],
+            },
         ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value: &f32| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value: &f32| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         let output = lhs.matmul(&mut backend, &rhs).expect("the matmul succeeds");
         assert_eq!(output.shape().dims(), &[0, 2], "output shape is [m, n]");
         assert!(
@@ -2680,6 +3081,10 @@ mod tests {
 
     #[test]
     fn gather_selects_rows_for_each_float_dtype() {
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let indices = Tensor::upload(
             &mut backend,
@@ -2692,50 +3097,65 @@ mod tests {
         )
         .expect("the upload succeeds");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let rows = Tensor::upload(
-                &mut backend,
-                &(0_u16..12)
-                    .flat_map(|value| f32::from(value).to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from([3, 4].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, dtype)
-            .expect("the cast succeeds")
-            .gather(&mut backend, &indices)
-            .expect("the gather succeeds");
-            assert_eq!(
-                rows.shape().dims(),
-                &[2, 4],
-                "output shape is [indices, cols]"
-            );
-            let actual: Vec<f32> = rows
-                .cast(&mut backend, DType::F32)
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let rows = Tensor::upload(
+                    &mut backend,
+                    &(0_u16..12)
+                        .flat_map(|value| f32::from(value).to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([3, 4].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .cast(&mut backend, dtype)
                 .expect("the cast succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            let expected = [8.0_f32, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0];
-            assert_eq!(actual.len(), expected.len(), "gather: element count");
-            actual.iter().zip(expected).for_each(|(&actual, expected)| {
-                assert!(
-                    (actual - expected).abs() <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                    "rows [2, 0] of a [3, 4] table for {dtype:?}: {actual} is not within \
-                     {tolerance} of {expected}"
+                .gather(&mut backend, &indices)
+                .expect("the gather succeeds");
+                assert_eq!(
+                    rows.shape().dims(),
+                    &[2, 4],
+                    "output shape is [indices, cols]"
                 );
-            });
-        });
+                let actual: Vec<f32> = rows
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect();
+                let expected = [8.0_f32, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0];
+                assert_eq!(actual.len(), expected.len(), "gather: element count");
+                actual.iter().zip(expected).for_each(|(&actual, expected)| {
+                    assert!(
+                        (actual - expected).abs()
+                            <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                        "rows [2, 0] of a [3, 4] table for {dtype:?}: {actual} is not within \
+                         {tolerance} of {expected}"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
@@ -2822,21 +3242,152 @@ mod tests {
 
     #[test]
     fn concat_on_first_and_last_axis_for_each_float_dtype() {
+        struct NameOutputDimsExpectedCase<T0, T1, T2, T3> {
+            name: T0,
+            output: T1,
+            dims: T2,
+            expected: T3,
+        }
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let [top, bottom, left, right] = [
-                (vec![0.0_f32, 1.0, 2.0], vec![1, 3]),
-                (vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 3]),
-                (vec![10.0, 20.0], vec![2, 1]),
-                (vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], vec![2, 3]),
-            ]
-            .map(|(values, dims)| {
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let [top, bottom, left, right] = [
+                    ValuesDimsCase {
+                        values: vec![0.0_f32, 1.0, 2.0],
+                        dims: vec![1, 3],
+                    },
+                    ValuesDimsCase {
+                        values: vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                        dims: vec![2, 3],
+                    },
+                    ValuesDimsCase {
+                        values: vec![10.0, 20.0],
+                        dims: vec![2, 1],
+                    },
+                    ValuesDimsCase {
+                        values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                        dims: vec![2, 3],
+                    },
+                ]
+                .map(
+                    |ValuesDimsCase {
+                         values,
+                         dims,
+                     }| {
+                        Tensor::upload(
+                            &mut backend,
+                            &values
+                                .iter()
+                                .flat_map(|value| value.to_le_bytes())
+                                .collect::<Vec<u8>>(),
+                            DType::F32,
+                            Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                        )
+                        .expect("the upload succeeds")
+                        .cast(&mut backend, dtype)
+                        .expect("the cast succeeds")
+                    },
+                );
+                [
+                    NameOutputDimsExpectedCase {
+                        name: "concat on axis 0",
+                        output: top.concat(&mut backend, &bottom, 0),
+                        dims: [3, 3],
+                        expected: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                    },
+                    NameOutputDimsExpectedCase {
+                        name: "concat on the last axis",
+                        output: left.concat(&mut backend, &right, 1),
+                        dims: [2, 4],
+                        expected: vec![10.0, 0.0, 1.0, 2.0, 20.0, 3.0, 4.0, 5.0],
+                    },
+                ]
+                .into_iter()
+                .for_each(
+                    |NameOutputDimsExpectedCase {
+                         name,
+                         output,
+                         dims,
+                         expected,
+                     }| {
+                        let output = output.expect("the concat succeeds");
+                        assert_eq!(output.shape().dims(), &dims, "{name}: output dims");
+                        let actual: Vec<f32> = output
+                            .cast(&mut backend, DType::F32)
+                            .expect("the cast succeeds")
+                            .download(&mut backend)
+                            .expect("the download succeeds")
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&chunk| f32::from_le_bytes(chunk))
+                            .collect();
+                        assert_eq!(actual.len(), expected.len(), "{name}: element count");
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .for_each(|(&actual, &expected)| {
+                                assert!(
+                                    (actual - expected).abs()
+                                        <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                                    "{name} for {dtype:?}: {actual} is not within {tolerance} of \
+                                     {expected}"
+                                );
+                            });
+                    },
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn concat_of_permuted_input_reads_strided_values() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let [lhs, rhs] = [
+            ValuesDimsCase {
+                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                dims: vec![2, 3],
+            },
+            ValuesDimsCase {
+                values: vec![10.0, 11.0],
+                dims: vec![1, 2],
+            },
+        ]
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
                 Tensor::upload(
                     &mut backend,
                     &values
@@ -2847,72 +3398,8 @@ mod tests {
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
                 .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
-            });
-            [
-                (
-                    "concat on axis 0",
-                    top.concat(&mut backend, &bottom, 0),
-                    [3, 3],
-                    vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-                ),
-                (
-                    "concat on the last axis",
-                    left.concat(&mut backend, &right, 1),
-                    [2, 4],
-                    vec![10.0, 0.0, 1.0, 2.0, 20.0, 3.0, 4.0, 5.0],
-                ),
-            ]
-            .into_iter()
-            .for_each(|(name, output, dims, expected)| {
-                let output = output.expect("the concat succeeds");
-                assert_eq!(output.shape().dims(), &dims, "{name}: output dims");
-                let actual: Vec<f32> = output
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                assert_eq!(actual.len(), expected.len(), "{name}: element count");
-                actual
-                    .iter()
-                    .zip(&expected)
-                    .for_each(|(&actual, &expected)| {
-                        assert!(
-                            (actual - expected).abs()
-                                <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                            "{name} for {dtype:?}: {actual} is not within {tolerance} of \
-                             {expected}"
-                        );
-                    });
-            });
-        });
-    }
-
-    #[test]
-    fn concat_of_permuted_input_reads_strided_values() {
-        let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let [lhs, rhs] = [
-            (vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0], vec![2, 3]),
-            (vec![10.0, 11.0], vec![1, 2]),
-        ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+            },
+        );
         let actual: Vec<f32> = lhs
             .permute(&[1, 0])
             .expect("the permutation is valid")
@@ -2934,23 +3421,38 @@ mod tests {
 
     #[test]
     fn concat_with_empty_input_keeps_the_other_input() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let [empty, rows] = [
-            (vec![], vec![0, 3]),
-            (vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0], vec![2, 3]),
+            ValuesDimsCase {
+                values: vec![],
+                dims: vec![0, 3],
+            },
+            ValuesDimsCase {
+                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                dims: vec![2, 3],
+            },
         ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value: &f32| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value: &f32| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         let output = empty
             .concat(&mut backend, &rows, 0)
             .expect("the concat succeeds");
@@ -2976,8 +3478,15 @@ mod tests {
 
     #[test]
     fn slice_update_writes_one_position_and_keeps_the_others_for_each_float_dtype() {
+        struct DtypeToleranceCase<T0, T1> {
+            dtype: T0,
+            tolerance: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let (heads, positions, head_dim, position) = (2_usize, 4_usize, 3_usize, 2_usize);
+        let heads = 2_usize;
+        let positions = 4_usize;
+        let head_dim = 3_usize;
+        let position = 2_usize;
         let update_values: Vec<f32> = (0_u16..6).map(|index| f32::from(index + 1)).collect();
         let expected: Vec<f32> = (0..heads)
             .flat_map(|head| {
@@ -2997,57 +3506,71 @@ mod tests {
             })
             .collect();
         [
-            (DType::F32, 1e-5_f32),
-            (DType::F16, 1e-2),
-            (DType::BF16, 1e-2),
+            DtypeToleranceCase {
+                dtype: DType::F32,
+                tolerance: 1e-5_f32,
+            },
+            DtypeToleranceCase {
+                dtype: DType::F16,
+                tolerance: 1e-2,
+            },
+            DtypeToleranceCase {
+                dtype: DType::BF16,
+                tolerance: 1e-2,
+            },
         ]
         .into_iter()
-        .for_each(|(dtype, tolerance)| {
-            let mut cache = Tensor::zeros(
-                &mut backend,
-                dtype,
-                Shape::try_from([heads, positions, head_dim].as_slice())
-                    .expect("the shape is valid"),
-            )
-            .expect("the zeros succeed");
-            let update = Tensor::upload(
-                &mut backend,
-                &update_values
+        .for_each(
+            |DtypeToleranceCase {
+                 dtype,
+                 tolerance,
+             }| {
+                let mut cache = Tensor::zeros(
+                    &mut backend,
+                    dtype,
+                    Shape::try_from([heads, positions, head_dim].as_slice())
+                        .expect("the shape is valid"),
+                )
+                .expect("the zeros succeed");
+                let update = Tensor::upload(
+                    &mut backend,
+                    &update_values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([heads, 1, head_dim].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .cast(&mut backend, dtype)
+                .expect("the cast succeeds");
+                cache
+                    .slice_update(&mut backend, &update, 1, position)
+                    .expect("the slice update succeeds");
+                let actual: Vec<f32> = cache
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds")
+                    .download(&mut backend)
+                    .expect("the download succeeds")
+                    .as_chunks::<4>()
+                    .0
                     .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from([heads, 1, head_dim].as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, dtype)
-            .expect("the cast succeeds");
-            cache
-                .slice_update(&mut backend, &update, 1, position)
-                .expect("the slice update succeeds");
-            let actual: Vec<f32> = cache
-                .cast(&mut backend, DType::F32)
-                .expect("the cast succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            assert_eq!(actual.len(), expected.len(), "slice update: element count");
-            actual
-                .iter()
-                .zip(&expected)
-                .for_each(|(&actual, &expected)| {
-                    assert!(
-                        (actual - expected).abs()
-                            <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
-                        "[2, 1, 3] into [2, 4, 3] at 2 for {dtype:?}: {actual} is not within \
-                         {tolerance} of {expected}"
-                    );
-                });
-        });
+                    .map(|&chunk| f32::from_le_bytes(chunk))
+                    .collect();
+                assert_eq!(actual.len(), expected.len(), "slice update: element count");
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .for_each(|(&actual, &expected)| {
+                        assert!(
+                            (actual - expected).abs()
+                                <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                            "[2, 1, 3] into [2, 4, 3] at 2 for {dtype:?}: {actual} is not within \
+                             {tolerance} of {expected}"
+                        );
+                    });
+            },
+        );
     }
 
     #[test]
@@ -3110,11 +3633,9 @@ mod tests {
             Shape::try_from([3, 1].as_slice()).expect("the shape is valid"),
         )
         .expect("the upload succeeds");
-        assert!(
-            matches!(
-                target.slice_update(&mut backend, &update, 1, 0),
-                Err(CoreError::SliceUpdateNonContiguous)
-            ),
+        assert_eq!(
+            target.slice_update(&mut backend, &update, 1, 0),
+            Err(CoreError::SliceUpdateNonContiguous),
             "a broadcast target would be written by several threads"
         );
     }
@@ -3133,59 +3654,91 @@ mod tests {
         .expect("the upload succeeds");
         let update = target.narrow(1, 0, 1).expect("the narrow is valid");
         let result = target.slice_update(&mut backend, &update, 1, 3);
-        assert!(
-            matches!(result, Err(CoreError::SharedStorage)),
-            "an update aliasing the target is rejected, got {result:?}"
+        assert_eq!(
+            result.err(),
+            Some(CoreError::SharedStorage),
+            "an update aliasing the target is rejected"
         );
     }
 
     #[test]
     fn slice_update_while_another_view_of_the_target_is_alive_is_rejected() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let [mut target, update] = [
-            (vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], vec![2, 4]),
-            (vec![100.0, 101.0], vec![2, 1]),
+            ValuesDimsCase {
+                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                dims: vec![2, 4],
+            },
+            ValuesDimsCase {
+                values: vec![100.0, 101.0],
+                dims: vec![2, 1],
+            },
         ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         let view = target.narrow(0, 0, 1).expect("the narrow is valid");
         let result = target.slice_update(&mut backend, &update, 1, 3);
-        assert!(
-            matches!(result, Err(CoreError::SharedStorage)),
-            "a live view would observe the write, got {result:?}"
+        assert_eq!(
+            result.err(),
+            Some(CoreError::SharedStorage),
+            "a live view would observe the write"
         );
         assert_eq!(view.shape().dims(), &[1, 4], "the view is still alive");
     }
 
     #[test]
     fn slice_update_without_live_views_writes_the_update() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let [mut target, update] = [
-            (vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], vec![2, 4]),
-            (vec![100.0, 101.0], vec![2, 1]),
+            ValuesDimsCase {
+                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                dims: vec![2, 4],
+            },
+            ValuesDimsCase {
+                values: vec![100.0, 101.0],
+                dims: vec![2, 1],
+            },
         ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-        });
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+            },
+        );
         target
             .slice_update(&mut backend, &update, 1, 3)
             .expect("the slice update succeeds");
@@ -3211,8 +3764,9 @@ mod tests {
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
         let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("the upload succeeds");
-        assert!(
-            matches!(tensor.download(&mut consumer), Err(CoreError::Backend)),
+        assert_eq!(
+            tensor.download(&mut consumer).err(),
+            Some(CoreError::Backend),
             "a storage from another backend cannot be downloaded"
         );
     }
@@ -3224,8 +3778,9 @@ mod tests {
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
         let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("the upload succeeds");
-        assert!(
-            matches!(tensor.neg(&mut consumer), Err(CoreError::Backend)),
+        assert_eq!(
+            tensor.neg(&mut consumer).err(),
+            Some(CoreError::Backend),
             "a storage from another backend cannot be read by a kernel"
         );
     }
@@ -3246,20 +3801,35 @@ mod tests {
             Shape::try_from(&[2_usize, 1][..]).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        assert!(
-            matches!(
-                target.slice_update(&mut consumer, &update, 1, 0),
-                Err(CoreError::Backend)
-            ),
+        assert_eq!(
+            target.slice_update(&mut consumer, &update, 1, 0),
+            Err(CoreError::Backend),
             "a target from another backend cannot be written"
         );
     }
 
     #[test]
     fn gather_and_concat_on_u32_are_rejected() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
+        }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let [values, indices] =
-            [(vec![0_u32, 1, 2, 3], vec![2, 2]), (vec![0], vec![1])].map(|(values, dims)| {
+        let [values, indices] = [
+            ValuesDimsCase {
+                values: vec![0_u32, 1, 2, 3],
+                dims: vec![2, 2],
+            },
+            ValuesDimsCase {
+                values: vec![0],
+                dims: vec![1],
+            },
+        ]
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
+             }| {
                 Tensor::upload(
                     &mut backend,
                     &values
@@ -3270,19 +3840,16 @@ mod tests {
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
                 .expect("the upload succeeds")
-            });
-        assert!(
-            matches!(
-                values.gather(&mut backend, &indices),
-                Err(CoreError::DTypeNotFloat)
-            ),
+            },
+        );
+        assert_eq!(
+            values.gather(&mut backend, &indices).err(),
+            Some(CoreError::DTypeNotFloat),
             "gather rejects a u32 table on Metal"
         );
-        assert!(
-            matches!(
-                values.concat(&mut backend, &values, 0),
-                Err(CoreError::DTypeNotFloat)
-            ),
+        assert_eq!(
+            values.concat(&mut backend, &values, 0).err(),
+            Some(CoreError::DTypeNotFloat),
             "concat rejects u32 on Metal"
         );
     }
