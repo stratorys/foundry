@@ -1,10 +1,23 @@
 use std::array;
 
-use crate::core::CoreError;
+use tracing::error;
+
+use crate::core::{
+    CoreError,
+    DTYPE_SIZE_BYTES_MAX,
+    DType,
+};
 
 pub const RANK_MAX: usize = 4;
 
 const ELEMENT_COUNT_MAX: usize = 0x7FFF_FFFF;
+
+const _: () = assert!(
+    ELEMENT_COUNT_MAX
+        .checked_mul(DTYPE_SIZE_BYTES_MAX)
+        .is_some(),
+    "the byte count of every shape fits in usize"
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Shape {
@@ -20,13 +33,41 @@ impl Shape {
 
     pub fn element_count(&self) -> usize { self.element_count }
 
+    pub fn byte_len(
+        &self,
+        dtype: DType,
+    ) -> usize {
+        self.element_count.saturating_mul(dtype.size_bytes())
+    }
+
+    pub fn dim(
+        &self,
+        axis: usize,
+    ) -> Result<usize, CoreError> {
+        self.dims().get(axis).copied().ok_or_else(|| {
+            error!(message = "Axis is out of range.", axis, rank = self.rank);
+            CoreError::AxisOutOfRange
+        })
+    }
+
+    pub fn last_axis(&self) -> Result<usize, CoreError> {
+        self.rank.checked_sub(1).ok_or_else(|| {
+            error!(message = "A scalar has no last axis.");
+            CoreError::AxisOutOfRange
+        })
+    }
+
     pub fn broadcast(
         lhs: &Shape,
         rhs: &Shape,
     ) -> Result<Shape, CoreError> {
-        let incompatible = || CoreError::BroadcastIncompatible {
-            lhs: lhs.dims().to_vec(),
-            rhs: rhs.dims().to_vec(),
+        let incompatible = || {
+            error!(
+                message = "Shapes cannot be broadcast together.",
+                lhs = ?lhs.dims(),
+                rhs = ?rhs.dims(),
+            );
+            CoreError::BroadcastIncompatible
         };
         let dims_reversed = (0..lhs.rank.max(rhs.rank))
             .map(|axis_from_end| {
@@ -52,19 +93,25 @@ impl TryFrom<&[usize]> for Shape {
     fn try_from(dims: &[usize]) -> Result<Self, Self::Error> {
         let rank = dims.len();
         if rank > RANK_MAX {
-            return Err(CoreError::RankTooLarge {
+            error!(
+                message = "Rank exceeds the maximum rank.",
                 rank,
-                rank_max: RANK_MAX,
-            });
+                rank_max = RANK_MAX
+            );
+            return Err(CoreError::RankTooLarge);
         }
         let element_count_non_zero = dims
             .iter()
             .filter(|&&dim| dim != 0)
             .try_fold(1_usize, |count, &dim| count.checked_mul(dim))
             .filter(|&count| count <= ELEMENT_COUNT_MAX)
-            .ok_or_else(|| CoreError::ElementCountOverflow {
-                dims: dims.to_vec(),
-                element_count_max: ELEMENT_COUNT_MAX,
+            .ok_or_else(|| {
+                error!(
+                    message = "Shape has too many elements.",
+                    ?dims,
+                    element_count_max = ELEMENT_COUNT_MAX,
+                );
+                CoreError::ElementCountOverflow
             })?;
         let element_count = if dims.contains(&0) {
             0
@@ -117,10 +164,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(CoreError::BroadcastIncompatible {
-                lhs: vec![2, 3],
-                rhs: vec![4, 3],
-            }),
+            Err(CoreError::BroadcastIncompatible),
             "dims 2 and 4 do not broadcast"
         );
     }
@@ -159,10 +203,7 @@ mod tests {
                 &Shape::try_from([1 << 30, 1].as_slice()).expect("valid shape"),
                 &Shape::try_from([1, 4].as_slice()).expect("valid shape"),
             ),
-            Err(CoreError::ElementCountOverflow {
-                dims: vec![1 << 30, 4],
-                element_count_max: 0x7FFF_FFFF,
-            }),
+            Err(CoreError::ElementCountOverflow),
             "two valid shapes can broadcast to an invalid one"
         );
     }
@@ -171,10 +212,7 @@ mod tests {
     fn rank_above_max_is_rejected() {
         assert_eq!(
             Shape::try_from([1, 2, 3, 4, 5].as_slice()),
-            Err(CoreError::RankTooLarge {
-                rank: 5,
-                rank_max: 4,
-            }),
+            Err(CoreError::RankTooLarge),
             "rank 5 is rejected"
         );
     }
@@ -201,10 +239,7 @@ mod tests {
     fn element_count_overflow_is_rejected() {
         assert_eq!(
             Shape::try_from([usize::MAX, 2].as_slice()),
-            Err(CoreError::ElementCountOverflow {
-                dims: vec![usize::MAX, 2],
-                element_count_max: 0x7FFF_FFFF,
-            }),
+            Err(CoreError::ElementCountOverflow),
             "the product overflows usize"
         );
     }
@@ -213,10 +248,7 @@ mod tests {
     fn element_count_above_i32_max_is_rejected() {
         assert_eq!(
             Shape::try_from([1 << 31].as_slice()),
-            Err(CoreError::ElementCountOverflow {
-                dims: vec![1 << 31],
-                element_count_max: 0x7FFF_FFFF,
-            }),
+            Err(CoreError::ElementCountOverflow),
             "one element above i32::MAX"
         );
     }
@@ -244,10 +276,7 @@ mod tests {
         .for_each(|dims| {
             assert_eq!(
                 Shape::try_from(dims.as_slice()),
-                Err(CoreError::ElementCountOverflow {
-                    dims: dims.to_vec(),
-                    element_count_max: 0x7FFF_FFFF,
-                }),
+                Err(CoreError::ElementCountOverflow),
                 "dims {dims:?}"
             );
         });

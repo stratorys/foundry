@@ -19,14 +19,8 @@ use foundry::models::llama::{
     LlamaConfig,
     LlamaError,
 };
-use foundry::weights::{
-    Weights,
-    WeightsError,
-};
-use hf_hub::{
-    HFClientSync,
-    HFError,
-};
+use foundry::weights::Weights;
+use hf_hub::HFClientSync;
 use tracing::{
     error,
     warn,
@@ -63,48 +57,29 @@ struct ModelId {
     name: String,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("Model id {model:?} is not of the form owner/name.")]
-struct ModelIdError {
-    model: String,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Model id is not of the form owner/name.")]
+struct ModelIdError;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum CliError {
-    #[error("Model {model} cannot be resolved from the Hugging Face cache: {error}")]
-    Resolve {
-        model: String,
-        #[source]
-        error: HFError,
-    },
+    #[error("Model cannot be resolved from the Hugging Face cache.")]
+    Resolve,
 
-    #[error(transparent)]
-    Weights(#[from] WeightsError),
+    #[error("Opening the model weights failed.")]
+    Weights,
 
-    #[error(transparent)]
-    Config(#[from] LlamaError),
+    #[error("Opening the model config failed.")]
+    Config,
 
-    #[error(transparent)]
-    Summary(#[from] WeightsSummaryError),
+    #[error("Total tensor byte count overflows usize.")]
+    TotalByteCountOverflow,
+
+    #[error("Tensor byte count does not match the index declaration.")]
+    BytesMismatch,
 
     #[error("Writing the report to stdout failed.")]
-    Output(#[from] io::Error),
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-enum WeightsSummaryError {
-    #[error(transparent)]
-    Weights(#[from] WeightsError),
-
-    #[error("Total byte count of model {model} overflows usize.")]
-    ByteCountOverflow { model: String },
-
-    #[error("Model {model} has {bytes} bytes of tensors; its index declares {bytes_declared}.")]
-    BytesMismatch {
-        model: String,
-        bytes: usize,
-        bytes_declared: u64,
-    },
+    Output,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -135,9 +110,10 @@ impl FromStr for ModelId {
                     name: name.to_owned(),
                 })
             }
-            _ => Err(ModelIdError {
-                model: model.to_owned(),
-            }),
+            _ => {
+                error!(message = "Model id is not of the form owner/name.", model);
+                Err(ModelIdError)
+            }
         }
     }
 }
@@ -172,9 +148,13 @@ fn main() -> ExitCode {
 }
 
 fn resolve_snapshot(model: &ModelId) -> Result<PathBuf, CliError> {
-    let resolve_error = |error| CliError::Resolve {
-        model: model.to_string(),
-        error,
+    let resolve_error = |error| {
+        error!(
+            message = "Model cannot be resolved from the Hugging Face cache.",
+            %model,
+            %error,
+        );
+        CliError::Resolve
     };
     HFClientSync::new()
         .map_err(resolve_error)?
@@ -190,22 +170,46 @@ fn inspect(
     tensors: bool,
 ) -> Result<(), CliError> {
     let directory = resolve_snapshot(model)?;
-    let weights = Weights::open(&directory)?;
+    let weights = Weights::open(&directory).map_err(|error| {
+        error!(
+            message = "Opening the model weights failed.",
+            directory = %directory.display(),
+            %error,
+        );
+        CliError::Weights
+    })?;
     let summary = summarize_weights(model, &weights)?;
     let config = load_architecture(&directory)?;
-    let tensor_rows = if tensors {
-        Some(tensor_rows(&weights)?)
-    } else {
-        None
-    };
-    let mut out = io::stdout().lock();
-    write_header(&mut out, model, &directory)?;
-    write_weights(&mut out, &summary)?;
-    if let Some(config) = &config {
-        write_architecture(&mut out, config)?;
+    let tensor_rows = tensors.then(|| tensor_rows(&weights));
+    write_report(
+        &mut io::stdout().lock(),
+        model,
+        &directory,
+        &summary,
+        config.as_ref(),
+        tensor_rows.as_deref(),
+    )
+    .map_err(|error| {
+        error!(message = "Writing the report to stdout failed.", %error);
+        CliError::Output
+    })
+}
+
+fn write_report(
+    out: &mut impl Write,
+    model: &ModelId,
+    directory: &Path,
+    summary: &WeightsSummary,
+    config: Option<&LlamaConfig>,
+    tensor_rows: Option<&[TensorRow]>,
+) -> io::Result<()> {
+    write_header(out, model, directory)?;
+    write_weights(out, summary)?;
+    if let Some(config) = config {
+        write_architecture(out, config)?;
     }
-    if let Some(rows) = &tensor_rows {
-        write_tensors(&mut out, rows)?;
+    if let Some(rows) = tensor_rows {
+        write_tensors(out, rows)?;
     }
     Ok(())
 }
@@ -213,37 +217,35 @@ fn inspect(
 fn summarize_weights<S: AsRef<[u8]>>(
     model: &ModelId,
     weights: &Weights<S>,
-) -> Result<WeightsSummary, WeightsSummaryError> {
-    let bytes = weights.names().try_fold(0_usize, |bytes, name| {
-        let tensor_bytes = weights.get(name)?.bytes.len();
-        bytes
-            .checked_add(tensor_bytes)
-            .ok_or_else(|| WeightsSummaryError::ByteCountOverflow {
-                model: model.to_string(),
-            })
+) -> Result<WeightsSummary, CliError> {
+    let bytes = weights.tensors().try_fold(0_usize, |bytes, (_, view)| {
+        bytes.checked_add(view.bytes.len()).ok_or_else(|| {
+            error!(message = "Total tensor byte count overflows usize.", %model);
+            CliError::TotalByteCountOverflow
+        })
     })?;
     let bytes_declared = weights.bytes_declared();
     if let Some(bytes_declared) = bytes_declared
         && u64::try_from(bytes).ok() != Some(bytes_declared)
     {
-        return Err(WeightsSummaryError::BytesMismatch {
-            model: model.to_string(),
+        error!(
+            message = "Tensor byte count does not match the index declaration.",
+            %model,
             bytes,
             bytes_declared,
-        });
+        );
+        return Err(CliError::BytesMismatch);
     }
     let dtypes = weights
-        .names()
-        .map(|name| {
-            weights.get(name).map(|view| {
-                let dtype = view.dtype;
-                format!("{dtype:?}")
-            })
+        .tensors()
+        .map(|(_, view)| {
+            let dtype = view.dtype;
+            format!("{dtype:?}")
         })
-        .collect::<Result<BTreeSet<String>, WeightsError>>()?;
+        .collect::<BTreeSet<String>>();
     Ok(WeightsSummary {
         shard_count: weights.shard_count(),
-        tensor_count: weights.names().count(),
+        tensor_count: weights.tensors().count(),
         bytes,
         bytes_declared,
         dtypes,
@@ -253,36 +255,37 @@ fn summarize_weights<S: AsRef<[u8]>>(
 fn load_architecture(directory: &Path) -> Result<Option<LlamaConfig>, CliError> {
     match LlamaConfig::open(directory) {
         Ok(config) => Ok(Some(config)),
-        Err(LlamaError::ModelType {
-            model_type,
-        }) => {
-            warn!(
-                message = "Model type is not supported; architecture is skipped.",
-                %model_type,
-            );
+        Err(LlamaError::ModelType) => {
+            warn!(message = "Model type is not supported; architecture is skipped.");
             Ok(None)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            error!(
+                message = "Opening the model config failed.",
+                directory = %directory.display(),
+                %error,
+            );
+            Err(CliError::Config)
+        }
     }
 }
 
-fn tensor_rows<S: AsRef<[u8]>>(weights: &Weights<S>) -> Result<Vec<TensorRow>, WeightsError> {
-    let mut names: Vec<&str> = weights.names().collect();
-    names.sort_unstable();
-    names
-        .into_iter()
-        .map(|name| {
-            let view = weights.get(name)?;
+fn tensor_rows<S: AsRef<[u8]>>(weights: &Weights<S>) -> Vec<TensorRow> {
+    let mut rows: Vec<TensorRow> = weights
+        .tensors()
+        .map(|(name, view)| {
             let dtype = view.dtype;
             let dims = view.shape.dims();
-            Ok(TensorRow {
+            TensorRow {
                 name: name.to_owned(),
                 dtype: format!("{dtype:?}"),
                 shape: format!("{dims:?}"),
                 bytes: view.bytes.len(),
-            })
+            }
         })
-        .collect()
+        .collect();
+    rows.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    rows
 }
 
 fn write_header(
@@ -427,13 +430,13 @@ mod tests {
 
     use crate::{
         Cli,
+        CliError,
         Command,
         GIB_BYTES,
         ModelId,
         ModelIdError,
         TensorRow,
         WeightsSummary,
-        WeightsSummaryError,
         format_gib,
         summarize_weights,
         tensor_rows,
@@ -466,9 +469,7 @@ mod tests {
             .for_each(|model| {
                 assert_eq!(
                     model.parse::<ModelId>(),
-                    Err(ModelIdError {
-                        model: model.to_owned(),
-                    }),
+                    Err(ModelIdError),
                     "model id {model:?} is rejected"
                 );
             });
@@ -701,11 +702,7 @@ mod tests {
                 },
                 &weights,
             ),
-            Err(WeightsSummaryError::BytesMismatch {
-                model: "a/b".to_owned(),
-                bytes: 4,
-                bytes_declared: 5,
-            }),
+            Err(CliError::BytesMismatch),
             "the index declares one byte more than the tensors hold"
         );
     }
@@ -728,7 +725,7 @@ mod tests {
             .expect("the file is valid");
         assert_eq!(
             tensor_rows(&weights),
-            Ok(vec![
+            vec![
                 TensorRow {
                     name: "a".to_owned(),
                     dtype: "BF16".to_owned(),
@@ -741,7 +738,7 @@ mod tests {
                     shape: "[1]".to_owned(),
                     bytes: 4,
                 },
-            ]),
+            ],
             "rows in name order"
         );
     }

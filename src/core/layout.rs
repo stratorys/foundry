@@ -1,5 +1,7 @@
 use std::array;
 
+use tracing::error;
+
 use crate::core::{
     CoreError,
     RANK_MAX,
@@ -28,6 +30,20 @@ impl Layout {
 
     pub fn offset(&self) -> usize { self.offset }
 
+    pub fn stride(
+        &self,
+        axis: usize,
+    ) -> Result<usize, CoreError> {
+        self.strides().get(axis).copied().ok_or_else(|| {
+            error!(
+                message = "Axis is out of range.",
+                axis,
+                rank = self.shape.rank()
+            );
+            CoreError::AxisOutOfRange
+        })
+    }
+
     pub fn is_contiguous(&self) -> bool {
         let expected = contiguous_strides(&self.shape);
         self.shape
@@ -42,14 +58,13 @@ impl Layout {
         shape: Shape,
     ) -> Result<Self, CoreError> {
         if !self.is_contiguous() {
+            error!(message = "Reshape requires a contiguous layout.", layout = ?self);
             return Err(CoreError::ReshapeNonContiguous);
         }
         let (from, to) = (self.shape.element_count(), shape.element_count());
         if from != to {
-            return Err(CoreError::ElementCountMismatch {
-                from,
-                to,
-            });
+            error!(message = "Element counts do not match.", from, to);
+            return Err(CoreError::ElementCountMismatch);
         }
         Ok(Self {
             offset: self.offset,
@@ -62,9 +77,13 @@ impl Layout {
         axes: &[usize],
     ) -> Result<Self, CoreError> {
         let rank = self.shape.rank();
-        let invalid = || CoreError::InvalidPermutation {
-            axes: axes.to_vec(),
-            rank,
+        let invalid = || {
+            error!(
+                message = "Axes are not a permutation of the rank.",
+                ?axes,
+                rank
+            );
+            CoreError::InvalidPermutation
         };
         let is_permutation = axes.len() == rank && (0..rank).all(|axis| axes.contains(&axis));
         if !is_permutation {
@@ -85,22 +104,14 @@ impl Layout {
         start: usize,
         len: usize,
     ) -> Result<Self, CoreError> {
-        let rank = self.shape.rank();
-        let (dim, stride) = self
-            .shape
-            .dims()
-            .get(axis)
-            .copied()
-            .zip(self.strides().get(axis).copied())
-            .ok_or(CoreError::AxisOutOfRange {
-                axis,
-                rank,
-            })?;
-        let out_of_bounds = || CoreError::NarrowOutOfBounds {
-            axis,
-            start,
-            len,
-            dim,
+        let dim = self.shape.dim(axis)?;
+        let stride = self.stride(axis)?;
+        let out_of_bounds = || {
+            error!(
+                message = "Narrow exceeds the dimension.",
+                axis, start, len, dim
+            );
+            CoreError::NarrowOutOfBounds
         };
         let end = start.checked_add(len).ok_or_else(out_of_bounds)?;
         if end > dim {
@@ -109,10 +120,14 @@ impl Layout {
         let offset = start
             .checked_mul(stride)
             .and_then(|delta| self.offset.checked_add(delta))
-            .ok_or(CoreError::OffsetOverflow {
-                offset: self.offset,
-                start,
-                stride,
+            .ok_or_else(|| {
+                error!(
+                    message = "View offset overflows.",
+                    offset = self.offset,
+                    start,
+                    stride,
+                );
+                CoreError::OffsetOverflow
             })?;
         let dims: Vec<usize> = self
             .shape
@@ -132,9 +147,13 @@ impl Layout {
         &self,
         shape: Shape,
     ) -> Result<Self, CoreError> {
-        let incompatible = || CoreError::BroadcastAsIncompatible {
-            from: self.shape.dims().to_vec(),
-            to: shape.dims().to_vec(),
+        let incompatible = || {
+            error!(
+                message = "Shape cannot be broadcast to the target shape.",
+                from = ?self.shape.dims(),
+                to = ?shape.dims(),
+            );
+            CoreError::BroadcastAsIncompatible
         };
         let leading = shape
             .rank()
@@ -228,10 +247,7 @@ mod tests {
             .for_each(|axes| {
                 assert_eq!(
                     layout.permute(axes),
-                    Err(CoreError::InvalidPermutation {
-                        axes: axes.to_vec(),
-                        rank: 3,
-                    }),
+                    Err(CoreError::InvalidPermutation),
                     "axes {axes:?}"
                 );
             });
@@ -254,20 +270,12 @@ mod tests {
             Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"));
         assert_eq!(
             layout.narrow(1, 2, 2),
-            Err(CoreError::NarrowOutOfBounds {
-                axis: 1,
-                start: 2,
-                len: 2,
-                dim: 3,
-            }),
+            Err(CoreError::NarrowOutOfBounds),
             "the window ends after the axis"
         );
         assert_eq!(
             layout.narrow(3, 0, 1),
-            Err(CoreError::AxisOutOfRange {
-                axis: 3,
-                rank: 3,
-            }),
+            Err(CoreError::AxisOutOfRange),
             "axis 3 does not exist"
         );
     }
@@ -280,12 +288,7 @@ mod tests {
                 usize::MAX,
                 1
             ),
-            Err(CoreError::NarrowOutOfBounds {
-                axis: 1,
-                start: usize::MAX,
-                len: 1,
-                dim: 3,
-            }),
+            Err(CoreError::NarrowOutOfBounds),
             "start plus len overflows usize"
         );
     }
@@ -320,10 +323,7 @@ mod tests {
         assert_eq!(
             Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
                 .reshape(Shape::try_from([5].as_slice()).expect("valid shape")),
-            Err(CoreError::ElementCountMismatch {
-                from: 6,
-                to: 5,
-            }),
+            Err(CoreError::ElementCountMismatch),
             "six elements cannot become five"
         );
     }
@@ -516,10 +516,7 @@ mod tests {
         assert_eq!(
             Layout::contiguous(Shape::try_from([3, 2].as_slice()).expect("valid shape"))
                 .broadcast_as(Shape::try_from([3, 4].as_slice()).expect("valid shape")),
-            Err(CoreError::BroadcastAsIncompatible {
-                from: vec![3, 2],
-                to: vec![3, 4],
-            }),
+            Err(CoreError::BroadcastAsIncompatible),
             "dim 2 cannot become 4"
         );
     }
@@ -529,10 +526,7 @@ mod tests {
         assert_eq!(
             Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
                 .broadcast_as(Shape::try_from([3].as_slice()).expect("valid shape")),
-            Err(CoreError::BroadcastAsIncompatible {
-                from: vec![2, 3],
-                to: vec![3],
-            }),
+            Err(CoreError::BroadcastAsIncompatible),
             "a broadcast cannot drop an axis"
         );
     }

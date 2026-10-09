@@ -4,6 +4,7 @@ use crate::core::{
     DType,
     Shape,
     Tensor,
+    exact_f32,
 };
 
 pub struct RmsNorm<B: Backend> {
@@ -17,15 +18,8 @@ impl<B: Backend> RmsNorm<B> {
         backend: &mut B,
         weight: Tensor<B>,
         eps: f32,
-    ) -> Result<Self, B::Error> {
-        let dim = weight.shape().element_count();
-        let dim_f32 =
-            u16::try_from(dim)
-                .map(f32::from)
-                .map_err(|_| CoreError::DimensionTooLargeForF32 {
-                    dim,
-                    dim_max: u16::MAX.into(),
-                })?;
+    ) -> Result<Self, CoreError> {
+        let dim_f32 = exact_f32(weight.shape().element_count())?;
         let scalar_shape = Shape::try_from([1].as_slice())?;
         Ok(Self {
             eps: Tensor::upload(backend, &eps.to_le_bytes(), DType::F32, scalar_shape)?,
@@ -43,15 +37,8 @@ impl<B: Backend> RmsNorm<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, B::Error> {
-        let axis = x
-            .shape()
-            .rank()
-            .checked_sub(1)
-            .ok_or(CoreError::AxisOutOfRange {
-                axis: 0,
-                rank: 0,
-            })?;
+    ) -> Result<Tensor<B>, CoreError> {
+        let axis = x.shape().last_axis()?;
         let x_f32 = x.cast(backend, DType::F32)?;
         let scale = x_f32
             .mul(backend, &x_f32)?

@@ -1,14 +1,10 @@
 use foundry::backend::cpu::CpuBackend;
-use foundry::core::DType;
 use foundry::models::llama::{
     LlamaConfig,
     LlamaError,
     LlamaWeights,
 };
-use foundry::weights::{
-    Weights,
-    WeightsError,
-};
+use foundry::weights::Weights;
 use hf_hub::HFClientSync;
 use serde_json::json;
 
@@ -269,16 +265,10 @@ fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
         .expect("the config is valid");
 
     let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
-    assert!(
-        matches!(
-            &result,
-            Err(LlamaError::ShapeMismatch { name, dims, dims_expected })
-                if name == "model.layers.1.self_attn.k_proj.weight"
-                    && dims == &[4, 4]
-                    && dims_expected == &[2, 4]
-        ),
-        "got {:?}",
-        result.err()
+    assert_eq!(
+        result.err(),
+        Some(LlamaError::TensorShapeMismatch),
+        "k_proj of shape [4, 4] where the config expects [2, 4] is rejected"
     );
 }
 
@@ -398,17 +388,10 @@ fn llama_weights_reject_a_non_bf16_tensor() {
         .expect("the config is valid");
 
     let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
-    assert!(
-        matches!(
-            &result,
-            Err(LlamaError::DTypeMismatch {
-                name,
-                dtype: DType::F32,
-                dtype_expected: DType::BF16,
-            }) if name == "model.norm.weight"
-        ),
-        "got {:?}",
-        result.err()
+    assert_eq!(
+        result.err(),
+        Some(LlamaError::TensorDTypeMismatch),
+        "an f32 model.norm.weight is rejected"
     );
 }
 
@@ -522,13 +505,9 @@ fn llama_weights_reject_a_missing_tensor() {
         .expect("the config is valid");
 
     let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
-    assert!(
-        matches!(
-            &result,
-            Err(LlamaError::Weights(WeightsError::TensorNotFound { name }))
-                if name == "model.norm.weight"
-        ),
-        "got {:?}",
-        result.err()
+    assert_eq!(
+        result.err(),
+        Some(LlamaError::TensorNotFound),
+        "a missing model.norm.weight is rejected"
     );
 }

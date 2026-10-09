@@ -6,26 +6,25 @@ use half::{
     bf16,
     f16,
 };
+use tracing::error;
 
 pub use self::error::CpuError;
 use crate::core::primitive::{
     BinaryOp,
+    ConcatSpec,
+    GatherSpec,
+    MatmulSpec,
     ReduceOp,
+    ReduceSpec,
+    SliceUpdateSpec,
     UnaryOp,
-    concat_rule,
-    gather_rule,
-    matmul_rule,
-    reduce_rule,
-    slice_update_rule,
 };
 use crate::core::{
     Backend,
-    CoreError,
-    DType,
+    FloatDType,
     Layout,
     Operand,
     OperandMut,
-    Shape,
 };
 
 pub struct CpuStorage {
@@ -45,16 +44,7 @@ impl Backend for CpuBackend {
     fn upload(
         &mut self,
         bytes: &[u8],
-        dtype: DType,
-        shape: &Shape,
     ) -> Result<CpuStorage, CpuError> {
-        let bytes_expected = byte_len(dtype, shape)?;
-        if bytes.len() != bytes_expected {
-            return Err(CpuError::ByteLengthMismatch {
-                bytes: bytes.len(),
-                bytes_expected,
-            });
-        }
         Ok(CpuStorage {
             bytes: bytes.to_vec(),
         })
@@ -62,11 +52,10 @@ impl Backend for CpuBackend {
 
     fn zeros(
         &mut self,
-        dtype: DType,
-        shape: &Shape,
+        byte_len: usize,
     ) -> Result<CpuStorage, CpuError> {
         Ok(CpuStorage {
-            bytes: vec![0; byte_len(dtype, shape)?],
+            bytes: vec![0; byte_len],
         })
     }
 
@@ -75,34 +64,22 @@ impl Backend for CpuBackend {
         input: Operand<'_, CpuStorage>,
     ) -> Result<Vec<u8>, CpuError> {
         let layout = input.layout();
-        if !layout.is_contiguous() {
-            return Err(CpuError::DownloadNonContiguous);
-        }
+        let size = input.dtype().size_bytes();
         let bytes = &input.storage().bytes;
-        let out_of_storage = || CpuError::IndexOutOfStorage {
-            index: layout.offset(),
-            bytes_len: bytes.len(),
-        };
-        let start = layout
-            .offset()
-            .checked_mul(input.dtype().size_bytes())
-            .ok_or_else(out_of_storage)?;
-        let end = start
-            .checked_add(byte_len(input.dtype(), layout.shape())?)
-            .ok_or_else(out_of_storage)?;
+        let start = layout.offset().saturating_mul(size);
+        let end = start.saturating_add(layout.shape().byte_len(input.dtype()));
         bytes
             .get(start..end)
             .map(<[u8]>::to_vec)
-            .ok_or_else(out_of_storage)
+            .ok_or_else(|| out_of_storage(start, bytes.len()))
     }
 
     fn unary(
         &mut self,
         op: UnaryOp,
-        input: Operand<'_, CpuStorage>,
+        input: Operand<'_, CpuStorage, FloatDType>,
     ) -> Result<CpuStorage, CpuError> {
-        reject_u32("unary", input.dtype())?;
-        let values: Vec<f32> = read_floats(&input, "unary")?
+        let values: Vec<f32> = read_floats(&input)?
             .into_iter()
             .map(|value| match op {
                 UnaryOp::Neg => -value,
@@ -111,20 +88,18 @@ impl Backend for CpuBackend {
                 UnaryOp::Recip => 1.0 / value,
             })
             .collect();
-        encode(input.dtype(), &values, "unary")
+        Ok(encode(input.dtype(), &values))
     }
 
     fn binary(
         &mut self,
         op: BinaryOp,
-        lhs: Operand<'_, CpuStorage>,
-        rhs: Operand<'_, CpuStorage>,
+        lhs: Operand<'_, CpuStorage, FloatDType>,
+        rhs: Operand<'_, CpuStorage, FloatDType>,
     ) -> Result<CpuStorage, CpuError> {
-        reject_u32("binary", lhs.dtype())?;
-        reject_u32("binary", rhs.dtype())?;
-        let values: Vec<f32> = read_floats(&lhs, "binary")?
+        let values: Vec<f32> = read_floats(&lhs)?
             .into_iter()
-            .zip(read_floats(&rhs, "binary")?)
+            .zip(read_floats(&rhs)?)
             .map(|(lhs, rhs)| match op {
                 BinaryOp::Add => lhs + rhs,
                 BinaryOp::Sub => lhs - rhs,
@@ -132,63 +107,42 @@ impl Backend for CpuBackend {
                 BinaryOp::Div => lhs / rhs,
             })
             .collect();
-        encode(lhs.dtype(), &values, "binary")
+        Ok(encode(lhs.dtype(), &values))
     }
 
     fn reduce(
         &mut self,
-        op: ReduceOp,
-        input: Operand<'_, CpuStorage>,
-        axis: usize,
+        input: Operand<'_, CpuStorage, FloatDType>,
+        spec: &ReduceSpec,
     ) -> Result<CpuStorage, CpuError> {
-        let dtype = input.dtype();
-        reject_u32("reduce", dtype)?;
         let layout = input.layout();
-        let (_, shape) = reduce_rule(op, dtype, layout.shape(), axis)?;
-        let axis_out_of_range = || CoreError::AxisOutOfRange {
-            axis,
-            rank: layout.shape().rank(),
-        };
-        let axis_len = layout
-            .shape()
-            .dims()
-            .get(axis)
-            .copied()
-            .ok_or_else(axis_out_of_range)?;
-        let axis_stride = layout
-            .strides()
-            .get(axis)
-            .copied()
-            .ok_or_else(axis_out_of_range)?;
-        let rows = (0..shape.element_count())
+        let rows = (0..spec.output().element_count())
             .map(|row| {
-                let base = strided_index(shape.dims(), layout.strides(), layout.offset(), row)?;
-                (0..axis_len)
+                let base =
+                    strided_index(spec.output().dims(), layout.strides(), layout.offset(), row)?;
+                (0..spec.axis_len())
                     .map(|position| {
-                        let index = offset_by(base, &[(position, axis_stride)]).ok_or(
-                            CpuError::IndexOverflow {
-                                linear: row,
-                            },
-                        )?;
-                        read_float(&input.storage().bytes, dtype, index, "reduce")
+                        let index = offset_by(base, &[(position, spec.axis_stride())])
+                            .ok_or_else(|| index_overflow(row))?;
+                        read_float(&input.storage().bytes, input.dtype(), index)
                     })
                     .collect::<Result<Vec<f32>, CpuError>>()
             })
             .collect::<Result<Vec<Vec<f32>>, CpuError>>()?;
-        match op {
+        match spec.op() {
             ReduceOp::Sum => {
                 let sums: Vec<f32> = rows
                     .iter()
                     .map(|row| row.iter().fold(0.0, |sum, &value| sum + value))
                     .collect();
-                encode(dtype, &sums, "reduce")
+                Ok(encode(input.dtype(), &sums))
             }
             ReduceOp::Max => {
                 let maxima: Vec<f32> = rows
                     .iter()
                     .map(|row| row.iter().copied().fold(f32::NEG_INFINITY, f32::max))
                     .collect();
-                encode(dtype, &maxima, "reduce")
+                Ok(encode(input.dtype(), &maxima))
             }
             ReduceOp::Argmax => {
                 let indices = rows
@@ -204,9 +158,7 @@ impl Backend for CpuBackend {
                                 }
                             },
                         );
-                        u32::try_from(position).map_err(|_| CpuError::IndexOverflow {
-                            linear: position,
-                        })
+                        u32::try_from(position).map_err(|_| index_overflow(position))
                     })
                     .collect::<Result<Vec<u32>, CpuError>>()?;
                 Ok(CpuStorage {
@@ -221,78 +173,61 @@ impl Backend for CpuBackend {
 
     fn matmul(
         &mut self,
-        lhs: Operand<'_, CpuStorage>,
-        rhs: Operand<'_, CpuStorage>,
+        lhs: Operand<'_, CpuStorage, FloatDType>,
+        rhs: Operand<'_, CpuStorage, FloatDType>,
+        spec: &MatmulSpec,
     ) -> Result<CpuStorage, CpuError> {
-        let dtype = lhs.dtype();
-        reject_u32("matmul", dtype)?;
-        let (_, shape) = matmul_rule(
-            dtype,
-            lhs.layout().shape(),
-            rhs.dtype(),
-            rhs.layout().shape(),
-        )?;
-        let incompatible = || CoreError::MatmulIncompatible {
-            lhs: lhs.layout().shape().dims().to_vec(),
-            rhs: rhs.layout().shape().dims().to_vec(),
-        };
-        let (lhs_batch_strides, [lhs_row_stride, lhs_col_stride]) = lhs
-            .layout()
-            .strides()
-            .split_last_chunk::<2>()
-            .ok_or_else(incompatible)?;
-        let (rhs_batch_strides, [rhs_row_stride, rhs_col_stride]) = rhs
-            .layout()
-            .strides()
-            .split_last_chunk::<2>()
-            .ok_or_else(incompatible)?;
-        let (batch_dims, [m, n]) = shape
-            .dims()
-            .split_last_chunk::<2>()
-            .ok_or_else(incompatible)?;
-        let k = lhs
-            .layout()
-            .shape()
-            .dims()
-            .last()
-            .copied()
-            .ok_or_else(incompatible)?;
-        let values = (0..shape.element_count())
+        let (m, k, n) = (spec.m(), spec.k(), spec.n());
+        let (lhs_matrix, rhs_matrix) = (spec.lhs(), spec.rhs());
+        let batch_dims = spec.batch().dims();
+        let values = (0..spec.output().element_count())
             .map(|linear| {
-                let overflow = || CpuError::IndexOverflow {
-                    linear,
-                };
-                let col = linear.checked_rem(*n).ok_or_else(overflow)?;
+                let overflow = || index_overflow(linear);
+                let col = linear.checked_rem(n).ok_or_else(overflow)?;
                 let row = linear
-                    .checked_div(*n)
-                    .and_then(|rows| rows.checked_rem(*m))
+                    .checked_div(n)
+                    .and_then(|rows| rows.checked_rem(m))
                     .ok_or_else(overflow)?;
                 let batch = m
-                    .checked_mul(*n)
+                    .checked_mul(n)
                     .and_then(|matrix| linear.checked_div(matrix))
                     .ok_or_else(overflow)?;
-                let lhs_base =
-                    strided_index(batch_dims, lhs_batch_strides, lhs.layout().offset(), batch)?;
-                let rhs_base =
-                    strided_index(batch_dims, rhs_batch_strides, rhs.layout().offset(), batch)?;
+                let lhs_base = strided_index(
+                    batch_dims,
+                    lhs_matrix.batch_strides(),
+                    lhs_matrix.offset(),
+                    batch,
+                )?;
+                let rhs_base = strided_index(
+                    batch_dims,
+                    rhs_matrix.batch_strides(),
+                    rhs_matrix.offset(),
+                    batch,
+                )?;
                 (0..k).try_fold(0.0_f32, |sum, inner| {
                     let lhs_index = offset_by(
                         lhs_base,
-                        &[(row, *lhs_row_stride), (inner, *lhs_col_stride)],
+                        &[
+                            (row, lhs_matrix.row_stride()),
+                            (inner, lhs_matrix.col_stride()),
+                        ],
                     )
                     .ok_or_else(overflow)?;
                     let rhs_index = offset_by(
                         rhs_base,
-                        &[(inner, *rhs_row_stride), (col, *rhs_col_stride)],
+                        &[
+                            (inner, rhs_matrix.row_stride()),
+                            (col, rhs_matrix.col_stride()),
+                        ],
                     )
                     .ok_or_else(overflow)?;
-                    let lhs_value = read_float(&lhs.storage().bytes, dtype, lhs_index, "matmul")?;
-                    let rhs_value = read_float(&rhs.storage().bytes, dtype, rhs_index, "matmul")?;
+                    let lhs_value = read_float(&lhs.storage().bytes, spec.dtype(), lhs_index)?;
+                    let rhs_value = read_float(&rhs.storage().bytes, spec.dtype(), rhs_index)?;
                     Ok(sum + lhs_value * rhs_value)
                 })
             })
             .collect::<Result<Vec<f32>, CpuError>>()?;
-        encode(dtype, &values, "matmul")
+        Ok(encode(spec.dtype(), &values))
     }
 
     fn copy(
@@ -302,7 +237,7 @@ impl Backend for CpuBackend {
         let layout = input.layout();
         let size = input.dtype().size_bytes();
         let bytes = (0..layout.shape().element_count()).try_fold(
-            Vec::with_capacity(byte_len(input.dtype(), layout.shape())?),
+            Vec::with_capacity(layout.shape().byte_len(input.dtype())),
             |mut bytes, linear| {
                 let index = strided_index(
                     layout.shape().dims(),
@@ -321,46 +256,27 @@ impl Backend for CpuBackend {
 
     fn cast(
         &mut self,
-        input: Operand<'_, CpuStorage>,
-        dtype: DType,
+        input: Operand<'_, CpuStorage, FloatDType>,
+        dtype: FloatDType,
     ) -> Result<CpuStorage, CpuError> {
-        reject_u32("cast", input.dtype())?;
-        reject_u32("cast", dtype)?;
-        encode(dtype, &read_floats(&input, "cast")?, "cast")
+        Ok(encode(dtype, &read_floats(&input)?))
     }
 
     fn gather(
         &mut self,
-        table: Operand<'_, CpuStorage>,
+        table: Operand<'_, CpuStorage, FloatDType>,
         indices: Operand<'_, CpuStorage>,
+        spec: &GatherSpec,
     ) -> Result<CpuStorage, CpuError> {
-        let dtype = table.dtype();
-        reject_u32("gather", dtype)?;
-        let (_, shape) = gather_rule(
-            dtype,
-            table.layout().shape(),
-            indices.dtype(),
-            indices.layout().shape(),
-        )?;
-        let incompatible = || CoreError::GatherIncompatible {
-            table: table.layout().shape().dims().to_vec(),
-            indices: indices.layout().shape().dims().to_vec(),
-        };
-        let ([rows, cols], [row_stride, col_stride]) =
-            (table.layout().shape().dims(), table.layout().strides())
-        else {
-            return Err(incompatible().into());
-        };
-        let size = dtype.size_bytes();
+        let size = spec.dtype().size_bytes();
+        let cols = spec.cols();
         let indices_layout = indices.layout();
-        let bytes = (0..shape.element_count()).try_fold(
-            Vec::with_capacity(byte_len(dtype, &shape)?),
+        let bytes = (0..spec.output().element_count()).try_fold(
+            Vec::with_capacity(spec.output().byte_len(spec.dtype().into())),
             |mut bytes, linear| {
-                let overflow = || CpuError::IndexOverflow {
-                    linear,
-                };
-                let position = linear.checked_div(*cols).ok_or_else(overflow)?;
-                let col = linear.checked_rem(*cols).ok_or_else(overflow)?;
+                let overflow = || index_overflow(linear);
+                let position = linear.checked_div(cols).ok_or_else(overflow)?;
+                let col = linear.checked_rem(cols).ok_or_else(overflow)?;
                 let index_position = strided_index(
                     indices_layout.shape().dims(),
                     indices_layout.strides(),
@@ -369,12 +285,12 @@ impl Backend for CpuBackend {
                 )?;
                 let row = usize::try_from(read_u32(&indices.storage().bytes, index_position)?)
                     .map_err(|_| overflow())?;
-                if row >= *rows {
+                if row >= spec.rows() {
                     bytes.extend(iter::repeat_n(0, size));
                 } else {
                     let index = offset_by(
                         table.layout().offset(),
-                        &[(row, *row_stride), (col, *col_stride)],
+                        &[(row, spec.row_stride()), (col, spec.col_stride())],
                     )
                     .ok_or_else(overflow)?;
                     bytes.extend_from_slice(element_bytes(&table.storage().bytes, size, index)?);
@@ -389,33 +305,14 @@ impl Backend for CpuBackend {
 
     fn concat(
         &mut self,
-        lhs: Operand<'_, CpuStorage>,
-        rhs: Operand<'_, CpuStorage>,
-        axis: usize,
+        lhs: Operand<'_, CpuStorage, FloatDType>,
+        rhs: Operand<'_, CpuStorage, FloatDType>,
+        spec: &ConcatSpec,
     ) -> Result<CpuStorage, CpuError> {
-        let dtype = lhs.dtype();
-        reject_u32("concat", dtype)?;
-        let (_, shape) = concat_rule(
-            dtype,
-            lhs.layout().shape(),
-            rhs.dtype(),
-            rhs.layout().shape(),
-            axis,
-        )?;
-        let lhs_len =
-            lhs.layout()
-                .shape()
-                .dims()
-                .get(axis)
-                .copied()
-                .ok_or(CoreError::AxisOutOfRange {
-                    axis,
-                    rank: lhs.layout().shape().rank(),
-                })?;
-        let layout = Layout::contiguous(shape);
-        let mut bytes = vec![0; byte_len(dtype, &shape)?];
-        write_window(&mut bytes, &layout, axis, 0, &lhs)?;
-        write_window(&mut bytes, &layout, axis, lhs_len, &rhs)?;
+        let layout = Layout::contiguous(*spec.output());
+        let mut bytes = vec![0; spec.output().byte_len(spec.dtype().into())];
+        write_window(&mut bytes, &layout, 0, &lhs)?;
+        write_window(&mut bytes, &layout, spec.rhs_offset(), &rhs)?;
         Ok(CpuStorage {
             bytes,
         })
@@ -423,55 +320,34 @@ impl Backend for CpuBackend {
 
     fn slice_update(
         &mut self,
-        mut target: OperandMut<'_, CpuStorage>,
-        update: Operand<'_, CpuStorage>,
-        axis: usize,
-        start: usize,
+        mut target: OperandMut<'_, CpuStorage, FloatDType>,
+        update: Operand<'_, CpuStorage, FloatDType>,
+        spec: &SliceUpdateSpec,
     ) -> Result<(), CpuError> {
         let layout = target.layout();
-        let dtype = target.dtype();
-        reject_u32("slice_update", dtype)?;
-        slice_update_rule(
-            dtype,
-            layout.shape(),
-            update.dtype(),
-            update.layout().shape(),
-            axis,
-            start,
-        )?;
         write_window(
             &mut target.storage_mut().bytes,
             layout,
-            axis,
-            start,
+            spec.offset(),
             &update,
         )
     }
 }
 
-fn byte_len(
-    dtype: DType,
-    shape: &Shape,
-) -> Result<usize, CpuError> {
-    shape
-        .element_count()
-        .checked_mul(dtype.size_bytes())
-        .ok_or_else(|| CpuError::ByteCountOverflow {
-            dims: shape.dims().to_vec(),
-        })
+fn index_overflow(linear: usize) -> CpuError {
+    error!(message = "Element index overflows usize.", linear);
+    CpuError::IndexOverflow
 }
 
-fn reject_u32(
-    primitive: &'static str,
-    dtype: DType,
-) -> Result<(), CpuError> {
-    match dtype {
-        DType::U32 => Err(CpuError::UnsupportedDType {
-            primitive,
-            dtype,
-        }),
-        DType::F32 | DType::F16 | DType::BF16 => Ok(()),
-    }
+fn out_of_storage(
+    index: usize,
+    bytes_len: usize,
+) -> CpuError {
+    error!(
+        message = "Element is outside its storage.",
+        index, bytes_len
+    );
+    CpuError::IndexOutOfStorage
 }
 
 fn strided_index(
@@ -491,9 +367,7 @@ fn strided_index(
             Some((index, rest.checked_div(dim)?))
         })
         .map(|(index, _)| index)
-        .ok_or(CpuError::IndexOverflow {
-            linear,
-        })
+        .ok_or_else(|| index_overflow(linear))
 }
 
 fn offset_by(
@@ -510,33 +384,25 @@ fn element_bytes(
     size: usize,
     index: usize,
 ) -> Result<&[u8], CpuError> {
-    let out_of_storage = || CpuError::IndexOutOfStorage {
-        index,
-        bytes_len: bytes.len(),
-    };
-    let start = index.checked_mul(size).ok_or_else(out_of_storage)?;
-    let end = start.checked_add(size).ok_or_else(out_of_storage)?;
-    bytes.get(start..end).ok_or_else(out_of_storage)
+    index
+        .checked_mul(size)
+        .and_then(|start| Some((start, start.checked_add(size)?)))
+        .and_then(|(start, end)| bytes.get(start..end))
+        .ok_or_else(|| out_of_storage(index, bytes.len()))
 }
 
 fn read_float(
     bytes: &[u8],
-    dtype: DType,
+    dtype: FloatDType,
     index: usize,
-    primitive: &'static str,
 ) -> Result<f32, CpuError> {
     match (dtype, element_bytes(bytes, dtype.size_bytes(), index)?) {
-        (DType::F32, &[b0, b1, b2, b3]) => Ok(f32::from_le_bytes([b0, b1, b2, b3])),
-        (DType::F16, &[b0, b1]) => Ok(f16::from_le_bytes([b0, b1]).to_f32()),
-        (DType::BF16, &[b0, b1]) => Ok(bf16::from_le_bytes([b0, b1]).to_f32()),
-        (DType::U32, _) => Err(CpuError::UnsupportedDType {
-            primitive,
-            dtype,
-        }),
-        (DType::F32 | DType::F16 | DType::BF16, _) => Err(CpuError::IndexOutOfStorage {
-            index,
-            bytes_len: bytes.len(),
-        }),
+        (FloatDType::F32, &[b0, b1, b2, b3]) => Ok(f32::from_le_bytes([b0, b1, b2, b3])),
+        (FloatDType::F16, &[b0, b1]) => Ok(f16::from_le_bytes([b0, b1]).to_f32()),
+        (FloatDType::BF16, &[b0, b1]) => Ok(bf16::from_le_bytes([b0, b1]).to_f32()),
+        (FloatDType::F32 | FloatDType::F16 | FloatDType::BF16, _) => {
+            Err(out_of_storage(index, bytes.len()))
+        }
     }
 }
 
@@ -544,19 +410,13 @@ fn read_u32(
     bytes: &[u8],
     index: usize,
 ) -> Result<u32, CpuError> {
-    match element_bytes(bytes, DType::U32.size_bytes(), index)? {
+    match element_bytes(bytes, size_of::<u32>(), index)? {
         &[b0, b1, b2, b3] => Ok(u32::from_le_bytes([b0, b1, b2, b3])),
-        _ => Err(CpuError::IndexOutOfStorage {
-            index,
-            bytes_len: bytes.len(),
-        }),
+        _ => Err(out_of_storage(index, bytes.len())),
     }
 }
 
-fn read_floats(
-    input: &Operand<'_, CpuStorage>,
-    primitive: &'static str,
-) -> Result<Vec<f32>, CpuError> {
+fn read_floats(input: &Operand<'_, CpuStorage, FloatDType>) -> Result<Vec<f32>, CpuError> {
     let layout = input.layout();
     (0..layout.shape().element_count())
         .map(|linear| {
@@ -566,63 +426,41 @@ fn read_floats(
                 layout.offset(),
                 linear,
             )?;
-            read_float(&input.storage().bytes, input.dtype(), index, primitive)
+            read_float(&input.storage().bytes, input.dtype(), index)
         })
         .collect()
 }
 
 fn encode(
-    dtype: DType,
+    dtype: FloatDType,
     values: &[f32],
-    primitive: &'static str,
-) -> Result<CpuStorage, CpuError> {
+) -> CpuStorage {
     let bytes = match dtype {
-        DType::F32 => values
+        FloatDType::F32 => values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect(),
-        DType::F16 => values
+        FloatDType::F16 => values
             .iter()
             .flat_map(|&value| f16::from_f32(value).to_le_bytes())
             .collect(),
-        DType::BF16 => values
+        FloatDType::BF16 => values
             .iter()
             .flat_map(|&value| bf16::from_f32(value).to_le_bytes())
             .collect(),
-        DType::U32 => {
-            return Err(CpuError::UnsupportedDType {
-                primitive,
-                dtype,
-            });
-        }
     };
-    Ok(CpuStorage {
+    CpuStorage {
         bytes,
-    })
+    }
 }
 
 fn write_window(
     target: &mut [u8],
     target_layout: &Layout,
-    axis: usize,
-    start: usize,
-    update: &Operand<'_, CpuStorage>,
+    offset: usize,
+    update: &Operand<'_, CpuStorage, FloatDType>,
 ) -> Result<(), CpuError> {
     let size = update.dtype().size_bytes();
-    let axis_stride =
-        target_layout
-            .strides()
-            .get(axis)
-            .copied()
-            .ok_or(CoreError::AxisOutOfRange {
-                axis,
-                rank: target_layout.shape().rank(),
-            })?;
-    let offset = offset_by(target_layout.offset(), &[(start, axis_stride)]).ok_or(
-        CpuError::IndexOverflow {
-            linear: start,
-        },
-    )?;
     let update_layout = update.layout();
     let dims = update_layout.shape().dims();
     (0..update_layout.shape().element_count()).try_for_each(|linear| {
@@ -635,15 +473,11 @@ fn write_window(
         let destination = strided_index(dims, target_layout.strides(), offset, linear)?;
         let value = element_bytes(&update.storage().bytes, size, source)?;
         let bytes_len = target.len();
-        let out_of_storage = || CpuError::IndexOutOfStorage {
-            index: destination,
-            bytes_len,
-        };
-        let begin = destination.checked_mul(size).ok_or_else(out_of_storage)?;
-        let end = begin.checked_add(size).ok_or_else(out_of_storage)?;
-        target
-            .get_mut(begin..end)
-            .ok_or_else(out_of_storage)?
+        destination
+            .checked_mul(size)
+            .and_then(|begin| Some((begin, begin.checked_add(size)?)))
+            .and_then(|(begin, end)| target.get_mut(begin..end))
+            .ok_or_else(|| out_of_storage(destination, bytes_len))?
             .copy_from_slice(value);
         Ok(())
     })
@@ -651,11 +485,9 @@ fn write_window(
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::cpu::{
-        CpuBackend,
-        CpuError,
-    };
+    use crate::backend::cpu::CpuBackend;
     use crate::core::{
+        CoreError,
         DType,
         Shape,
         Tensor,
@@ -711,10 +543,7 @@ mod tests {
                     DType::F32,
                     Shape::try_from([2].as_slice()).expect("the shape is valid"),
                 ),
-                Err(CpuError::ByteLengthMismatch {
-                    bytes: 6,
-                    bytes_expected: 8,
-                })
+                Err(CoreError::ByteLengthMismatch)
             ),
             "six bytes for two f32 are rejected"
         );
@@ -734,7 +563,7 @@ mod tests {
         assert!(
             matches!(
                 tensor.download(&mut backend),
-                Err(CpuError::DownloadNonContiguous)
+                Err(CoreError::DownloadNonContiguous)
             ),
             "a permuted view is not downloaded"
         );
@@ -1035,10 +864,7 @@ mod tests {
         assert!(
             matches!(
                 tensor.add(&mut backend, &tensor),
-                Err(CpuError::UnsupportedDType {
-                    primitive: "binary",
-                    dtype: DType::U32,
-                })
+                Err(CoreError::DTypeNotFloat)
             ),
             "add rejects u32"
         );
@@ -1350,10 +1176,7 @@ mod tests {
         assert!(
             matches!(
                 tensor.concat(&mut backend, &tensor, 0),
-                Err(CpuError::UnsupportedDType {
-                    primitive: "concat",
-                    dtype: DType::U32,
-                })
+                Err(CoreError::DTypeNotFloat)
             ),
             "concat rejects u32"
         );

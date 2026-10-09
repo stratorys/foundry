@@ -1,9 +1,6 @@
 use std::num::NonZeroUsize;
 
-use foundry::backend::cpu::{
-    CpuBackend,
-    CpuError,
-};
+use foundry::backend::cpu::CpuBackend;
 use foundry::core::{
     CoreError,
     DType,
@@ -170,10 +167,7 @@ fn rms_norm_rejects_a_dimension_beyond_u16() {
     assert!(
         matches!(
             RmsNorm::new(&mut backend, weight, 1e-5),
-            Err(CpuError::Core(CoreError::DimensionTooLargeForF32 {
-                dim: 65_536,
-                dim_max: 65_535,
-            }))
+            Err(CoreError::DimensionTooLargeForF32)
         ),
         "a dimension above u16::MAX is rejected"
     );
@@ -345,7 +339,7 @@ fn kv_cache_update_beyond_capacity_is_rejected() {
     assert!(
         matches!(
             cache.update(&mut backend, &key, &value, 0),
-            Err(CpuError::Core(CoreError::SliceUpdateOutOfBounds { .. }))
+            Err(CoreError::SliceUpdateOutOfBounds)
         ),
         "writing three positions to a cache of two is rejected"
     );
@@ -366,7 +360,7 @@ fn kv_cache_update_rejects_keys_and_values_of_different_shapes() {
     assert!(
         matches!(
             cache.update(&mut backend, &key, &value, 0),
-            Err(CpuError::Core(CoreError::KvIncompatible { .. }))
+            Err(CoreError::KvIncompatible)
         ),
         "keys of two positions with values of one position are rejected"
     );
@@ -603,10 +597,7 @@ fn attention_rejects_a_head_dim_other_than_its_own() {
     assert!(
         matches!(
             attention.forward(&mut backend, &query, &cache, 2, &mask),
-            Err(CpuError::Core(CoreError::AttentionHeadDimMismatch {
-                head_dim: 2,
-                head_dim_expected: 4,
-            }))
+            Err(CoreError::AttentionHeadDimMismatch)
         ),
         "a head dim of 2 is rejected by an attention built for 4"
     );

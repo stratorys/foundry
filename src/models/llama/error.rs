@@ -1,112 +1,68 @@
-use std::convert::Infallible;
-use std::io;
-use std::path::PathBuf;
+use tracing::error;
 
-use crate::core::DType;
-use crate::weights::WeightsError;
+use crate::core::CoreError;
 
-#[derive(Debug, thiserror::Error)]
-pub enum LlamaError<E = Infallible> {
-    #[error("I/O on {path:?} failed.")]
-    Io {
-        path: PathBuf,
-        #[source]
-        error: io::Error,
-    },
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LlamaError {
+    #[error("Reading the config file failed.")]
+    ConfigRead,
 
-    #[error("Config file {path:?} of {bytes} bytes exceeds the maximum of {bytes_max} bytes.")]
-    ConfigTooLarge {
-        path: PathBuf,
-        bytes: u64,
-        bytes_max: u64,
-    },
+    #[error("Config file exceeds the maximum size.")]
+    ConfigTooLarge,
 
     #[error("Config is not valid JSON or misses a field.")]
-    Json(#[source] serde_json::Error),
+    ConfigJson,
 
-    #[error("Model type {model_type:?} is not \"llama\".")]
-    ModelType { model_type: String },
+    #[error("Model type is not llama.")]
+    ModelType,
 
-    #[error(
-        "Hidden size {hidden_size} does not equal {num_attention_heads} attention heads times \
-         head dim {head_dim}."
-    )]
-    HiddenSizeMismatch {
-        hidden_size: usize,
-        num_attention_heads: usize,
-        head_dim: usize,
-    },
+    #[error("Hidden size does not equal attention heads times head dim.")]
+    HiddenSizeMismatch,
 
-    #[error(
-        "{num_attention_heads} attention heads are not a multiple of {num_key_value_heads} \
-         key-value heads."
-    )]
-    HeadRatio {
-        num_attention_heads: usize,
-        num_key_value_heads: usize,
-    },
+    #[error("Attention heads are not a multiple of key-value heads.")]
+    HeadRatio,
 
-    #[error("RoPE type {rope_type:?} is not \"llama3\".")]
-    RopeType { rope_type: String },
+    #[error("RoPE type is not llama3.")]
+    RopeType,
 
     #[error("Word embeddings are not tied.")]
     UntiedEmbeddings,
 
-    #[error(transparent)]
-    Weights(#[from] WeightsError),
+    #[error("Tensor is not in the weights.")]
+    TensorNotFound,
 
-    #[error(transparent)]
-    Backend(E),
+    #[error("Tensor shape does not match the config.")]
+    TensorShapeMismatch,
 
-    #[error("Tensor {name} has shape {dims:?}; the config expects {dims_expected:?}.")]
-    ShapeMismatch {
-        name: String,
-        dims: Vec<usize>,
-        dims_expected: Vec<usize>,
-    },
+    #[error("Tensor dtype is not the model dtype.")]
+    TensorDTypeMismatch,
 
-    #[error("Tensor {name} has dtype {dtype:?}; {dtype_expected:?} is expected.")]
-    DTypeMismatch {
-        name: String,
-        dtype: DType,
-        dtype_expected: DType,
-    },
-
-    #[error("{kv_heads} key-value heads times head dim {head_dim} overflows usize.")]
-    DimensionOverflow { kv_heads: usize, head_dim: usize },
+    #[error("Key-value width overflows usize.")]
+    KvDimOverflow,
 
     #[error("Uploaded byte count overflows usize.")]
-    ByteCountOverflow,
+    UploadedBytesOverflow,
 
-    #[error("Maximum sequence length {seq_len_max} exceeds the allowed {seq_len_max_allowed}.")]
-    SeqLenMaxTooLarge {
-        seq_len_max: usize,
-        seq_len_max_allowed: usize,
-    },
+    #[error("Maximum sequence length exceeds the allowed length.")]
+    SeqLenMaxTooLarge,
 
-    #[error("Head dim {head_dim} is not a positive even number, as rotate-half RoPE requires.")]
-    HeadDimInvalid { head_dim: usize },
-
-    #[error("{name} {dim} exceeds {dim_max}, the largest value converted exactly to f32.")]
-    DimensionTooLargeForF32 {
-        name: &'static str,
-        dim: usize,
-        dim_max: usize,
-    },
+    #[error("Head dim is not a positive even number.")]
+    HeadDimInvalid,
 
     #[error("Forward input holds no token.")]
     EmptyInput,
 
-    #[error(
-        "{seq_len} tokens at position {position} exceed the cache length of {seq_len_max} \
-         positions."
-    )]
-    CacheOverflow {
-        position: usize,
-        seq_len: usize,
-        seq_len_max: usize,
-    },
+    #[error("Tokens exceed the cache length.")]
+    CacheOverflow,
 
-    #[error("{caches} layer caches were given for {layers} layers.")]
-    CacheLayerCount { caches: usize, layers: usize },
+    #[error("Layer cache count does not match the layer count.")]
+    CacheLayerCount,
+
+    #[error("Tensor operation failed.")]
+    Tensor,
+}
+
+pub fn tensor_failed(error: CoreError) -> LlamaError {
+    error!(message = "Tensor operation failed.", %error);
+    LlamaError::Tensor
 }

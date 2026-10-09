@@ -1,11 +1,14 @@
 use std::num::NonZeroUsize;
 
+use tracing::error;
+
 use crate::core::{
     Backend,
     CoreError,
     DType,
     Shape,
     Tensor,
+    exact_f32,
 };
 use crate::nn::{
     KvCache,
@@ -33,13 +36,8 @@ impl<B: Backend> Attention<B> {
     pub fn new(
         backend: &mut B,
         head_dim: NonZeroUsize,
-    ) -> Result<Self, B::Error> {
-        let head_dim_f32 = u16::try_from(head_dim.get()).map(f32::from).map_err(|_| {
-            CoreError::DimensionTooLargeForF32 {
-                dim: head_dim.get(),
-                dim_max: u16::MAX.into(),
-            }
-        })?;
+    ) -> Result<Self, CoreError> {
+        let head_dim_f32 = exact_f32(head_dim.get())?;
         Ok(Self {
             head_dim,
             scale: Tensor::upload(
@@ -58,7 +56,7 @@ impl<B: Backend> Attention<B> {
         cache: &KvCache<B>,
         seq_len_total: usize,
         mask: &Tensor<B>,
-    ) -> Result<Tensor<B>, B::Error> {
+    ) -> Result<Tensor<B>, CoreError> {
         let keys = &cache.keys().narrow(SEQ_AXIS, 0, seq_len_total)?;
         let values = &cache.values().narrow(SEQ_AXIS, 0, seq_len_total)?;
         let AttentionDims {
@@ -92,7 +90,6 @@ impl<B: Backend> Attention<B> {
             .reshape(Shape::try_from(
                 [seq_len, heads.saturating_mul(head_dim)].as_slice(),
             )?)
-            .map_err(Into::into)
     }
 }
 
@@ -102,10 +99,14 @@ fn attention_dims(
     keys: &Shape,
     values: &Shape,
 ) -> Result<AttentionDims, CoreError> {
-    let incompatible = || CoreError::AttentionIncompatible {
-        query: query.dims().to_vec(),
-        key: keys.dims().to_vec(),
-        value: values.dims().to_vec(),
+    let incompatible = || {
+        error!(
+            message = "Query, keys and values are incompatible for attention.",
+            query = ?query.dims(),
+            keys = ?keys.dims(),
+            values = ?values.dims(),
+        );
+        CoreError::AttentionIncompatible
     };
     let (&[heads, seq_len, head_dim], &[kv_heads, seq_len_total, key_head_dim]) =
         (query.dims(), keys.dims())
@@ -119,10 +120,12 @@ fn attention_dims(
         return Err(incompatible());
     }
     if head_dim != head_dim_expected.get() {
-        return Err(CoreError::AttentionHeadDimMismatch {
+        error!(
+            message = "Attention head dim does not match.",
             head_dim,
-            head_dim_expected: head_dim_expected.get(),
-        });
+            head_dim_expected = head_dim_expected.get(),
+        );
+        return Err(CoreError::AttentionHeadDimMismatch);
     }
     Ok(AttentionDims {
         heads,
@@ -179,11 +182,7 @@ mod tests {
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
             ),
-            Err(CoreError::AttentionIncompatible {
-                query: vec![4, 2],
-                key: vec![2, 2, 2],
-                value: vec![2, 2, 2],
-            }),
+            Err(CoreError::AttentionIncompatible),
             "a rank 2 query"
         );
         assert_eq!(
@@ -193,11 +192,7 @@ mod tests {
                 &Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
             ),
-            Err(CoreError::AttentionIncompatible {
-                query: vec![4, 2, 2],
-                key: vec![2, 2],
-                value: vec![2, 2],
-            }),
+            Err(CoreError::AttentionIncompatible),
             "rank 2 keys"
         );
     }
@@ -211,11 +206,7 @@ mod tests {
                 &Shape::try_from([0, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([0, 2, 2].as_slice()).expect("the shape is valid"),
             ),
-            Err(CoreError::AttentionIncompatible {
-                query: vec![4, 2, 2],
-                key: vec![0, 2, 2],
-                value: vec![0, 2, 2],
-            }),
+            Err(CoreError::AttentionIncompatible),
             "zero key-value heads"
         );
     }
@@ -229,11 +220,7 @@ mod tests {
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
             ),
-            Err(CoreError::AttentionIncompatible {
-                query: vec![3, 2, 2],
-                key: vec![2, 2, 2],
-                value: vec![2, 2, 2],
-            }),
+            Err(CoreError::AttentionIncompatible),
             "three query heads over two key-value heads"
         );
     }
@@ -247,11 +234,7 @@ mod tests {
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
             ),
-            Err(CoreError::AttentionIncompatible {
-                query: vec![4, 3, 2],
-                key: vec![2, 2, 2],
-                value: vec![2, 2, 2],
-            }),
+            Err(CoreError::AttentionIncompatible),
             "three query positions over two key positions"
         );
     }
@@ -265,11 +248,7 @@ mod tests {
                 &Shape::try_from([2, 2, 4].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 2, 4].as_slice()).expect("the shape is valid"),
             ),
-            Err(CoreError::AttentionIncompatible {
-                query: vec![4, 2, 2],
-                key: vec![2, 2, 4],
-                value: vec![2, 2, 4],
-            }),
+            Err(CoreError::AttentionIncompatible),
             "head dims 2 and 4 differ"
         );
     }
@@ -283,11 +262,7 @@ mod tests {
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 3, 2].as_slice()).expect("the shape is valid"),
             ),
-            Err(CoreError::AttentionIncompatible {
-                query: vec![4, 2, 2],
-                key: vec![2, 2, 2],
-                value: vec![2, 3, 2],
-            }),
+            Err(CoreError::AttentionIncompatible),
             "values hold one more position than keys"
         );
     }

@@ -11,7 +11,7 @@ pub struct Silu<B: Backend> {
 }
 
 impl<B: Backend> Silu<B> {
-    pub fn new(backend: &mut B) -> Result<Self, B::Error> {
+    pub fn new(backend: &mut B) -> Result<Self, CoreError> {
         Ok(Self {
             one: Tensor::upload(
                 backend,
@@ -26,7 +26,7 @@ impl<B: Backend> Silu<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, B::Error> {
+    ) -> Result<Tensor<B>, CoreError> {
         let x_f32 = x.cast(backend, DType::F32)?;
         let denominator = x_f32.neg(backend)?.exp(backend)?.add(backend, &self.one)?;
         x_f32.div(backend, &denominator)?.cast(backend, x.dtype())
@@ -36,15 +36,8 @@ impl<B: Backend> Silu<B> {
 pub fn softmax_last_axis<B: Backend>(
     backend: &mut B,
     x: &Tensor<B>,
-) -> Result<Tensor<B>, B::Error> {
-    let axis = x
-        .shape()
-        .rank()
-        .checked_sub(1)
-        .ok_or(CoreError::AxisOutOfRange {
-            axis: 0,
-            rank: 0,
-        })?;
+) -> Result<Tensor<B>, CoreError> {
+    let axis = x.shape().last_axis()?;
     let x_f32 = x.cast(backend, DType::F32)?;
     let row_max = x_f32.max(backend, axis)?;
     let exps = x_f32.sub(backend, &row_max)?.exp(backend)?;

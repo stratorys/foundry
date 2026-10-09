@@ -11,6 +11,7 @@ use objc2_metal::{
     MTLCommandQueue,
     MTLComputeCommandEncoder,
 };
+use tracing::error;
 
 use crate::backend::metal::{
     Buffer,
@@ -29,7 +30,7 @@ pub struct CommandStream {
     queue: Queue,
     open: Option<OpenBuffer>,
     in_flight: VecDeque<CommandBuffer>,
-    failure: Option<String>,
+    failed: bool,
 }
 
 struct OpenBuffer {
@@ -44,7 +45,7 @@ impl CommandStream {
             queue,
             open: None,
             in_flight: VecDeque::with_capacity(IN_FLIGHT_MAX.saturating_add(1)),
-            failure: None,
+            failed: false,
         }
     }
 
@@ -90,11 +91,11 @@ impl CommandStream {
     }
 
     fn check_failure(&self) -> Result<(), MetalError> {
-        self.failure.as_ref().map_or(Ok(()), |message| {
-            Err(MetalError::CommandBufferFailed {
-                message: message.clone(),
-            })
-        })
+        if self.failed {
+            Err(MetalError::CommandBufferFailed)
+        } else {
+            Ok(())
+        }
     }
 
     fn open_buffer(&mut self) -> Result<&mut OpenBuffer, MetalError> {
@@ -150,14 +151,16 @@ impl CommandStream {
         match command_buffer.status() {
             MTLCommandBufferStatus::Completed => Ok(()),
             status => {
-                let message = command_buffer.error().map_or_else(
-                    || format!("status {status:?}"),
-                    |error| error.localizedDescription().to_string(),
+                let description = command_buffer
+                    .error()
+                    .map(|error| error.localizedDescription().to_string());
+                error!(
+                    message = "Metal command buffer failed.",
+                    ?status,
+                    error = ?description,
                 );
-                self.failure = Some(message.clone());
-                Err(MetalError::CommandBufferFailed {
-                    message,
-                })
+                self.failed = true;
+                Err(MetalError::CommandBufferFailed)
             }
         }
     }

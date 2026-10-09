@@ -1,3 +1,5 @@
+use tracing::error;
+
 use crate::core::{
     Backend,
     CoreError,
@@ -20,7 +22,7 @@ impl<B: Backend> KvCache<B> {
         kv_heads: usize,
         seq_len_max: usize,
         head_dim: usize,
-    ) -> Result<Self, B::Error> {
+    ) -> Result<Self, CoreError> {
         let shape = Shape::try_from([kv_heads, seq_len_max, head_dim].as_slice())?;
         Ok(Self {
             keys: Tensor::zeros(backend, dtype, shape)?,
@@ -34,20 +36,22 @@ impl<B: Backend> KvCache<B> {
         keys: &Tensor<B>,
         values: &Tensor<B>,
         position: usize,
-    ) -> Result<(), B::Error> {
+    ) -> Result<(), CoreError> {
         if keys.shape() != values.shape() {
-            return Err(CoreError::KvIncompatible {
-                keys: keys.shape().dims().to_vec(),
-                values: values.shape().dims().to_vec(),
-            }
-            .into());
+            error!(
+                message = "Keys and values do not have the same shape.",
+                keys = ?keys.shape().dims(),
+                values = ?values.shape().dims(),
+            );
+            return Err(CoreError::KvIncompatible);
         }
         if keys.dtype() != values.dtype() {
-            return Err(CoreError::DTypeMismatch {
-                lhs: keys.dtype(),
-                rhs: values.dtype(),
-            }
-            .into());
+            error!(
+                message = "DTypes do not match.",
+                keys = ?keys.dtype(),
+                values = ?values.dtype(),
+            );
+            return Err(CoreError::DTypeMismatch);
         }
         self.keys.slice_update(backend, keys, SEQ_AXIS, position)?;
         self.values

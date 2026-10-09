@@ -1,9 +1,4 @@
-use crate::core::{
-    CoreError,
-    DType,
-};
-
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MetalError {
     #[error("No default Metal device is available.")]
     DeviceUnavailable,
@@ -11,20 +6,14 @@ pub enum MetalError {
     #[error("Metal command queue creation failed.")]
     QueueCreation,
 
-    #[error("Metal library compilation failed: {message}")]
-    LibraryCompilation { message: String },
+    #[error("Metal library compilation failed.")]
+    LibraryCompilation,
 
-    #[error("Buffer of {bytes} bytes exceeds the maximum buffer length {bytes_max}.")]
-    BufferTooLarge { bytes: usize, bytes_max: usize },
+    #[error("Buffer exceeds the maximum Metal buffer length.")]
+    BufferTooLarge,
 
-    #[error("Metal buffer allocation of {bytes} bytes failed.")]
-    BufferAllocation { bytes: usize },
-
-    #[error("Byte count of shape {dims:?} overflows usize.")]
-    ByteCountOverflow { dims: Vec<usize> },
-
-    #[error("Byte length {bytes} does not match the expected byte length {bytes_expected}.")]
-    ByteLengthMismatch { bytes: usize, bytes_expected: usize },
+    #[error("Metal buffer allocation failed.")]
+    BufferAllocation,
 
     #[error("Metal command buffer creation failed.")]
     CommandBufferCreation,
@@ -35,49 +24,24 @@ pub enum MetalError {
     #[error("Metal compute command encoder creation failed.")]
     ComputeEncoderCreation,
 
-    #[error("Kernel {name} is not in the Metal library.")]
-    KernelNotFound { name: &'static str },
+    #[error("Kernel is not in the Metal library.")]
+    KernelNotFound,
 
-    #[error("Metal pipeline creation for kernel {name} failed: {message}")]
-    PipelineCreation { name: &'static str, message: String },
+    #[error("Metal pipeline creation failed.")]
+    PipelineCreation,
 
-    #[error("Value {value} does not fit in a 32-bit kernel index.")]
-    IndexTooLarge { value: usize },
+    #[error("Value does not fit in a 32-bit kernel index.")]
+    KernelIndexTooLarge,
 
-    #[error("Primitive {primitive} does not support dtype {dtype:?} on Metal.")]
-    UnsupportedDType {
-        primitive: &'static str,
-        dtype: DType,
-    },
+    #[error("Kernel allows too few threads per threadgroup.")]
+    ThreadgroupTooSmall,
 
-    #[error(
-        "Kernel {name} allows {threads} threads per threadgroup; {threads_required} are required."
-    )]
-    ThreadgroupTooSmall {
-        name: &'static str,
-        threads: usize,
-        threads_required: usize,
-    },
-
-    #[error("Metal command buffer failed: {message}")]
-    CommandBufferFailed { message: String },
+    #[error("Metal command buffer failed.")]
+    CommandBufferFailed,
 
     #[error("Storage was produced by another Metal backend instance.")]
     ForeignStorage,
 
-    #[error("Download requires a contiguous layout.")]
-    DownloadNonContiguous,
-
-    #[error(
-        "Download of {bytes} bytes from byte offset {bytes_offset} exceeds buffer length \
-         {bytes_len}."
-    )]
-    DownloadOutOfBounds {
-        bytes: usize,
-        bytes_offset: usize,
-        bytes_len: usize,
-    },
-
-    #[error(transparent)]
-    Core(#[from] CoreError),
+    #[error("Download exceeds the buffer length.")]
+    DownloadOutOfBounds,
 }

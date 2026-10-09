@@ -1,5 +1,6 @@
 use crate::core::{
     Backend,
+    CoreError,
     Tensor,
 };
 
@@ -18,7 +19,7 @@ impl<B: Backend> Linear<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, B::Error> {
+    ) -> Result<Tensor<B>, CoreError> {
         x.matmul(backend, &self.weight.permute(&[1, 0])?)
     }
 }
@@ -38,7 +39,7 @@ impl<B: Backend> Embedding<B> {
         &self,
         backend: &mut B,
         token_ids: &Tensor<B>,
-    ) -> Result<Tensor<B>, B::Error> {
+    ) -> Result<Tensor<B>, CoreError> {
         self.table.gather(backend, token_ids)
     }
 }

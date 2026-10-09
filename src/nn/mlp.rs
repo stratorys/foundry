@@ -1,5 +1,6 @@
 use crate::core::{
     Backend,
+    CoreError,
     Tensor,
 };
 use crate::nn::{
@@ -20,7 +21,7 @@ impl<B: Backend> SwigluMlp<B> {
         gate: Linear<B>,
         up: Linear<B>,
         down: Linear<B>,
-    ) -> Result<Self, B::Error> {
+    ) -> Result<Self, CoreError> {
         Ok(Self {
             gate,
             up,
@@ -33,7 +34,7 @@ impl<B: Backend> SwigluMlp<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, B::Error> {
+    ) -> Result<Tensor<B>, CoreError> {
         let gate = self.gate.forward(backend, x)?;
         let up = self.up.forward(backend, x)?;
         let hidden = self.silu.forward(backend, &gate)?.mul(backend, &up)?;

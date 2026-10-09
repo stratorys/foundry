@@ -7,7 +7,12 @@ mod shape;
 mod tensor;
 
 pub use self::backend::Backend;
-pub use self::dtype::DType;
+pub use self::dtype::{
+    DTYPE_SIZE_BYTES_MAX,
+    DType,
+    FloatDType,
+    exact_f32,
+};
 pub use self::error::CoreError;
 pub use self::layout::Layout;
 pub use self::shape::{

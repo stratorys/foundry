@@ -1,12 +1,17 @@
 use std::f32::consts::TAU;
 use std::iter;
 
+use tracing::error;
+
 use crate::core::{
     Backend,
+    CoreError,
     DType,
     Shape,
     Tensor,
+    exact_f32,
 };
+use crate::models::llama::error::tensor_failed;
 use crate::models::llama::{
     Llama3RopeScaling,
     LlamaConfig,
@@ -33,13 +38,14 @@ impl<B: Backend> Llama3Rope<B> {
         backend: &mut B,
         config: &LlamaConfig,
         seq_len_max: usize,
-    ) -> Result<Self, LlamaError<B::Error>> {
+    ) -> Result<Self, LlamaError> {
         let seq_len_max_allowed = config.max_position_embeddings().min(POSITION_COUNT_MAX);
         if seq_len_max > seq_len_max_allowed {
-            return Err(LlamaError::SeqLenMaxTooLarge {
-                seq_len_max,
-                seq_len_max_allowed,
-            });
+            error!(
+                message = "Maximum sequence length exceeds the allowed length.",
+                seq_len_max, seq_len_max_allowed,
+            );
+            return Err(LlamaError::SeqLenMaxTooLarge);
         }
         let head_dim = config.head_dim();
         let inv_frequencies =
@@ -67,8 +73,8 @@ impl<B: Backend> Llama3Rope<B> {
             .cast(backend, DType::BF16)
         });
         Ok(Self {
-            cos: cos.map_err(LlamaError::Backend)?,
-            sin: sin.map_err(LlamaError::Backend)?,
+            cos: cos.map_err(tensor_failed)?,
+            sin: sin.map_err(tensor_failed)?,
             head_dim,
         })
     }
@@ -77,12 +83,11 @@ impl<B: Backend> Llama3Rope<B> {
         &self,
         backend: &mut B,
         positions: &Tensor<B>,
-    ) -> Result<RopeAngles<B>, B::Error> {
+    ) -> Result<RopeAngles<B>, CoreError> {
         let shape =
             Shape::try_from([positions.shape().element_count(), 1, self.head_dim].as_slice())?;
-        let [cos, sin] = [&self.cos, &self.sin].map(|table| {
-            Ok::<Tensor<B>, B::Error>(table.gather(backend, positions)?.reshape(shape)?)
-        });
+        let [cos, sin] =
+            [&self.cos, &self.sin].map(|table| table.gather(backend, positions)?.reshape(shape));
         Ok(RopeAngles {
             cos: cos?,
             sin: sin?,
@@ -96,7 +101,7 @@ impl<B: Backend> RopeAngles<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, B::Error> {
+    ) -> Result<Tensor<B>, CoreError> {
         let rotated = x
             .narrow(DIM_AXIS, self.half_dim, self.half_dim)?
             .neg(backend)?
@@ -106,38 +111,27 @@ impl<B: Backend> RopeAngles<B> {
     }
 }
 
-fn inv_frequencies<E>(
+fn inv_frequencies(
     head_dim: usize,
     theta: f32,
     scaling: &Llama3RopeScaling,
-) -> Result<Vec<f32>, LlamaError<E>> {
+) -> Result<Vec<f32>, LlamaError> {
     if head_dim == 0 || !head_dim.is_multiple_of(2) {
-        return Err(LlamaError::HeadDimInvalid {
-            head_dim,
-        });
+        error!(
+            message = "Head dim is not a positive even number.",
+            head_dim
+        );
+        return Err(LlamaError::HeadDimInvalid);
     }
-    let head_dim_u16 =
-        u16::try_from(head_dim).map_err(|_| LlamaError::DimensionTooLargeForF32 {
-            name: "head dim",
-            dim: head_dim,
-            dim_max: u16::MAX.into(),
-        })?;
-    let context_len_u16 =
-        u16::try_from(scaling.original_max_position_embeddings).map_err(|_| {
-            LlamaError::DimensionTooLargeForF32 {
-                name: "original max position embeddings",
-                dim: scaling.original_max_position_embeddings,
-                dim_max: u16::MAX.into(),
-            }
-        })?;
-    let head_dim_f32 = f32::from(head_dim_u16);
-    let context_len = f32::from(context_len_u16);
+    let head_dim_f32 = exact_f32(head_dim).map_err(tensor_failed)?;
+    let context_len = exact_f32(scaling.original_max_position_embeddings).map_err(tensor_failed)?;
     let wavelen_low = context_len / scaling.low_freq_factor;
     let wavelen_high = context_len / scaling.high_freq_factor;
-    Ok((0..head_dim_u16)
+    (0..head_dim)
         .step_by(2)
         .map(|dim_index| {
-            let inv_frequency = theta.powf(f32::from(dim_index) / head_dim_f32).recip();
+            let dim_index_f32 = exact_f32(dim_index).map_err(tensor_failed)?;
+            let inv_frequency = theta.powf(dim_index_f32 / head_dim_f32).recip();
             let wavelen = TAU / inv_frequency;
             let inv_frequency_scaled = if wavelen > wavelen_low {
                 inv_frequency / scaling.factor
@@ -147,19 +141,18 @@ fn inv_frequencies<E>(
             let smooth = (context_len / wavelen - scaling.low_freq_factor)
                 / (scaling.high_freq_factor - scaling.low_freq_factor);
             let is_medium = wavelen >= wavelen_high && wavelen <= wavelen_low;
-            if is_medium {
+            Ok(if is_medium {
                 (1.0 - smooth) * inv_frequency_scaled / scaling.factor
                     + smooth * inv_frequency_scaled
             } else {
                 inv_frequency_scaled
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::f64::consts::TAU;
 
     use crate::models::llama::rope::inv_frequencies;
@@ -177,7 +170,7 @@ mod tests {
             original_max_position_embeddings: 8192,
         };
         let inv_frequencies =
-            inv_frequencies::<Infallible>(128, 500_000.0, &scaling).expect("the head dim is valid");
+            inv_frequencies(128, 500_000.0, &scaling).expect("the head dim is valid");
         assert_eq!(inv_frequencies.len(), 64, "one frequency per rotated pair");
         [0_u8, 32, 63].iter().for_each(|&dim_index| {
             let period = 500_000.0_f64.powf(f64::from(dim_index) * 2.0 / 128.0);
@@ -214,15 +207,11 @@ mod tests {
             high_freq_factor: 4.0,
             original_max_position_embeddings: 8192,
         };
-        let result = inv_frequencies::<Infallible>(3, 500_000.0, &scaling);
-        assert!(
-            matches!(
-                result,
-                Err(LlamaError::HeadDimInvalid {
-                    head_dim: 3
-                })
-            ),
-            "got {result:?}"
+        let result = inv_frequencies(3, 500_000.0, &scaling);
+        assert_eq!(
+            result,
+            Err(LlamaError::HeadDimInvalid),
+            "an odd head dim is rejected"
         );
     }
 }

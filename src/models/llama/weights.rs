@@ -1,8 +1,11 @@
+use tracing::error;
+
 use crate::core::{
     Backend,
     DType,
     Tensor,
 };
+use crate::models::llama::error::tensor_failed;
 use crate::models::llama::{
     LlamaConfig,
     LlamaError,
@@ -46,15 +49,16 @@ impl<B: Backend> LlamaWeights<B> {
         backend: &mut B,
         config: &LlamaConfig,
         weights: &Weights<S>,
-    ) -> Result<Self, LlamaError<B::Error>> {
+    ) -> Result<Self, LlamaError> {
         let kv_heads = config.num_key_value_heads();
         let head_dim = config.head_dim();
-        let kv_dim = kv_heads
-            .checked_mul(head_dim)
-            .ok_or(LlamaError::DimensionOverflow {
-                kv_heads,
-                head_dim,
-            })?;
+        let kv_dim = kv_heads.checked_mul(head_dim).ok_or_else(|| {
+            error!(
+                message = "Key-value width overflows usize.",
+                kv_heads, head_dim,
+            );
+            LlamaError::KvDimOverflow
+        })?;
         let mut loader = Loader {
             backend,
             weights,
@@ -66,7 +70,7 @@ impl<B: Backend> LlamaWeights<B> {
         )?;
         let layers = (0..config.num_hidden_layers())
             .map(|index| loader.layer(config, index, kv_dim))
-            .collect::<Result<Vec<LlamaLayerWeights<B>>, LlamaError<B::Error>>>()?;
+            .collect::<Result<Vec<LlamaLayerWeights<B>>, LlamaError>>()?;
         let norm = loader.rms_norm("model.norm.weight", config)?;
         Ok(Self {
             embedding: Embedding::new(embed_tokens.clone()),
@@ -110,7 +114,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         config: &LlamaConfig,
         index: usize,
         kv_dim: usize,
-    ) -> Result<LlamaLayerWeights<B>, LlamaError<B::Error>> {
+    ) -> Result<LlamaLayerWeights<B>, LlamaError> {
         let hidden = config.hidden_size();
         let intermediate = config.intermediate_size();
         let prefix = format!("model.layers.{index}");
@@ -145,7 +149,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
             &format!("{prefix}.mlp.down_proj.weight"),
             [hidden, intermediate],
         )?;
-        let mlp = SwigluMlp::new(self.backend, gate, up, down).map_err(LlamaError::Backend)?;
+        let mlp = SwigluMlp::new(self.backend, gate, up, down).map_err(tensor_failed)?;
         Ok(LlamaLayerWeights {
             input_norm,
             q_proj,
@@ -161,7 +165,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         &mut self,
         name: &str,
         dims_expected: [usize; 2],
-    ) -> Result<Linear<B>, LlamaError<B::Error>> {
+    ) -> Result<Linear<B>, LlamaError> {
         Ok(Linear::new(self.tensor(name, &dims_expected)?))
     }
 
@@ -169,37 +173,47 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         &mut self,
         name: &str,
         config: &LlamaConfig,
-    ) -> Result<RmsNorm<B>, LlamaError<B::Error>> {
+    ) -> Result<RmsNorm<B>, LlamaError> {
         let weight = self.tensor(name, &[config.hidden_size()])?;
-        RmsNorm::new(self.backend, weight, config.rms_norm_eps()).map_err(LlamaError::Backend)
+        RmsNorm::new(self.backend, weight, config.rms_norm_eps()).map_err(tensor_failed)
     }
 
     fn tensor(
         &mut self,
         name: &str,
         dims_expected: &[usize],
-    ) -> Result<Tensor<B>, LlamaError<B::Error>> {
-        let view = self.weights.get(name)?;
+    ) -> Result<Tensor<B>, LlamaError> {
+        let view = self.weights.get(name).ok_or_else(|| {
+            error!(message = "Tensor is not in the weights.", name);
+            LlamaError::TensorNotFound
+        })?;
         if view.dtype != DTYPE {
-            return Err(LlamaError::DTypeMismatch {
-                name: name.to_owned(),
-                dtype: view.dtype,
-                dtype_expected: DTYPE,
-            });
+            error!(
+                message = "Tensor dtype is not the model dtype.",
+                name,
+                dtype = ?view.dtype,
+                dtype_expected = ?DTYPE,
+            );
+            return Err(LlamaError::TensorDTypeMismatch);
         }
         if view.shape.dims() != dims_expected {
-            return Err(LlamaError::ShapeMismatch {
-                name: name.to_owned(),
-                dims: view.shape.dims().to_vec(),
-                dims_expected: dims_expected.to_vec(),
-            });
+            error!(
+                message = "Tensor shape does not match the config.",
+                name,
+                dims = ?view.shape.dims(),
+                ?dims_expected,
+            );
+            return Err(LlamaError::TensorShapeMismatch);
         }
         let tensor = Tensor::upload(self.backend, view.bytes, view.dtype, view.shape)
-            .map_err(LlamaError::Backend)?;
+            .map_err(tensor_failed)?;
         self.bytes_uploaded = self
             .bytes_uploaded
             .checked_add(view.bytes.len())
-            .ok_or(LlamaError::ByteCountOverflow)?;
+            .ok_or_else(|| {
+                error!(message = "Uploaded byte count overflows usize.");
+                LlamaError::UploadedBytesOverflow
+            })?;
         Ok(tensor)
     }
 }

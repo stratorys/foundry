@@ -1,95 +1,61 @@
-use crate::core::DType;
-use crate::core::primitive::ReduceOp;
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CoreError {
-    #[error("Rank {rank} exceeds the maximum rank {rank_max}.")]
-    RankTooLarge { rank: usize, rank_max: usize },
+    #[error("Rank exceeds the maximum rank.")]
+    RankTooLarge,
 
-    #[error("Shape {dims:?} has more than {element_count_max} non-zero elements.")]
-    ElementCountOverflow {
-        dims: Vec<usize>,
-        element_count_max: usize,
-    },
+    #[error("Shape has too many elements.")]
+    ElementCountOverflow,
 
-    #[error("Offset {offset} plus start {start} times stride {stride} overflows usize.")]
-    OffsetOverflow {
-        offset: usize,
-        start: usize,
-        stride: usize,
-    },
+    #[error("View offset overflows.")]
+    OffsetOverflow,
 
-    #[error("Shapes {lhs:?} and {rhs:?} cannot be broadcast together.")]
-    BroadcastIncompatible { lhs: Vec<usize>, rhs: Vec<usize> },
+    #[error("Shapes cannot be broadcast together.")]
+    BroadcastIncompatible,
 
-    #[error("Axes {axes:?} are not a permutation of rank {rank}.")]
-    InvalidPermutation { axes: Vec<usize>, rank: usize },
+    #[error("Axes are not a permutation of the rank.")]
+    InvalidPermutation,
 
-    #[error("Axis {axis} is out of range for rank {rank}.")]
-    AxisOutOfRange { axis: usize, rank: usize },
+    #[error("Axis is out of range.")]
+    AxisOutOfRange,
 
-    #[error("Narrow of axis {axis} from {start} with length {len} exceeds dimension {dim}.")]
-    NarrowOutOfBounds {
-        axis: usize,
-        start: usize,
-        len: usize,
-        dim: usize,
-    },
+    #[error("Narrow exceeds the dimension.")]
+    NarrowOutOfBounds,
 
-    #[error("Dimension {dim} exceeds {dim_max}, the largest dimension converted exactly to f32.")]
-    DimensionTooLargeForF32 { dim: usize, dim_max: usize },
+    #[error("Dimension is too large to convert exactly to f32.")]
+    DimensionTooLargeForF32,
 
     #[error("Reshape requires a contiguous layout.")]
     ReshapeNonContiguous,
 
-    #[error("Element count {from} does not match element count {to}.")]
-    ElementCountMismatch { from: usize, to: usize },
+    #[error("Element counts do not match.")]
+    ElementCountMismatch,
 
-    #[error("Shape {from:?} cannot be broadcast to shape {to:?}.")]
-    BroadcastAsIncompatible { from: Vec<usize>, to: Vec<usize> },
+    #[error("Shape cannot be broadcast to the target shape.")]
+    BroadcastAsIncompatible,
 
-    #[error("DType {dtype:?} is not a float dtype.")]
-    DTypeNotFloat { dtype: DType },
+    #[error("DType is not a float dtype.")]
+    DTypeNotFloat,
 
-    #[error("DType {lhs:?} does not match dtype {rhs:?}.")]
-    DTypeMismatch { lhs: DType, rhs: DType },
+    #[error("DTypes do not match.")]
+    DTypeMismatch,
 
-    #[error("DType {dtype:?} was given where {dtype_expected:?} is expected.")]
-    DTypeUnexpected { dtype: DType, dtype_expected: DType },
+    #[error("Gather indices are not u32.")]
+    IndicesNotU32,
 
-    #[error("Shapes {lhs:?} and {rhs:?} cannot be multiplied.")]
-    MatmulIncompatible { lhs: Vec<usize>, rhs: Vec<usize> },
+    #[error("Shapes cannot be multiplied.")]
+    MatmulIncompatible,
 
-    #[error("Table shape {table:?} and indices shape {indices:?} cannot be gathered.")]
-    GatherIncompatible {
-        table: Vec<usize>,
-        indices: Vec<usize>,
-    },
+    #[error("Table and indices cannot be gathered.")]
+    GatherIncompatible,
 
-    #[error("Shapes {lhs:?} and {rhs:?} cannot be concatenated on axis {axis}.")]
-    ConcatIncompatible {
-        axis: usize,
-        lhs: Vec<usize>,
-        rhs: Vec<usize>,
-    },
+    #[error("Shapes cannot be concatenated.")]
+    ConcatIncompatible,
 
-    #[error(
-        "Update shape {update:?} at start {start} on axis {axis} does not fit target shape \
-         {target:?}."
-    )]
-    SliceUpdateOutOfBounds {
-        axis: usize,
-        start: usize,
-        target: Vec<usize>,
-        update: Vec<usize>,
-    },
+    #[error("Slice update does not fit the target.")]
+    SliceUpdateOutOfBounds,
 
-    #[error("Reduction {op:?} over empty axis {axis} of shape {dims:?} has no result.")]
-    EmptyReduction {
-        op: ReduceOp,
-        axis: usize,
-        dims: Vec<usize>,
-    },
+    #[error("Reduction over an empty axis has no result.")]
+    EmptyReduction,
 
     #[error("Slice update target shares its storage with another tensor.")]
     SharedStorage,
@@ -97,22 +63,21 @@ pub enum CoreError {
     #[error("Slice update requires a contiguous target layout.")]
     SliceUpdateNonContiguous,
 
-    #[error("Query {query:?}, key {key:?} and value {value:?} are incompatible for attention.")]
-    AttentionIncompatible {
-        query: Vec<usize>,
-        key: Vec<usize>,
-        value: Vec<usize>,
-    },
+    #[error("Byte length does not match the shape and dtype.")]
+    ByteLengthMismatch,
 
-    #[error("Head dim {head_dim} was given where head dim {head_dim_expected} is expected.")]
-    AttentionHeadDimMismatch {
-        head_dim: usize,
-        head_dim_expected: usize,
-    },
+    #[error("Download requires a contiguous layout.")]
+    DownloadNonContiguous,
 
-    #[error("Keys {keys:?} and values {values:?} do not have the same shape.")]
-    KvIncompatible {
-        keys: Vec<usize>,
-        values: Vec<usize>,
-    },
+    #[error("Query, keys and values are incompatible for attention.")]
+    AttentionIncompatible,
+
+    #[error("Attention head dim does not match.")]
+    AttentionHeadDimMismatch,
+
+    #[error("Keys and values do not have the same shape.")]
+    KvIncompatible,
+
+    #[error("Backend primitive failed.")]
+    Backend,
 }

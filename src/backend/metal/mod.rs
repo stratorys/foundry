@@ -19,23 +19,25 @@ use objc2_metal::{
     MTLResourceOptions,
     MTLSize,
 };
+use tracing::error;
 
 pub use self::error::MetalError;
 use self::stream::CommandStream;
 use crate::core::primitive::{
     BinaryOp,
+    ConcatSpec,
+    GatherSpec,
+    MatmulSpec,
+    MatrixLayout,
     ReduceOp,
+    ReduceSpec,
+    SliceUpdateSpec,
     UnaryOp,
-    concat_rule,
-    gather_rule,
-    matmul_rule,
-    reduce_rule,
-    slice_update_rule,
 };
 use crate::core::{
     Backend,
-    CoreError,
     DType,
+    FloatDType,
     Layout,
     Operand,
     OperandMut,
@@ -84,7 +86,6 @@ pub struct MetalBackend {
 struct BufferView<'buffer> {
     storage: &'buffer MetalStorage,
     layout: &'buffer Layout,
-    dtype: DType,
 }
 
 #[repr(C)]
@@ -154,23 +155,8 @@ impl StridedArgs {
     fn window(
         target: &Layout,
         shape: &Shape,
-        axis: usize,
-        start: usize,
+        offset: usize,
     ) -> Result<Self, MetalError> {
-        let axis_stride = target
-            .strides()
-            .get(axis)
-            .copied()
-            .ok_or(CoreError::AxisOutOfRange {
-                axis,
-                rank: target.shape().rank(),
-            })?;
-        let offset = start
-            .checked_mul(axis_stride)
-            .and_then(|skipped| skipped.checked_add(target.offset()))
-            .ok_or(MetalError::IndexTooLarge {
-                value: start,
-            })?;
         Ok(Self {
             offset: index_u32(offset)?,
             ..Self::with_shape(target, shape)?
@@ -182,29 +168,15 @@ impl GatherArgs {
     fn new(
         table: &BufferView<'_>,
         indices: &BufferView<'_>,
+        spec: &GatherSpec,
     ) -> Result<Self, MetalError> {
-        let incompatible = || CoreError::GatherIncompatible {
-            table: table.layout.shape().dims().to_vec(),
-            indices: indices.layout.shape().dims().to_vec(),
-        };
-        let ([rows, cols], [row_stride, col_stride]) =
-            (table.layout.shape().dims(), table.layout.strides())
-        else {
-            return Err(incompatible().into());
-        };
-        let count = indices
-            .layout
-            .shape()
-            .element_count()
-            .checked_mul(*cols)
-            .ok_or_else(incompatible)?;
         Ok(Self {
-            count: index_u32(count)?,
-            rows: index_u32(*rows)?,
-            cols: index_u32(*cols)?,
+            count: index_u32(spec.output().element_count())?,
+            rows: index_u32(spec.rows())?,
+            cols: index_u32(spec.cols())?,
             table_offset: index_u32(table.layout.offset())?,
-            table_row_stride: index_u32(*row_stride)?,
-            table_col_stride: index_u32(*col_stride)?,
+            table_row_stride: index_u32(spec.row_stride())?,
+            table_col_stride: index_u32(spec.col_stride())?,
             indices: StridedArgs::new(indices)?,
         })
     }
@@ -213,82 +185,47 @@ impl GatherArgs {
 impl ReduceArgs {
     fn new(
         input: &BufferView<'_>,
-        axis: usize,
-        rows: &Shape,
+        spec: &ReduceSpec,
     ) -> Result<Self, MetalError> {
-        let axis_out_of_range = || CoreError::AxisOutOfRange {
-            axis,
-            rank: input.layout.shape().rank(),
-        };
-        let axis_len = input
-            .layout
-            .shape()
-            .dims()
-            .get(axis)
-            .copied()
-            .ok_or_else(axis_out_of_range)?;
-        let axis_stride = input
-            .layout
-            .strides()
-            .get(axis)
-            .copied()
-            .ok_or_else(axis_out_of_range)?;
         Ok(Self {
-            rows: StridedArgs::with_shape(input.layout, rows)?,
-            axis_len: index_u32(axis_len)?,
-            axis_stride: index_u32(axis_stride)?,
+            rows: StridedArgs::with_shape(input.layout, spec.output())?,
+            axis_len: index_u32(spec.axis_len())?,
+            axis_stride: index_u32(spec.axis_stride())?,
         })
     }
 }
 
 impl MatmulOperand {
-    fn new(
-        operand: &BufferView<'_>,
-        incompatible: impl Fn() -> CoreError,
-    ) -> Result<Self, MetalError> {
-        let (batch_strides, [row_stride, col_stride]) = operand
-            .layout
-            .strides()
-            .split_last_chunk::<2>()
-            .ok_or_else(incompatible)?;
+    fn new(matrix: &MatrixLayout) -> Result<Self, MetalError> {
         Ok(Self {
-            offset: index_u32(operand.layout.offset())?,
-            row_stride: index_u32(*row_stride)?,
-            col_stride: index_u32(*col_stride)?,
-            batch_strides: padded_u32(batch_strides)?,
+            offset: index_u32(matrix.offset())?,
+            row_stride: index_u32(matrix.row_stride())?,
+            col_stride: index_u32(matrix.col_stride())?,
+            batch_strides: padded_u32(matrix.batch_strides())?,
         })
     }
 }
 
 impl MatmulArgs {
     fn new(
-        lhs: &BufferView<'_>,
-        rhs: &BufferView<'_>,
+        spec: &MatmulSpec,
+        lhs: &MatrixLayout,
+        rhs: &MatrixLayout,
     ) -> Result<(Self, MTLSize), MetalError> {
-        let incompatible = || CoreError::MatmulIncompatible {
-            lhs: lhs.layout.shape().dims().to_vec(),
-            rhs: rhs.layout.shape().dims().to_vec(),
-        };
-        let (batch_dims, [m, k]) = lhs
-            .layout
-            .shape()
-            .dims()
-            .split_last_chunk::<2>()
-            .ok_or_else(incompatible)?;
-        let n = rhs.layout.shape().dims().last().ok_or_else(incompatible)?;
+        let batch_dims = spec.batch().dims();
         let args = Self {
-            m: index_u32(*m)?,
-            n: index_u32(*n)?,
-            k: index_u32(*k)?,
+            m: index_u32(spec.m())?,
+            n: index_u32(spec.n())?,
+            k: index_u32(spec.k())?,
             batch_rank: index_u32(batch_dims.len())?,
             batch_dims: padded_u32(batch_dims)?,
-            lhs: MatmulOperand::new(lhs, incompatible)?,
-            rhs: MatmulOperand::new(rhs, incompatible)?,
+            lhs: MatmulOperand::new(lhs)?,
+            rhs: MatmulOperand::new(rhs)?,
         };
         let grid = MTLSize {
-            width: n.div_ceil(MATMUL_TILE),
-            height: m.div_ceil(MATMUL_TILE),
-            depth: batch_dims.iter().product(),
+            width: spec.n().div_ceil(MATMUL_TILE),
+            height: spec.m().div_ceil(MATMUL_TILE),
+            depth: spec.batch().element_count(),
         };
         Ok((args, grid))
     }
@@ -301,8 +238,12 @@ impl MetalBackend {
         let source = NSString::from_str(&KERNEL_SOURCES.concat());
         let library = device
             .newLibraryWithSource_options_error(&source, None)
-            .map_err(|error| MetalError::LibraryCompilation {
-                message: error.localizedDescription().to_string(),
+            .map_err(|error| {
+                error!(
+                    message = "Metal library compilation failed.",
+                    error = %error.localizedDescription(),
+                );
+                MetalError::LibraryCompilation
             })?;
         Ok(Self {
             device,
@@ -314,25 +255,26 @@ impl MetalBackend {
 
     fn allocate(
         &self,
-        dtype: DType,
-        shape: &Shape,
+        byte_len: usize,
     ) -> Result<MetalStorage, MetalError> {
-        let byte_len = byte_len(dtype, shape)?;
         let bytes_max = self.device.maxBufferLength();
         if byte_len > bytes_max {
-            return Err(MetalError::BufferTooLarge {
-                bytes: byte_len,
+            error!(
+                message = "Buffer exceeds the maximum Metal buffer length.",
+                bytes = byte_len,
                 bytes_max,
-            });
+            );
+            return Err(MetalError::BufferTooLarge);
         }
         let buffer = self
             .device
-            .newBufferWithLength_options(
-                byte_len.max(dtype.size_bytes()),
-                MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or(MetalError::BufferAllocation {
-                bytes: byte_len,
+            .newBufferWithLength_options(byte_len.max(1), MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                error!(
+                    message = "Metal buffer allocation failed.",
+                    bytes = byte_len
+                );
+                MetalError::BufferAllocation
             })?;
         Ok(MetalStorage {
             buffer,
@@ -351,19 +293,19 @@ impl MetalBackend {
         ) {
             Ok(())
         } else {
+            error!(message = "Storage was produced by another Metal backend instance.");
             Err(MetalError::ForeignStorage)
         }
     }
 
-    fn view<'buffer>(
+    fn view<'buffer, D: Copy>(
         &self,
-        operand: &Operand<'buffer, MetalStorage>,
+        operand: &Operand<'buffer, MetalStorage, D>,
     ) -> Result<BufferView<'buffer>, MetalError> {
         self.owns(operand.storage())?;
         Ok(BufferView {
             storage: operand.storage(),
             layout: operand.layout(),
-            dtype: operand.dtype(),
         })
     }
 
@@ -377,15 +319,20 @@ impl MetalBackend {
         let function = self
             .library
             .newFunctionWithName(&NSString::from_str(name))
-            .ok_or(MetalError::KernelNotFound {
-                name,
+            .ok_or_else(|| {
+                error!(message = "Kernel is not in the Metal library.", name);
+                MetalError::KernelNotFound
             })?;
         let pipeline = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|error| MetalError::PipelineCreation {
-                name,
-                message: error.localizedDescription().to_string(),
+            .map_err(|error| {
+                error!(
+                    message = "Metal pipeline creation failed.",
+                    name,
+                    error = %error.localizedDescription(),
+                );
+                MetalError::PipelineCreation
             })?;
         self.pipelines.insert(name, pipeline.clone());
         Ok(pipeline)
@@ -484,11 +431,7 @@ impl MetalBackend {
         let pipeline = self.pipeline(kernel)?;
         let threads = pipeline.maxTotalThreadsPerThreadgroup();
         if threads < REDUCE_THREADS {
-            return Err(MetalError::ThreadgroupTooSmall {
-                name: kernel,
-                threads,
-                threads_required: REDUCE_THREADS,
-            });
+            return Err(threadgroup_too_small(kernel, threads, REDUCE_THREADS));
         }
         self.encode(&pipeline, |encoder| {
             // SAFETY: the input buffer is alive for the whole call and the
@@ -533,17 +476,14 @@ impl MetalBackend {
         kernel: &'static str,
         lhs: &BufferView<'_>,
         rhs: &BufferView<'_>,
+        args: &MatmulArgs,
+        grid: MTLSize,
         output: &MetalStorage,
     ) -> Result<(), MetalError> {
-        let (args, grid) = MatmulArgs::new(lhs, rhs)?;
         let pipeline = self.pipeline(kernel)?;
         let threads = pipeline.maxTotalThreadsPerThreadgroup();
         if threads < MATMUL_THREADS {
-            return Err(MetalError::ThreadgroupTooSmall {
-                name: kernel,
-                threads,
-                threads_required: MATMUL_THREADS,
-            });
+            return Err(threadgroup_too_small(kernel, threads, MATMUL_THREADS));
         }
         self.encode(&pipeline, |encoder| {
             // SAFETY: both input buffers are alive for the whole call and the
@@ -568,7 +508,7 @@ impl MetalBackend {
             // before the call returns.
             unsafe {
                 encoder.setBytes_length_atIndex(
-                    NonNull::from(&args).cast(),
+                    NonNull::from(args).cast(),
                     size_of::<MatmulArgs>(),
                     3,
                 )
@@ -709,21 +649,30 @@ impl MetalBackend {
     fn copy_view(
         &mut self,
         input: &BufferView<'_>,
+        dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let output = self.allocate(input.dtype, input.layout.shape())?;
-        self.dispatch_strided(copy_kernel(input.dtype), &[input], &output)?;
+        let output = self.allocate(input.layout.shape().byte_len(dtype))?;
+        self.dispatch_strided(copy_kernel(dtype), &[input], &output)?;
         Ok(output)
     }
 
-    fn matmul_copy(
+    fn matmul_operand<'buffer>(
         &mut self,
-        operand: &BufferView<'_>,
-    ) -> Result<Option<(MetalStorage, Layout)>, MetalError> {
-        if is_matmul_ready(operand.layout) {
-            return Ok(None);
+        operand: BufferView<'buffer>,
+        matrix: &MatrixLayout,
+        spec: &MatmulSpec,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(BufferView<'buffer>, MatrixLayout, Option<MetalStorage>), MetalError> {
+        if is_matmul_ready(matrix, rows, cols) {
+            return Ok((operand, *matrix, None));
         }
-        let storage = self.copy_view(operand)?;
-        Ok(Some((storage, Layout::contiguous(*operand.layout.shape()))))
+        let storage = self.copy_view(&operand, spec.dtype().into())?;
+        Ok((
+            operand,
+            MatrixLayout::contiguous(spec.batch(), rows, cols),
+            Some(storage),
+        ))
     }
 }
 
@@ -734,17 +683,8 @@ impl Backend for MetalBackend {
     fn upload(
         &mut self,
         bytes: &[u8],
-        dtype: DType,
-        shape: &Shape,
     ) -> Result<MetalStorage, MetalError> {
-        let bytes_expected = byte_len(dtype, shape)?;
-        if bytes.len() != bytes_expected {
-            return Err(MetalError::ByteLengthMismatch {
-                bytes: bytes.len(),
-                bytes_expected,
-            });
-        }
-        let storage = self.allocate(dtype, shape)?;
+        let storage = self.allocate(bytes.len())?;
         // SAFETY: the buffer is freshly allocated in shared storage with at
         // least `storage.byte_len == bytes.len()` bytes, and no GPU
         // work references it yet.
@@ -760,10 +700,9 @@ impl Backend for MetalBackend {
 
     fn zeros(
         &mut self,
-        dtype: DType,
-        shape: &Shape,
+        byte_len: usize,
     ) -> Result<MetalStorage, MetalError> {
-        let storage = self.allocate(dtype, shape)?;
+        let storage = self.allocate(byte_len)?;
         self.stream.fill_zero(&storage.buffer)?;
         Ok(storage)
     }
@@ -772,28 +711,20 @@ impl Backend for MetalBackend {
         &mut self,
         input: Operand<'_, MetalStorage>,
     ) -> Result<Vec<u8>, MetalError> {
+        let dtype = input.dtype();
         let input = self.view(&input)?;
-        if !input.layout.is_contiguous() {
-            return Err(MetalError::DownloadNonContiguous);
-        }
-        let shape = input.layout.shape();
-        let bytes = byte_len(input.dtype, shape)?;
-        let bytes_offset = input
-            .layout
-            .offset()
-            .checked_mul(input.dtype.size_bytes())
-            .ok_or_else(|| MetalError::ByteCountOverflow {
-                dims: shape.dims().to_vec(),
-            })?;
+        let bytes = input.layout.shape().byte_len(dtype);
+        let bytes_offset = input.layout.offset().saturating_mul(dtype.size_bytes());
         let bytes_len = input.storage.byte_len;
-        let out_of_bounds = MetalError::DownloadOutOfBounds {
-            bytes,
-            bytes_offset,
-            bytes_len,
-        };
         match bytes_offset.checked_add(bytes) {
             Some(end) if end <= bytes_len => {}
-            Some(_) | None => return Err(out_of_bounds),
+            Some(_) | None => {
+                error!(
+                    message = "Download exceeds the buffer length.",
+                    bytes, bytes_offset, bytes_len,
+                );
+                return Err(MetalError::DownloadOutOfBounds);
+            }
         }
         self.stream.synchronize()?;
         let mut output = vec![0_u8; bytes];
@@ -823,63 +754,76 @@ impl Backend for MetalBackend {
     fn unary(
         &mut self,
         op: UnaryOp,
-        input: Operand<'_, MetalStorage>,
+        input: Operand<'_, MetalStorage, FloatDType>,
     ) -> Result<MetalStorage, MetalError> {
+        let dtype = input.dtype();
         let input = self.view(&input)?;
-        let kernel = unary_kernel(op, input.dtype)?;
-        let output = self.allocate(input.dtype, input.layout.shape())?;
-        self.dispatch_strided(kernel, &[&input], &output)?;
+        let output = self.allocate(input.layout.shape().byte_len(dtype.into()))?;
+        self.dispatch_strided(unary_kernel(op, dtype), &[&input], &output)?;
         Ok(output)
     }
 
     fn binary(
         &mut self,
         op: BinaryOp,
-        lhs: Operand<'_, MetalStorage>,
-        rhs: Operand<'_, MetalStorage>,
+        lhs: Operand<'_, MetalStorage, FloatDType>,
+        rhs: Operand<'_, MetalStorage, FloatDType>,
     ) -> Result<MetalStorage, MetalError> {
+        let dtype = lhs.dtype();
         let lhs = self.view(&lhs)?;
         let rhs = self.view(&rhs)?;
-        let kernel = binary_kernel(op, lhs.dtype)?;
-        let output = self.allocate(lhs.dtype, lhs.layout.shape())?;
-        self.dispatch_strided(kernel, &[&lhs, &rhs], &output)?;
+        let output = self.allocate(lhs.layout.shape().byte_len(dtype.into()))?;
+        self.dispatch_strided(binary_kernel(op, dtype), &[&lhs, &rhs], &output)?;
         Ok(output)
     }
 
     fn reduce(
         &mut self,
-        op: ReduceOp,
-        input: Operand<'_, MetalStorage>,
-        axis: usize,
+        input: Operand<'_, MetalStorage, FloatDType>,
+        spec: &ReduceSpec,
     ) -> Result<MetalStorage, MetalError> {
         let input = self.view(&input)?;
-        let kernel = reduce_kernel(op, input.dtype)?;
-        let (dtype, shape) = reduce_rule(op, input.dtype, input.layout.shape(), axis)?;
-        let args = ReduceArgs::new(&input, axis, &shape)?;
-        let output = self.allocate(dtype, &shape)?;
-        self.dispatch_reduce(kernel, &input, &args, shape.element_count(), &output)?;
+        let args = ReduceArgs::new(&input, spec)?;
+        let output = self.allocate(spec.output().byte_len(spec.dtype_output()))?;
+        self.dispatch_reduce(
+            reduce_kernel(spec.op(), spec.dtype()),
+            &input,
+            &args,
+            spec.output().element_count(),
+            &output,
+        )?;
         Ok(output)
     }
 
     fn matmul(
         &mut self,
-        lhs: Operand<'_, MetalStorage>,
-        rhs: Operand<'_, MetalStorage>,
+        lhs: Operand<'_, MetalStorage, FloatDType>,
+        rhs: Operand<'_, MetalStorage, FloatDType>,
+        spec: &MatmulSpec,
     ) -> Result<MetalStorage, MetalError> {
         let lhs = self.view(&lhs)?;
         let rhs = self.view(&rhs)?;
-        let kernel = matmul_kernel(lhs.dtype)?;
-        let (dtype, shape) =
-            matmul_rule(lhs.dtype, lhs.layout.shape(), rhs.dtype, rhs.layout.shape())?;
-        let output = self.allocate(dtype, &shape)?;
-        if shape.element_count() == 0 {
+        let output = self.allocate(spec.output().byte_len(spec.dtype().into()))?;
+        if spec.output().element_count() == 0 {
             return Ok(output);
         }
-        let lhs_copy = self.matmul_copy(&lhs)?;
-        let rhs_copy = self.matmul_copy(&rhs)?;
-        let lhs = matmul_operand(lhs, lhs_copy.as_ref());
-        let rhs = matmul_operand(rhs, rhs_copy.as_ref());
-        self.dispatch_matmul(kernel, &lhs, &rhs, &output)?;
+        let (lhs, lhs_matrix, lhs_copy) =
+            self.matmul_operand(lhs, spec.lhs(), spec, spec.m(), spec.k())?;
+        let (rhs, rhs_matrix, rhs_copy) =
+            self.matmul_operand(rhs, spec.rhs(), spec, spec.k(), spec.n())?;
+        let lhs_layout = Layout::contiguous(*lhs.layout.shape());
+        let rhs_layout = Layout::contiguous(*rhs.layout.shape());
+        let lhs = copied_view(lhs, lhs_copy.as_ref(), &lhs_layout);
+        let rhs = copied_view(rhs, rhs_copy.as_ref(), &rhs_layout);
+        let (args, grid) = MatmulArgs::new(spec, &lhs_matrix, &rhs_matrix)?;
+        self.dispatch_matmul(
+            matmul_kernel(spec.dtype()),
+            &lhs,
+            &rhs,
+            &args,
+            grid,
+            &output,
+        )?;
         Ok(output)
     }
 
@@ -887,43 +831,38 @@ impl Backend for MetalBackend {
         &mut self,
         input: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        self.copy_view(&self.view(&input)?)
+        let dtype = input.dtype();
+        self.copy_view(&self.view(&input)?, dtype)
     }
 
     fn cast(
         &mut self,
-        input: Operand<'_, MetalStorage>,
-        dtype: DType,
+        input: Operand<'_, MetalStorage, FloatDType>,
+        dtype: FloatDType,
     ) -> Result<MetalStorage, MetalError> {
+        let dtype_from = input.dtype();
         let input = self.view(&input)?;
-        let kernel = cast_kernel(input.dtype, dtype)?;
-        let output = self.allocate(dtype, input.layout.shape())?;
-        self.dispatch_strided(kernel, &[&input], &output)?;
+        let output = self.allocate(input.layout.shape().byte_len(dtype.into()))?;
+        self.dispatch_strided(cast_kernel(dtype_from, dtype), &[&input], &output)?;
         Ok(output)
     }
 
     fn gather(
         &mut self,
-        table: Operand<'_, MetalStorage>,
+        table: Operand<'_, MetalStorage, FloatDType>,
         indices: Operand<'_, MetalStorage>,
+        spec: &GatherSpec,
     ) -> Result<MetalStorage, MetalError> {
         let table = self.view(&table)?;
         let indices = self.view(&indices)?;
-        let kernel = gather_kernel(table.dtype)?;
-        let (dtype, shape) = gather_rule(
-            table.dtype,
-            table.layout.shape(),
-            indices.dtype,
-            indices.layout.shape(),
-        )?;
-        let args = GatherArgs::new(&table, &indices)?;
-        let output = self.allocate(dtype, &shape)?;
+        let args = GatherArgs::new(&table, &indices, spec)?;
+        let output = self.allocate(spec.output().byte_len(spec.dtype().into()))?;
         self.dispatch_gather(
-            kernel,
+            gather_kernel(spec.dtype()),
             &table,
             &indices,
             &args,
-            shape.element_count(),
+            spec.output().element_count(),
             &output,
         )?;
         Ok(output)
@@ -931,34 +870,17 @@ impl Backend for MetalBackend {
 
     fn concat(
         &mut self,
-        lhs: Operand<'_, MetalStorage>,
-        rhs: Operand<'_, MetalStorage>,
-        axis: usize,
+        lhs: Operand<'_, MetalStorage, FloatDType>,
+        rhs: Operand<'_, MetalStorage, FloatDType>,
+        spec: &ConcatSpec,
     ) -> Result<MetalStorage, MetalError> {
         let lhs = self.view(&lhs)?;
         let rhs = self.view(&rhs)?;
-        let kernel = slice_update_kernel("concat", lhs.dtype)?;
-        let (dtype, shape) = concat_rule(
-            lhs.dtype,
-            lhs.layout.shape(),
-            rhs.dtype,
-            rhs.layout.shape(),
-            axis,
-        )?;
-        let lhs_len =
-            lhs.layout
-                .shape()
-                .dims()
-                .get(axis)
-                .copied()
-                .ok_or(CoreError::AxisOutOfRange {
-                    axis,
-                    rank: lhs.layout.shape().rank(),
-                })?;
-        let mut output = self.allocate(dtype, &shape)?;
-        let layout = Layout::contiguous(shape);
-        let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), axis, 0)?;
-        let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), axis, lhs_len)?;
+        let kernel = slice_update_kernel(spec.dtype());
+        let mut output = self.allocate(spec.output().byte_len(spec.dtype().into()))?;
+        let layout = Layout::contiguous(*spec.output());
+        let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), 0)?;
+        let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), spec.rhs_offset())?;
         self.dispatch_write(kernel, &lhs, &lhs_window, &mut output)?;
         self.dispatch_write(kernel, &rhs, &rhs_window, &mut output)?;
         Ok(output)
@@ -966,39 +888,33 @@ impl Backend for MetalBackend {
 
     fn slice_update(
         &mut self,
-        mut target: OperandMut<'_, MetalStorage>,
-        update: Operand<'_, MetalStorage>,
-        axis: usize,
-        start: usize,
+        mut target: OperandMut<'_, MetalStorage, FloatDType>,
+        update: Operand<'_, MetalStorage, FloatDType>,
+        spec: &SliceUpdateSpec,
     ) -> Result<(), MetalError> {
         self.owns(target.storage_mut())?;
         let layout = target.layout();
-        let dtype = target.dtype();
         let update = self.view(&update)?;
-        let kernel = slice_update_kernel("slice_update", dtype)?;
-        slice_update_rule(
-            dtype,
-            layout.shape(),
-            update.dtype,
-            update.layout.shape(),
-            axis,
-            start,
-        )?;
-        let window = StridedArgs::window(layout, update.layout.shape(), axis, start)?;
-        self.dispatch_write(kernel, &update, &window, target.storage_mut())
+        let window = StridedArgs::window(layout, update.layout.shape(), spec.offset())?;
+        self.dispatch_write(
+            slice_update_kernel(spec.dtype()),
+            &update,
+            &window,
+            target.storage_mut(),
+        )
     }
 }
 
-fn byte_len(
-    dtype: DType,
-    shape: &Shape,
-) -> Result<usize, MetalError> {
-    shape
-        .element_count()
-        .checked_mul(dtype.size_bytes())
-        .ok_or_else(|| MetalError::ByteCountOverflow {
-            dims: shape.dims().to_vec(),
-        })
+fn threadgroup_too_small(
+    name: &'static str,
+    threads: usize,
+    threads_required: usize,
+) -> MetalError {
+    error!(
+        message = "Kernel allows too few threads per threadgroup.",
+        name, threads, threads_required,
+    );
+    MetalError::ThreadgroupTooSmall
 }
 
 fn copy_kernel(dtype: DType) -> &'static str {
@@ -1011,167 +927,134 @@ fn copy_kernel(dtype: DType) -> &'static str {
 }
 
 fn cast_kernel(
-    dtype_from: DType,
-    dtype_to: DType,
-) -> Result<&'static str, MetalError> {
-    let unsupported = |dtype| MetalError::UnsupportedDType {
-        primitive: "cast",
-        dtype,
-    };
+    dtype_from: FloatDType,
+    dtype_to: FloatDType,
+) -> &'static str {
     match (dtype_from, dtype_to) {
-        (DType::F32, DType::F32) => Ok("cast_f32_f32"),
-        (DType::F32, DType::F16) => Ok("cast_f32_f16"),
-        (DType::F32, DType::BF16) => Ok("cast_f32_bf16"),
-        (DType::F16, DType::F32) => Ok("cast_f16_f32"),
-        (DType::F16, DType::F16) => Ok("cast_f16_f16"),
-        (DType::F16, DType::BF16) => Ok("cast_f16_bf16"),
-        (DType::BF16, DType::F32) => Ok("cast_bf16_f32"),
-        (DType::BF16, DType::F16) => Ok("cast_bf16_f16"),
-        (DType::BF16, DType::BF16) => Ok("cast_bf16_bf16"),
-        (DType::U32, _) => Err(unsupported(DType::U32)),
-        (_, DType::U32) => Err(unsupported(DType::U32)),
+        (FloatDType::F32, FloatDType::F32) => "cast_f32_f32",
+        (FloatDType::F32, FloatDType::F16) => "cast_f32_f16",
+        (FloatDType::F32, FloatDType::BF16) => "cast_f32_bf16",
+        (FloatDType::F16, FloatDType::F32) => "cast_f16_f32",
+        (FloatDType::F16, FloatDType::F16) => "cast_f16_f16",
+        (FloatDType::F16, FloatDType::BF16) => "cast_f16_bf16",
+        (FloatDType::BF16, FloatDType::F32) => "cast_bf16_f32",
+        (FloatDType::BF16, FloatDType::F16) => "cast_bf16_f16",
+        (FloatDType::BF16, FloatDType::BF16) => "cast_bf16_bf16",
     }
 }
 
 fn unary_kernel(
     op: UnaryOp,
-    dtype: DType,
-) -> Result<&'static str, MetalError> {
+    dtype: FloatDType,
+) -> &'static str {
     match (op, dtype) {
-        (UnaryOp::Neg, DType::F32) => Ok("unary_neg_f32"),
-        (UnaryOp::Neg, DType::F16) => Ok("unary_neg_f16"),
-        (UnaryOp::Neg, DType::BF16) => Ok("unary_neg_bf16"),
-        (UnaryOp::Exp, DType::F32) => Ok("unary_exp_f32"),
-        (UnaryOp::Exp, DType::F16) => Ok("unary_exp_f16"),
-        (UnaryOp::Exp, DType::BF16) => Ok("unary_exp_bf16"),
-        (UnaryOp::Sqrt, DType::F32) => Ok("unary_sqrt_f32"),
-        (UnaryOp::Sqrt, DType::F16) => Ok("unary_sqrt_f16"),
-        (UnaryOp::Sqrt, DType::BF16) => Ok("unary_sqrt_bf16"),
-        (UnaryOp::Recip, DType::F32) => Ok("unary_recip_f32"),
-        (UnaryOp::Recip, DType::F16) => Ok("unary_recip_f16"),
-        (UnaryOp::Recip, DType::BF16) => Ok("unary_recip_bf16"),
-        (_, DType::U32) => Err(MetalError::UnsupportedDType {
-            primitive: "unary",
-            dtype,
-        }),
+        (UnaryOp::Neg, FloatDType::F32) => "unary_neg_f32",
+        (UnaryOp::Neg, FloatDType::F16) => "unary_neg_f16",
+        (UnaryOp::Neg, FloatDType::BF16) => "unary_neg_bf16",
+        (UnaryOp::Exp, FloatDType::F32) => "unary_exp_f32",
+        (UnaryOp::Exp, FloatDType::F16) => "unary_exp_f16",
+        (UnaryOp::Exp, FloatDType::BF16) => "unary_exp_bf16",
+        (UnaryOp::Sqrt, FloatDType::F32) => "unary_sqrt_f32",
+        (UnaryOp::Sqrt, FloatDType::F16) => "unary_sqrt_f16",
+        (UnaryOp::Sqrt, FloatDType::BF16) => "unary_sqrt_bf16",
+        (UnaryOp::Recip, FloatDType::F32) => "unary_recip_f32",
+        (UnaryOp::Recip, FloatDType::F16) => "unary_recip_f16",
+        (UnaryOp::Recip, FloatDType::BF16) => "unary_recip_bf16",
     }
 }
 
 fn binary_kernel(
     op: BinaryOp,
-    dtype: DType,
-) -> Result<&'static str, MetalError> {
+    dtype: FloatDType,
+) -> &'static str {
     match (op, dtype) {
-        (BinaryOp::Add, DType::F32) => Ok("binary_add_f32"),
-        (BinaryOp::Add, DType::F16) => Ok("binary_add_f16"),
-        (BinaryOp::Add, DType::BF16) => Ok("binary_add_bf16"),
-        (BinaryOp::Sub, DType::F32) => Ok("binary_sub_f32"),
-        (BinaryOp::Sub, DType::F16) => Ok("binary_sub_f16"),
-        (BinaryOp::Sub, DType::BF16) => Ok("binary_sub_bf16"),
-        (BinaryOp::Mul, DType::F32) => Ok("binary_mul_f32"),
-        (BinaryOp::Mul, DType::F16) => Ok("binary_mul_f16"),
-        (BinaryOp::Mul, DType::BF16) => Ok("binary_mul_bf16"),
-        (BinaryOp::Div, DType::F32) => Ok("binary_div_f32"),
-        (BinaryOp::Div, DType::F16) => Ok("binary_div_f16"),
-        (BinaryOp::Div, DType::BF16) => Ok("binary_div_bf16"),
-        (_, DType::U32) => Err(MetalError::UnsupportedDType {
-            primitive: "binary",
-            dtype,
-        }),
+        (BinaryOp::Add, FloatDType::F32) => "binary_add_f32",
+        (BinaryOp::Add, FloatDType::F16) => "binary_add_f16",
+        (BinaryOp::Add, FloatDType::BF16) => "binary_add_bf16",
+        (BinaryOp::Sub, FloatDType::F32) => "binary_sub_f32",
+        (BinaryOp::Sub, FloatDType::F16) => "binary_sub_f16",
+        (BinaryOp::Sub, FloatDType::BF16) => "binary_sub_bf16",
+        (BinaryOp::Mul, FloatDType::F32) => "binary_mul_f32",
+        (BinaryOp::Mul, FloatDType::F16) => "binary_mul_f16",
+        (BinaryOp::Mul, FloatDType::BF16) => "binary_mul_bf16",
+        (BinaryOp::Div, FloatDType::F32) => "binary_div_f32",
+        (BinaryOp::Div, FloatDType::F16) => "binary_div_f16",
+        (BinaryOp::Div, FloatDType::BF16) => "binary_div_bf16",
     }
 }
 
 fn reduce_kernel(
     op: ReduceOp,
-    dtype: DType,
-) -> Result<&'static str, MetalError> {
+    dtype: FloatDType,
+) -> &'static str {
     match (op, dtype) {
-        (ReduceOp::Sum, DType::F32) => Ok("reduce_sum_f32"),
-        (ReduceOp::Sum, DType::F16) => Ok("reduce_sum_f16"),
-        (ReduceOp::Sum, DType::BF16) => Ok("reduce_sum_bf16"),
-        (ReduceOp::Max, DType::F32) => Ok("reduce_max_f32"),
-        (ReduceOp::Max, DType::F16) => Ok("reduce_max_f16"),
-        (ReduceOp::Max, DType::BF16) => Ok("reduce_max_bf16"),
-        (ReduceOp::Argmax, DType::F32) => Ok("reduce_argmax_f32"),
-        (ReduceOp::Argmax, DType::F16) => Ok("reduce_argmax_f16"),
-        (ReduceOp::Argmax, DType::BF16) => Ok("reduce_argmax_bf16"),
-        (_, DType::U32) => Err(MetalError::UnsupportedDType {
-            primitive: "reduce",
-            dtype,
-        }),
+        (ReduceOp::Sum, FloatDType::F32) => "reduce_sum_f32",
+        (ReduceOp::Sum, FloatDType::F16) => "reduce_sum_f16",
+        (ReduceOp::Sum, FloatDType::BF16) => "reduce_sum_bf16",
+        (ReduceOp::Max, FloatDType::F32) => "reduce_max_f32",
+        (ReduceOp::Max, FloatDType::F16) => "reduce_max_f16",
+        (ReduceOp::Max, FloatDType::BF16) => "reduce_max_bf16",
+        (ReduceOp::Argmax, FloatDType::F32) => "reduce_argmax_f32",
+        (ReduceOp::Argmax, FloatDType::F16) => "reduce_argmax_f16",
+        (ReduceOp::Argmax, FloatDType::BF16) => "reduce_argmax_bf16",
     }
 }
 
-fn matmul_kernel(dtype: DType) -> Result<&'static str, MetalError> {
+fn matmul_kernel(dtype: FloatDType) -> &'static str {
     match dtype {
-        DType::F32 => Ok("matmul_f32"),
-        DType::F16 => Ok("matmul_f16"),
-        DType::BF16 => Ok("matmul_bf16"),
-        DType::U32 => Err(MetalError::UnsupportedDType {
-            primitive: "matmul",
-            dtype,
-        }),
+        FloatDType::F32 => "matmul_f32",
+        FloatDType::F16 => "matmul_f16",
+        FloatDType::BF16 => "matmul_bf16",
     }
 }
 
-fn gather_kernel(dtype: DType) -> Result<&'static str, MetalError> {
+fn gather_kernel(dtype: FloatDType) -> &'static str {
     match dtype {
-        DType::F32 => Ok("gather_f32"),
-        DType::F16 => Ok("gather_f16"),
-        DType::BF16 => Ok("gather_bf16"),
-        DType::U32 => Err(MetalError::UnsupportedDType {
-            primitive: "gather",
-            dtype,
-        }),
+        FloatDType::F32 => "gather_f32",
+        FloatDType::F16 => "gather_f16",
+        FloatDType::BF16 => "gather_bf16",
     }
 }
 
-fn slice_update_kernel(
-    primitive: &'static str,
-    dtype: DType,
-) -> Result<&'static str, MetalError> {
+fn slice_update_kernel(dtype: FloatDType) -> &'static str {
     match dtype {
-        DType::F32 => Ok("slice_update_f32"),
-        DType::F16 => Ok("slice_update_f16"),
-        DType::BF16 => Ok("slice_update_bf16"),
-        DType::U32 => Err(MetalError::UnsupportedDType {
-            primitive,
-            dtype,
-        }),
+        FloatDType::F32 => "slice_update_f32",
+        FloatDType::F16 => "slice_update_f16",
+        FloatDType::BF16 => "slice_update_bf16",
     }
 }
 
-fn is_matmul_ready(layout: &Layout) -> bool {
-    match (
-        layout.shape().dims().split_last_chunk::<2>(),
-        layout.strides().split_last_chunk::<2>(),
-    ) {
-        (Some((_, [rows, cols])), Some((_, [row_stride, col_stride]))) => {
-            let is_row_major = *col_stride == 1 || *cols == 1;
-            let is_transposed = *row_stride == 1 || *rows == 1;
-            is_row_major || is_transposed
-        }
-        _ => false,
-    }
+fn is_matmul_ready(
+    matrix: &MatrixLayout,
+    rows: usize,
+    cols: usize,
+) -> bool {
+    let is_row_major = matrix.col_stride() == 1 || cols == 1;
+    let is_transposed = matrix.row_stride() == 1 || rows == 1;
+    is_row_major || is_transposed
 }
 
-fn matmul_operand<'buffer>(
+fn copied_view<'buffer>(
     operand: BufferView<'buffer>,
-    copy: Option<&'buffer (MetalStorage, Layout)>,
+    copy: Option<&'buffer MetalStorage>,
+    layout: &'buffer Layout,
 ) -> BufferView<'buffer> {
     match copy {
-        Some((storage, layout)) => BufferView {
+        Some(storage) => BufferView {
             storage,
             layout,
-            dtype: operand.dtype,
         },
         None => operand,
     }
 }
 
 fn index_u32(value: usize) -> Result<u32, MetalError> {
-    u32::try_from(value).map_err(|_| MetalError::IndexTooLarge {
-        value,
+    u32::try_from(value).map_err(|_| {
+        error!(
+            message = "Value does not fit in a 32-bit kernel index.",
+            value
+        );
+        MetalError::KernelIndexTooLarge
     })
 }
 
@@ -1196,9 +1079,9 @@ mod tests {
 
     use crate::backend::metal::{
         MetalBackend,
-        MetalError,
         is_matmul_ready,
     };
+    use crate::core::primitive::matmul_rule;
     use crate::core::{
         CoreError,
         DType,
@@ -1367,13 +1250,7 @@ mod tests {
             Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
         );
         assert!(
-            matches!(
-                result,
-                Err(MetalError::ByteLengthMismatch {
-                    bytes: 10,
-                    bytes_expected: 16
-                })
-            ),
+            matches!(result, Err(CoreError::ByteLengthMismatch)),
             "a byte length that does not match shape × dtype is rejected"
         );
     }
@@ -1388,7 +1265,7 @@ mod tests {
             Shape::try_from([(1 << 31) - 1].as_slice()).expect("the shape is valid"),
         );
         assert!(
-            matches!(result, Err(MetalError::ByteLengthMismatch { .. })),
+            matches!(result, Err(CoreError::ByteLengthMismatch)),
             "the byte length is checked before allocation, got {:?}",
             result.err()
         );
@@ -1433,7 +1310,7 @@ mod tests {
         assert!(
             matches!(
                 permuted.download(&mut backend),
-                Err(MetalError::DownloadNonContiguous)
+                Err(CoreError::DownloadNonContiguous)
             ),
             "a non-contiguous layout cannot be downloaded"
         );
@@ -1962,10 +1839,7 @@ mod tests {
         assert!(
             matches!(
                 indices.add(&mut backend, &indices),
-                Err(MetalError::UnsupportedDType {
-                    primitive: "binary",
-                    dtype: DType::U32
-                })
+                Err(CoreError::DTypeNotFloat)
             ),
             "binary ops reject u32 on Metal"
         );
@@ -2335,13 +2209,7 @@ mod tests {
         )
         .expect("the upload succeeds");
         assert!(
-            matches!(
-                indices.sum(&mut backend, 0),
-                Err(MetalError::UnsupportedDType {
-                    primitive: "reduce",
-                    dtype: DType::U32
-                })
-            ),
+            matches!(indices.sum(&mut backend, 0), Err(CoreError::DTypeNotFloat)),
             "reductions reject u32 on Metal"
         );
     }
@@ -2433,7 +2301,8 @@ mod tests {
             let weight_transposed = weight.permute(&[1, 0]).expect("the permutation is valid");
             assert!(
                 !weight_transposed.layout().is_contiguous()
-                    && is_matmul_ready(weight_transposed.layout()),
+                    && matmul_rule(dtype, x.layout(), dtype, weight_transposed.layout())
+                        .is_ok_and(|spec| is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
                 "a transposed weight is read in place"
             );
             let actual: Vec<f32> = x
@@ -2489,7 +2358,8 @@ mod tests {
             });
             let lhs_transposed = lhs.permute(&[1, 0]).expect("the permutation is valid");
             assert!(
-                is_matmul_ready(lhs_transposed.layout()),
+                matmul_rule(dtype, lhs_transposed.layout(), dtype, rhs.layout())
+                    .is_ok_and(|spec| is_matmul_ready(spec.lhs(), spec.m(), spec.k())),
                 "a transposed lhs is read in place"
             );
             let actual: Vec<f32> = lhs_transposed
@@ -2697,10 +2567,6 @@ mod tests {
             .expect("the cast succeeds")
             .permute(&[2, 0, 1])
             .expect("the permutation is valid");
-            assert!(
-                !is_matmul_ready(rhs.layout()),
-                "strides (12, 4) on the last two axes need a copy"
-            );
             let lhs = Tensor::upload(
                 &mut backend,
                 &lhs_values
@@ -2713,6 +2579,11 @@ mod tests {
             .expect("the upload succeeds")
             .cast(&mut backend, dtype)
             .expect("the cast succeeds");
+            assert!(
+                matmul_rule(dtype, lhs.layout(), dtype, rhs.layout())
+                    .is_ok_and(|spec| !is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
+                "strides (12, 4) on the last two axes need a copy"
+            );
             let actual: Vec<f32> = lhs
                 .matmul(&mut backend, &rhs)
                 .expect("the matmul succeeds")
@@ -3242,7 +3113,7 @@ mod tests {
         assert!(
             matches!(
                 target.slice_update(&mut backend, &update, 1, 0),
-                Err(MetalError::Core(CoreError::SliceUpdateNonContiguous))
+                Err(CoreError::SliceUpdateNonContiguous)
             ),
             "a broadcast target would be written by several threads"
         );
@@ -3263,7 +3134,7 @@ mod tests {
         let update = target.narrow(1, 0, 1).expect("the narrow is valid");
         let result = target.slice_update(&mut backend, &update, 1, 3);
         assert!(
-            matches!(result, Err(MetalError::Core(CoreError::SharedStorage))),
+            matches!(result, Err(CoreError::SharedStorage)),
             "an update aliasing the target is rejected, got {result:?}"
         );
     }
@@ -3290,7 +3161,7 @@ mod tests {
         let view = target.narrow(0, 0, 1).expect("the narrow is valid");
         let result = target.slice_update(&mut backend, &update, 1, 3);
         assert!(
-            matches!(result, Err(MetalError::Core(CoreError::SharedStorage))),
+            matches!(result, Err(CoreError::SharedStorage)),
             "a live view would observe the write, got {result:?}"
         );
         assert_eq!(view.shape().dims(), &[1, 4], "the view is still alive");
@@ -3341,10 +3212,7 @@ mod tests {
         let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("the upload succeeds");
         assert!(
-            matches!(
-                tensor.download(&mut consumer),
-                Err(MetalError::ForeignStorage)
-            ),
+            matches!(tensor.download(&mut consumer), Err(CoreError::Backend)),
             "a storage from another backend cannot be downloaded"
         );
     }
@@ -3357,7 +3225,7 @@ mod tests {
         let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("the upload succeeds");
         assert!(
-            matches!(tensor.neg(&mut consumer), Err(MetalError::ForeignStorage)),
+            matches!(tensor.neg(&mut consumer), Err(CoreError::Backend)),
             "a storage from another backend cannot be read by a kernel"
         );
     }
@@ -3381,7 +3249,7 @@ mod tests {
         assert!(
             matches!(
                 target.slice_update(&mut consumer, &update, 1, 0),
-                Err(MetalError::ForeignStorage)
+                Err(CoreError::Backend)
             ),
             "a target from another backend cannot be written"
         );
@@ -3406,20 +3274,14 @@ mod tests {
         assert!(
             matches!(
                 values.gather(&mut backend, &indices),
-                Err(MetalError::UnsupportedDType {
-                    primitive: "gather",
-                    dtype: DType::U32
-                })
+                Err(CoreError::DTypeNotFloat)
             ),
             "gather rejects a u32 table on Metal"
         );
         assert!(
             matches!(
                 values.concat(&mut backend, &values, 0),
-                Err(MetalError::UnsupportedDType {
-                    primitive: "concat",
-                    dtype: DType::U32
-                })
+                Err(CoreError::DTypeNotFloat)
             ),
             "concat rejects u32 on Metal"
         );
