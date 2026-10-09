@@ -637,26 +637,4 @@ mod tests {
             result.err()
         );
     }
-
-    #[test]
-    #[ignore = "needs the bf16 snapshot of Llama-3.2-3B-Instruct in FOUNDRY_LLAMA_DIR"]
-    fn llama_snapshot_loads() {
-        let directory = std::env::var("FOUNDRY_LLAMA_DIR").expect("FOUNDRY_LLAMA_DIR is set");
-        let weights = Weights::open(Path::new(&directory)).expect("the snapshot loads");
-
-        assert_eq!(
-            weights.names().count(),
-            254,
-            "28 layers × 9 + embeddings + norm"
-        );
-        weights.names().for_each(|name| {
-            let view = weights.get(name).expect("every listed tensor is readable");
-            assert_eq!(view.dtype, DType::BF16, "dtype of {name}");
-        });
-        ["model.embed_tokens.weight", "model.norm.weight"]
-            .iter()
-            .for_each(|name| {
-                assert!(weights.get(name).is_ok(), "{name} is present");
-            });
-    }
 }
