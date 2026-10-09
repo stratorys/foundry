@@ -10,10 +10,21 @@ use std::path::{
 };
 use std::process::ExitCode;
 use std::str::FromStr;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 use clap::{
     Parser,
     Subcommand,
+};
+#[cfg(target_os = "macos")]
+use foundry::backend::metal::MetalBackend;
+#[cfg(target_os = "macos")]
+use foundry::generate::generate;
+#[cfg(target_os = "macos")]
+use foundry::models::llama::{
+    Llama,
+    LlamaWeights,
 };
 use foundry::models::llama::{
     LlamaConfig,
@@ -21,6 +32,8 @@ use foundry::models::llama::{
 };
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
+#[cfg(target_os = "macos")]
+use tracing::info;
 use tracing::{
     error,
     warn,
@@ -48,6 +61,24 @@ enum Command {
         model: ModelId,
         #[arg(long, help = "List every tensor with its dtype, shape and size.")]
         tensors: bool,
+    },
+    #[cfg(target_os = "macos")]
+    #[command(
+        about = "Generate token IDs greedily from prompt token IDs on Metal and print them as \
+                 JSON."
+    )]
+    Run {
+        #[arg(long, help = "Hugging Face repository id, as owner/name.")]
+        model: ModelId,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            required = true,
+            help = "Prompt token IDs, comma-separated."
+        )]
+        prompt_ids: Vec<u32>,
+        #[arg(long, help = "Maximum number of generated tokens.")]
+        max_new_tokens: usize,
     },
 }
 
@@ -80,6 +111,26 @@ enum CliError {
 
     #[error("Writing the report to stdout failed.")]
     Output,
+
+    #[cfg(target_os = "macos")]
+    #[error("Creating the Metal backend failed.")]
+    Backend,
+
+    #[cfg(target_os = "macos")]
+    #[error("Loading the model weights failed.")]
+    Load,
+
+    #[cfg(target_os = "macos")]
+    #[error("Building the model failed.")]
+    Model,
+
+    #[cfg(target_os = "macos")]
+    #[error("Prompt and generated token counts overflow usize.")]
+    SeqLenOverflow,
+
+    #[cfg(target_os = "macos")]
+    #[error("Generation failed.")]
+    Generate,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,6 +188,12 @@ fn main() -> ExitCode {
             model,
             tensors,
         } => inspect(&model, tensors),
+        #[cfg(target_os = "macos")]
+        Command::Run {
+            model,
+            prompt_ids,
+            max_new_tokens,
+        } => run(&model, &prompt_ids, max_new_tokens),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -170,14 +227,7 @@ fn inspect(
     tensors: bool,
 ) -> Result<(), CliError> {
     let directory = resolve_snapshot(model)?;
-    let weights = Weights::open(&directory).map_err(|error| {
-        error!(
-            message = "Opening the model weights failed.",
-            directory = %directory.display(),
-            %error,
-        );
-        CliError::Weights
-    })?;
+    let weights = open_weights(&directory)?;
     let summary = summarize_weights(model, &weights)?;
     let config = load_architecture(&directory)?;
     let tensor_rows = tensors.then(|| tensor_rows(&weights));
@@ -193,6 +243,94 @@ fn inspect(
         error!(message = "Writing the report to stdout failed.", %error);
         CliError::Output
     })
+}
+
+fn open_weights(directory: &Path) -> Result<Weights, CliError> {
+    Weights::open(directory).map_err(|error| {
+        error!(
+            message = "Opening the model weights failed.",
+            directory = %directory.display(),
+            %error,
+        );
+        CliError::Weights
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn run(
+    model: &ModelId,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+) -> Result<(), CliError> {
+    let directory = resolve_snapshot(model)?;
+    let config = LlamaConfig::open(&directory).map_err(|error| {
+        error!(
+            message = "Opening the model config failed.",
+            directory = %directory.display(),
+            %error,
+        );
+        CliError::Config
+    })?;
+    let weights = open_weights(&directory)?;
+    let mut backend = MetalBackend::new().map_err(|error| {
+        error!(message = "Creating the Metal backend failed.", %error);
+        CliError::Backend
+    })?;
+    let llama_weights = LlamaWeights::load(&mut backend, &config, &weights).map_err(|error| {
+        error!(message = "Loading the model weights failed.", %model, %error);
+        CliError::Load
+    })?;
+    let seq_len_max = prompt_ids
+        .len()
+        .checked_add(max_new_tokens)
+        .ok_or_else(|| {
+            error!(
+                message = "Prompt and generated token counts overflow usize.",
+                prompt_tokens = prompt_ids.len(),
+                max_new_tokens,
+            );
+            CliError::SeqLenOverflow
+        })?;
+    let llama = Llama::new(&mut backend, &config, llama_weights, seq_len_max).map_err(|error| {
+        error!(message = "Building the model failed.", %model, seq_len_max, %error);
+        CliError::Model
+    })?;
+    let generation = generate(
+        &mut backend,
+        &llama,
+        prompt_ids,
+        max_new_tokens,
+        config.eos_token_ids(),
+    )
+    .map_err(|error| {
+        error!(message = "Generation failed.", %model, %error);
+        CliError::Generate
+    })?;
+    info!(
+        message = "Generated tokens.",
+        prompt_tokens = prompt_ids.len(),
+        generated_tokens = generation.token_ids.len(),
+        prefill_ms = %generation.prefill.as_millis(),
+        decode_steps = generation.decode_steps.len(),
+        decode_ms_total = %generation.decode_steps.iter().sum::<Duration>().as_millis(),
+    );
+    write_token_ids(&mut io::stdout().lock(), &generation.token_ids).map_err(|error| {
+        error!(message = "Writing the token IDs to stdout failed.", %error);
+        CliError::Output
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn write_token_ids(
+    out: &mut impl Write,
+    token_ids: &[u32],
+) -> io::Result<()> {
+    let token_ids = token_ids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<String>>()
+        .join(",");
+    writeln!(out, "[{token_ids}]")
 }
 
 fn write_report(
@@ -431,6 +569,8 @@ mod tests {
     };
     use serde_json::json;
 
+    #[cfg(target_os = "macos")]
+    use crate::write_token_ids;
     use crate::{
         Cli,
         CliError,
@@ -561,6 +701,89 @@ mod tests {
                 .map_err(|error| error.kind()),
             Err(ErrorKind::InvalidSubcommand),
             "load is not a subcommand"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_parses_model_prompt_ids_and_max_new_tokens() {
+        assert_eq!(
+            Cli::try_parse_from([
+                "foundry",
+                "run",
+                "--model",
+                "a/b",
+                "--prompt-ids",
+                "1,2,3",
+                "--max-new-tokens",
+                "4",
+            ])
+            .map(|cli| cli.command)
+            .map_err(|error| error.kind()),
+            Ok(Command::Run {
+                model: ModelId {
+                    owner: "a".to_owned(),
+                    name: "b".to_owned(),
+                },
+                prompt_ids: vec![1, 2, 3],
+                max_new_tokens: 4,
+            }),
+            "comma-separated prompt IDs"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_rejects_missing_or_malformed_prompt_ids() {
+        struct ArgsKindCase<T0, T1> {
+            args: T0,
+            kind: T1,
+        }
+        [
+            ArgsKindCase {
+                args: vec!["foundry", "run", "--model", "a/b", "--max-new-tokens", "4"],
+                kind: ErrorKind::MissingRequiredArgument,
+            },
+            ArgsKindCase {
+                args: vec![
+                    "foundry",
+                    "run",
+                    "--model",
+                    "a/b",
+                    "--prompt-ids",
+                    "1,x",
+                    "--max-new-tokens",
+                    "4",
+                ],
+                kind: ErrorKind::ValueValidation,
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |ArgsKindCase {
+                 args,
+                 kind,
+             }| {
+                assert_eq!(
+                    Cli::try_parse_from(&args)
+                        .map(|cli| cli.command)
+                        .map_err(|error| error.kind()),
+                    Err(kind),
+                    "args {args:?}"
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_token_ids_prints_a_json_array() {
+        let mut out = Vec::new();
+        write_token_ids(&mut out, &[1, 2, 3]).expect("writing to a vector succeeds");
+        assert_eq!(
+            String::from_utf8(out),
+            Ok("[1,2,3]\n".to_owned()),
+            "token IDs as a JSON array"
         );
     }
 
