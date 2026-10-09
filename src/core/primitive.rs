@@ -360,6 +360,24 @@ mod tests {
     }
 
     #[test]
+    fn reduce_max_and_argmax_over_empty_axis_are_rejected() {
+        [ReduceOp::Max, ReduceOp::Argmax]
+            .into_iter()
+            .for_each(|op| {
+                let result = reduce_rule(op, DType::F32, &shape(&[2, 0]), 1);
+                assert!(result.is_err(), "{op:?} got {result:?}");
+            });
+    }
+
+    #[test]
+    fn reduce_sum_over_empty_axis_keeps_axis_with_size_one() {
+        let (dtype, output) =
+            reduce_rule(ReduceOp::Sum, DType::F32, &shape(&[2, 0]), 1).expect("sum of nothing");
+        assert_eq!(dtype, DType::F32, "dtype");
+        assert_eq!(output.dims(), &[2, 1], "dims");
+    }
+
+    #[test]
     fn matmul_multiplies_last_two_axes() {
         let (dtype, output) = matmul_rule(
             DType::BF16,

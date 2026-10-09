@@ -329,6 +329,165 @@ mod tests {
         assert_eq!(layout.strides(), &[0, 1, 0], "broadcast strides");
     }
 
+    const WIDENED_DIMS: [usize; 4] = [2, 6, 5, 7];
+
+    fn addresses(layout: &Layout) -> Vec<usize> {
+        let dims = layout.shape().dims();
+        (0..layout.shape().element_count())
+            .map(|flat| {
+                dims.iter()
+                    .zip(layout.strides())
+                    .rev()
+                    .fold(
+                        (flat, layout.offset()),
+                        |(rest, address), (&dim, &stride)| {
+                            let index = rest
+                                .checked_rem(dim)
+                                .expect("a non-empty view has no zero dim");
+                            let address = index
+                                .checked_mul(stride)
+                                .and_then(|delta| address.checked_add(delta))
+                                .expect("the address fits in usize");
+                            (rest.checked_div(dim).expect("dim is non-zero"), address)
+                        },
+                    )
+                    .1
+            })
+            .collect()
+    }
+
+    fn with_dims(
+        dims: &[usize],
+        size: impl Fn(usize, usize) -> usize,
+    ) -> Option<Shape> {
+        let dims: Vec<usize> = dims
+            .iter()
+            .enumerate()
+            .map(|(axis, &dim)| size(axis, dim))
+            .collect();
+        Shape::try_from(dims.as_slice()).ok()
+    }
+
+    fn narrows(layout: &Layout) -> Vec<Layout> {
+        layout
+            .shape()
+            .dims()
+            .iter()
+            .enumerate()
+            .flat_map(|(axis, &dim)| {
+                [
+                    Some((0, dim)),
+                    dim.checked_sub(1).map(|len| (1, len)),
+                    Some((dim, 0)),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(move |(start, len)| layout.narrow(axis, start, len).ok())
+            })
+            .collect()
+    }
+
+    fn permutes(layout: &Layout) -> Vec<Layout> {
+        let rank = layout.shape().rank();
+        let reversed: Vec<usize> = (0..rank).rev().collect();
+        let rotated: Vec<usize> = (1..rank).chain((rank > 0).then_some(0)).collect();
+        [reversed, rotated]
+            .iter()
+            .filter_map(|axes| layout.permute(axes).ok())
+            .collect()
+    }
+
+    fn broadcasts(layout: &Layout) -> Vec<Layout> {
+        let dims = layout.shape().dims();
+        let leading: Vec<usize> = [2].into_iter().chain(dims.iter().copied()).collect();
+        let widened_all = with_dims(dims, |axis, dim| {
+            if dim == 1 {
+                WIDENED_DIMS.get(axis).copied().unwrap_or(2)
+            } else {
+                dim
+            }
+        });
+        let widened_each = dims
+            .iter()
+            .enumerate()
+            .filter(|&(_, &dim)| dim == 1)
+            .filter_map(|(widened, _)| {
+                with_dims(dims, |axis, dim| if axis == widened { 2 } else { dim })
+            });
+        Shape::try_from(leading.as_slice())
+            .ok()
+            .into_iter()
+            .chain(widened_all)
+            .chain(widened_each)
+            .filter_map(|shape| layout.broadcast_as(shape).ok())
+            .collect()
+    }
+
+    fn reshapes(layout: &Layout) -> Vec<Layout> {
+        Shape::try_from([layout.shape().element_count()].as_slice())
+            .ok()
+            .and_then(|shape| layout.reshape(shape).ok())
+            .into_iter()
+            .collect()
+    }
+
+    fn views(base: &Layout) -> Vec<Layout> {
+        let narrowed = narrows(base);
+        let permuted = permutes(base);
+        let after_narrow = narrowed.iter().flat_map(|layout| {
+            permutes(layout)
+                .into_iter()
+                .chain(reshapes(layout))
+                .chain(broadcasts(layout))
+        });
+        let after_permute = permuted
+            .iter()
+            .flat_map(narrows)
+            .flat_map(|layout| broadcasts(&layout));
+        [*base]
+            .into_iter()
+            .chain(broadcasts(base))
+            .chain(reshapes(base))
+            .chain(after_narrow.collect::<Vec<Layout>>())
+            .chain(after_permute.collect::<Vec<Layout>>())
+            .chain(narrowed)
+            .chain(permuted)
+            .collect()
+    }
+
+    #[test]
+    fn every_view_addresses_only_elements_of_its_base() {
+        [[].as_slice(), &[2, 0, 3], &[5], &[2, 3, 4], &[1, 3, 1, 4]]
+            .into_iter()
+            .for_each(|dims| {
+                let base = contiguous(dims);
+                let element_count = base.shape().element_count();
+                views(&base).iter().for_each(|view| {
+                    assert!(
+                        addresses(view)
+                            .iter()
+                            .all(|&address| address < element_count),
+                        "base {dims:?} view {:?} strides {:?} offset {} leaves {element_count} \
+                         elements",
+                        view.shape().dims(),
+                        view.strides(),
+                        view.offset()
+                    );
+                });
+            });
+    }
+
+    #[test]
+    fn broadcast_widens_size_one_axes_in_place() {
+        let layouts = broadcasts(&contiguous(&[1, 3, 1, 4]));
+        let widened: Vec<&[usize]> = layouts.iter().map(|layout| layout.shape().dims()).collect();
+        assert!(
+            widened.contains(&[2, 3, 5, 4].as_slice())
+                && widened.contains(&[1, 3, 2, 4].as_slice()),
+            "got {widened:?}"
+        );
+    }
+
     #[test]
     fn broadcast_as_rejects_incompatible_shape() {
         let result = contiguous(&[3, 2])

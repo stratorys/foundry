@@ -1304,6 +1304,16 @@ mod tests {
     }
 
     #[test]
+    fn upload_of_empty_bytes_for_oversized_shape_reports_byte_length_mismatch() {
+        let result = Tensor::upload(&mut backend(), &[], DType::F32, shape(&[1 << 20, 1 << 20]));
+        assert!(
+            matches!(result, Err(MetalError::ByteLengthMismatch { .. })),
+            "the byte length is checked before allocation, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn narrow_on_leading_axis_downloads_the_sub_range() {
         let mut backend = backend();
         let bytes: Vec<u8> = (0_u32..6).flat_map(u32::to_le_bytes).collect();
@@ -2346,6 +2356,47 @@ mod tests {
                 Err(MetalError::SliceUpdateNonContiguous)
             ),
             "a broadcast target would be written by several threads"
+        );
+    }
+
+    #[test]
+    fn slice_update_with_a_view_of_the_target_as_update_is_rejected() {
+        let mut backend = backend();
+        let mut target = upload_f32(&mut backend, &iota(8), &[2, 4]);
+        let update = target.narrow(1, 0, 1).expect("the narrow is valid");
+        let result = target.slice_update(&mut backend, &update, 1, 3);
+        assert!(
+            result.is_err(),
+            "an update aliasing the target is rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn slice_update_while_another_view_of_the_target_is_alive_is_rejected() {
+        let mut backend = backend();
+        let mut target = upload_f32(&mut backend, &iota(8), &[2, 4]);
+        let view = target.narrow(0, 0, 1).expect("the narrow is valid");
+        let update = upload_f32(&mut backend, &[100.0, 101.0], &[2, 1]);
+        let result = target.slice_update(&mut backend, &update, 1, 3);
+        assert!(
+            result.is_err(),
+            "a live view would observe the write, got {result:?}"
+        );
+        assert_eq!(view.shape().dims(), &[1, 4], "the view is still alive");
+    }
+
+    #[test]
+    fn slice_update_without_live_views_writes_the_update() {
+        let mut backend = backend();
+        let mut target = upload_f32(&mut backend, &iota(8), &[2, 4]);
+        let update = upload_f32(&mut backend, &[100.0, 101.0], &[2, 1]);
+        target
+            .slice_update(&mut backend, &update, 1, 3)
+            .expect("the slice update succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &target),
+            [0.0, 1.0, 2.0, 100.0, 4.0, 5.0, 6.0, 101.0],
+            "the update lands in the last column"
         );
     }
 
