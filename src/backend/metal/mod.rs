@@ -36,6 +36,7 @@ use crate::core::primitive::{
 };
 use crate::core::{
     Backend,
+    DTYPE_SIZE_BYTES_MAX,
     DType,
     FloatDType,
     Layout,
@@ -282,7 +283,10 @@ impl MetalBackend {
         }
         let buffer = self
             .device
-            .newBufferWithLength_options(byte_len.max(1), MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(
+                byte_len.max(DTYPE_SIZE_BYTES_MAX),
+                MTLResourceOptions::StorageModeShared,
+            )
             .ok_or_else(|| {
                 error!(
                     message = "Metal buffer allocation failed.",
