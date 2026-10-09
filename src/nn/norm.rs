@@ -66,3 +66,90 @@ impl<B: Backend> RmsNorm<B> {
             .mul(backend, &self.weight)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::cpu::{
+        CpuBackend,
+        CpuError,
+    };
+    use crate::core::{
+        CoreError,
+        DType,
+        Shape,
+        Tensor,
+    };
+    use crate::nn::RmsNorm;
+
+    #[test]
+    fn rms_norm_of_constant_rows_is_the_weight() {
+        let mut backend = CpuBackend::new();
+        let weight = Tensor::upload(
+            &mut backend,
+            &[1.0_f32, 2.0, 0.5, -1.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([4].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let norm = RmsNorm::new(&mut backend, weight, 1e-5).expect("the norm is built");
+        let x = Tensor::upload(
+            &mut backend,
+            &[2.0_f32, 2.0, 2.0, 2.0, -3.0, -3.0, -3.0, -3.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([2, 4].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+        .cast(&mut backend, DType::BF16)
+        .expect("the cast succeeds");
+        let output = norm.forward(&mut backend, &x).expect("the norm succeeds");
+        assert_eq!(output.dtype(), DType::BF16, "output keeps the input dtype");
+        assert_eq!(output.shape().dims(), &[2, 4], "output dims");
+        let actual: Vec<f32> = output
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds")
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect();
+        let expected = [1.0_f32, 2.0, 0.5, -1.0, -1.0, -2.0, -0.5, 1.0];
+        assert_eq!(actual.len(), expected.len(), "element count");
+        actual.iter().zip(expected).for_each(|(&actual, expected)| {
+            assert!(
+                (actual - expected).abs() <= 1e-2 * expected.abs(),
+                "rms_norm: {actual} is not within 1e-2 of {expected}"
+            );
+        });
+    }
+
+    #[test]
+    fn rms_norm_rejects_a_dimension_beyond_u16() {
+        let mut backend = CpuBackend::new();
+        let weight = Tensor::zeros(
+            &mut backend,
+            DType::BF16,
+            Shape::try_from([65_536].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the zeros succeed");
+        assert!(
+            matches!(
+                RmsNorm::new(&mut backend, weight, 1e-5),
+                Err(CpuError::Core(CoreError::DimensionTooLargeForF32 {
+                    dim: 65_536,
+                    dim_max: 65_535,
+                }))
+            ),
+            "a dimension above u16::MAX is rejected"
+        );
+    }
+}

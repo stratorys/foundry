@@ -76,3 +76,62 @@ impl<B: Backend> KvCache<B> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::cpu::{
+        CpuBackend,
+        CpuError,
+    };
+    use crate::core::{
+        CoreError,
+        DType,
+        Shape,
+        Tensor,
+    };
+    use crate::nn::KvCache;
+
+    #[test]
+    fn kv_cache_update_beyond_capacity_is_rejected() {
+        let mut backend = CpuBackend::new();
+        let [key, value] = [[1, 3, 2], [1, 3, 2]].map(|dims| {
+            Tensor::zeros(
+                &mut backend,
+                DType::BF16,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the zeros succeed")
+        });
+        let mut cache =
+            KvCache::new(&mut backend, DType::BF16, 1, 2, 2).expect("the cache is built");
+        assert!(
+            matches!(
+                cache.update(&mut backend, &key, &value, 0),
+                Err(CpuError::Core(CoreError::SliceUpdateOutOfBounds { .. }))
+            ),
+            "writing three positions to a cache of two is rejected"
+        );
+    }
+
+    #[test]
+    fn kv_cache_update_rejects_keys_and_values_of_different_shapes() {
+        let mut backend = CpuBackend::new();
+        let [key, value] = [[1, 2, 2], [1, 1, 2]].map(|dims| {
+            Tensor::zeros(
+                &mut backend,
+                DType::BF16,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the zeros succeed")
+        });
+        let mut cache =
+            KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
+        assert!(
+            matches!(
+                cache.update(&mut backend, &key, &value, 0),
+                Err(CpuError::Core(CoreError::KvIncompatible { .. }))
+            ),
+            "keys of two positions with values of one position are rejected"
+        );
+    }
+}

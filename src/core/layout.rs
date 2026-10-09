@@ -197,13 +197,10 @@ mod tests {
         Shape,
     };
 
-    fn contiguous(dims: &[usize]) -> Layout {
-        Layout::contiguous(Shape::try_from(dims).expect("valid shape"))
-    }
-
     #[test]
     fn contiguous_strides_are_row_major() {
-        let layout = contiguous(&[2, 3, 4]);
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"));
         assert_eq!(layout.strides(), &[12, 4, 1], "contiguous strides");
         assert!(
             layout.is_contiguous(),
@@ -213,9 +210,10 @@ mod tests {
 
     #[test]
     fn permute_reorders_dims_and_strides() {
-        let layout = contiguous(&[2, 3, 4])
-            .permute(&[2, 0, 1])
-            .expect("valid permutation");
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
+                .permute(&[2, 0, 1])
+                .expect("valid permutation");
         assert_eq!(layout.shape().dims(), &[4, 2, 3], "permuted dims");
         assert_eq!(layout.strides(), &[1, 12, 4], "permuted strides");
         assert!(!layout.is_contiguous(), "permuted layout is not contiguous");
@@ -223,7 +221,8 @@ mod tests {
 
     #[test]
     fn permute_rejects_invalid_permutation() {
-        let layout = contiguous(&[2, 3, 4]);
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"));
         [[0, 0, 1].as_slice(), &[0, 1, 3], &[0, 1]]
             .into_iter()
             .for_each(|axes| {
@@ -237,7 +236,10 @@ mod tests {
 
     #[test]
     fn narrow_moves_offset_and_shrinks_axis() {
-        let layout = contiguous(&[2, 3, 4]).narrow(1, 1, 2).expect("in bounds");
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
+                .narrow(1, 1, 2)
+                .expect("in bounds");
         assert_eq!(layout.shape().dims(), &[2, 2, 4], "narrowed dims");
         assert_eq!(layout.strides(), &[12, 4, 1], "strides unchanged");
         assert_eq!(layout.offset(), 4, "offset moved by one row");
@@ -245,7 +247,8 @@ mod tests {
 
     #[test]
     fn narrow_rejects_out_of_bounds() {
-        let layout = contiguous(&[2, 3, 4]);
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"));
         let result = layout.narrow(1, 2, 2);
         assert!(
             matches!(result, Err(CoreError::NarrowOutOfBounds { .. })),
@@ -266,7 +269,10 @@ mod tests {
 
     #[test]
     fn reshape_keeps_offset_of_contiguous_layout() {
-        let layout = contiguous(&[2, 3, 4]).narrow(0, 1, 1).expect("in bounds");
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
+                .narrow(0, 1, 1)
+                .expect("in bounds");
         let reshaped = layout
             .reshape(Shape::try_from([3, 4].as_slice()).expect("valid shape"))
             .expect("contiguous");
@@ -276,7 +282,7 @@ mod tests {
 
     #[test]
     fn reshape_rejects_non_contiguous_layout() {
-        let layout = contiguous(&[2, 3])
+        let layout = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
             .permute(&[1, 0])
             .expect("valid permutation");
         let result = layout.reshape(Shape::try_from([6].as_slice()).expect("valid shape"));
@@ -288,8 +294,8 @@ mod tests {
 
     #[test]
     fn reshape_rejects_element_count_mismatch() {
-        let result =
-            contiguous(&[2, 3]).reshape(Shape::try_from([5].as_slice()).expect("valid shape"));
+        let result = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
+            .reshape(Shape::try_from([5].as_slice()).expect("valid shape"));
         assert!(
             matches!(
                 result,
@@ -304,7 +310,7 @@ mod tests {
 
     #[test]
     fn broadcast_as_uses_zero_strides() {
-        let layout = contiguous(&[3, 1])
+        let layout = Layout::contiguous(Shape::try_from([3, 1].as_slice()).expect("valid shape"))
             .broadcast_as(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
             .expect("broadcastable");
         assert_eq!(layout.shape().dims(), &[2, 3, 4], "broadcast dims");
@@ -448,7 +454,7 @@ mod tests {
         [[].as_slice(), &[2, 0, 3], &[5], &[2, 3, 4], &[1, 3, 1, 4]]
             .into_iter()
             .for_each(|dims| {
-                let base = contiguous(dims);
+                let base = Layout::contiguous(Shape::try_from(dims).expect("valid shape"));
                 let element_count = base.shape().element_count();
                 views(&base).iter().for_each(|view| {
                     assert!(
@@ -467,7 +473,9 @@ mod tests {
 
     #[test]
     fn broadcast_widens_size_one_axes_in_place() {
-        let layouts = broadcasts(&contiguous(&[1, 3, 1, 4]));
+        let layouts = broadcasts(&Layout::contiguous(
+            Shape::try_from([1, 3, 1, 4].as_slice()).expect("valid shape"),
+        ));
         let widened: Vec<&[usize]> = layouts.iter().map(|layout| layout.shape().dims()).collect();
         assert!(
             widened.contains(&[2, 3, 5, 4].as_slice())
@@ -479,20 +487,28 @@ mod tests {
     #[test]
     fn broadcast_as_beyond_i32_max_is_rejected() {
         let dim = usize::try_from(u32::MAX).expect("u32 fits in usize");
-        let result = Shape::try_from([dim].as_slice())
-            .and_then(|shape| contiguous(&[1]).broadcast_as(shape));
+        let result = Shape::try_from([dim].as_slice()).and_then(|shape| {
+            Layout::contiguous(Shape::try_from([1].as_slice()).expect("valid shape"))
+                .broadcast_as(shape)
+        });
         assert!(result.is_err(), "got {result:?}");
     }
 
     #[test]
     fn empty_contiguous_strides_do_not_depend_on_axis_order() {
         assert_eq!(
-            contiguous(&[(1 << 30) - 1, 0, 2]).strides(),
+            Layout::contiguous(
+                Shape::try_from([(1 << 30) - 1, 0, 2].as_slice()).expect("valid shape")
+            )
+            .strides(),
             &[0, 2, 1],
             "zero dim in the middle"
         );
         assert_eq!(
-            contiguous(&[0, (1 << 30) - 1, 2]).strides(),
+            Layout::contiguous(
+                Shape::try_from([0, (1 << 30) - 1, 2].as_slice()).expect("valid shape")
+            )
+            .strides(),
             &[(1 << 31) - 2, 2, 1],
             "zero dim first"
         );
@@ -500,7 +516,7 @@ mod tests {
 
     #[test]
     fn broadcast_as_rejects_incompatible_shape() {
-        let result = contiguous(&[3, 2])
+        let result = Layout::contiguous(Shape::try_from([3, 2].as_slice()).expect("valid shape"))
             .broadcast_as(Shape::try_from([3, 4].as_slice()).expect("valid shape"));
         assert!(
             matches!(result, Err(CoreError::BroadcastAsIncompatible { .. })),

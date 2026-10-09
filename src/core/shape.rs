@@ -99,17 +99,22 @@ mod tests {
         Shape,
     };
 
-    fn shape(dims: &[usize]) -> Shape { Shape::try_from(dims).expect("valid shape") }
-
     #[test]
     fn broadcast_aligns_axes_from_the_right() {
-        let result = Shape::broadcast(&shape(&[2, 1, 4]), &shape(&[3, 1])).expect("broadcastable");
+        let result = Shape::broadcast(
+            &Shape::try_from([2, 1, 4].as_slice()).expect("valid shape"),
+            &Shape::try_from([3, 1].as_slice()).expect("valid shape"),
+        )
+        .expect("broadcastable");
         assert_eq!(result.dims(), &[2, 3, 4], "broadcast dims");
     }
 
     #[test]
     fn broadcast_rejects_mismatched_dims() {
-        let result = Shape::broadcast(&shape(&[2, 3]), &shape(&[4, 3]));
+        let result = Shape::broadcast(
+            &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+            &Shape::try_from([4, 3].as_slice()).expect("valid shape"),
+        );
         assert!(
             matches!(result, Err(CoreError::BroadcastIncompatible { .. })),
             "got {result:?}"
@@ -152,7 +157,9 @@ mod tests {
     #[test]
     fn element_count_at_i32_max_is_accepted() {
         assert_eq!(
-            shape(&[(1 << 31) - 1]).element_count(),
+            Shape::try_from([(1 << 31) - 1].as_slice())
+                .expect("valid shape")
+                .element_count(),
             (1 << 31) - 1,
             "element count"
         );
@@ -181,7 +188,13 @@ mod tests {
         [[(1 << 30) - 1, 0, 2], [0, (1 << 30) - 1, 2]]
             .into_iter()
             .for_each(|dims| {
-                assert_eq!(shape(&dims).element_count(), 0, "dims {dims:?}");
+                assert_eq!(
+                    Shape::try_from(dims.as_slice())
+                        .expect("valid shape")
+                        .element_count(),
+                    0,
+                    "dims {dims:?}"
+                );
             });
     }
 }

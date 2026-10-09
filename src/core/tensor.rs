@@ -329,26 +329,24 @@ mod tests {
         Shape,
     };
 
-    fn contiguous(dims: &[usize]) -> Layout {
-        Layout::contiguous(Shape::try_from(dims).expect("valid shape"))
-    }
-
     #[test]
     fn narrow_on_leading_axis_needs_no_copy() {
-        let layout = contiguous(&[8, 16, 128])
-            .narrow(0, 2, 3)
-            .expect("in bounds");
+        let layout =
+            Layout::contiguous(Shape::try_from([8, 16, 128].as_slice()).expect("valid shape"))
+                .narrow(0, 2, 3)
+                .expect("in bounds");
         assert!(layout.is_contiguous(), "leading narrow stays contiguous");
         assert_eq!(layout.offset(), 2 * 16 * 128, "offset moved by two rows");
     }
 
     #[test]
     fn narrow_after_permute_needs_a_copy() {
-        let layout = contiguous(&[16, 8, 128])
-            .permute(&[1, 0, 2])
-            .expect("valid permutation")
-            .narrow(1, 0, 4)
-            .expect("in bounds");
+        let layout =
+            Layout::contiguous(Shape::try_from([16, 8, 128].as_slice()).expect("valid shape"))
+                .permute(&[1, 0, 2])
+                .expect("valid permutation")
+                .narrow(1, 0, 4)
+                .expect("in bounds");
         assert_eq!(layout.shape().dims(), &[8, 4, 128], "narrowed dims");
         assert!(!layout.is_contiguous(), "permuted narrow is not contiguous");
     }
