@@ -30,12 +30,14 @@ use crate::core::primitive::{
     BinaryOp,
     ReduceOp,
     UnaryOp,
+    matmul_rule,
     reduce_rule,
 };
 use crate::core::{
     Backend,
     CoreError,
     DType,
+    Layout,
     Operand,
     RANK_MAX,
     Shape,
@@ -47,9 +49,14 @@ const KERNEL_SOURCES: &[&str] = &[
     include_str!("kernels/unary.metal"),
     include_str!("kernels/binary.metal"),
     include_str!("kernels/reduce.metal"),
+    include_str!("kernels/matmul.metal"),
 ];
 
 const REDUCE_THREADS: usize = 256;
+
+const MATMUL_TILE: usize = 16;
+
+const MATMUL_THREADS: usize = MATMUL_TILE * MATMUL_TILE;
 
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -88,6 +95,25 @@ struct ReduceArgs {
     axis_stride: u32,
 }
 
+#[repr(C)]
+struct MatmulOperand {
+    offset: u32,
+    row_stride: u32,
+    col_stride: u32,
+    batch_strides: [u32; RANK_MAX],
+}
+
+#[repr(C)]
+struct MatmulArgs {
+    m: u32,
+    n: u32,
+    k: u32,
+    batch_rank: u32,
+    batch_dims: [u32; RANK_MAX],
+    lhs: MatmulOperand,
+    rhs: MatmulOperand,
+}
+
 impl StridedArgs {
     fn new(input: &Operand<'_, MetalStorage>) -> Result<Self, MetalError> {
         Self::with_shape(input, input.layout.shape())
@@ -97,12 +123,7 @@ impl StridedArgs {
         input: &Operand<'_, MetalStorage>,
         shape: &Shape,
     ) -> Result<Self, MetalError> {
-        let elements_buffer = input
-            .storage
-            .byte_len
-            .checked_div(input.dtype.size_bytes())
-            .unwrap_or(0);
-        index_u32(elements_buffer)?;
+        index_u32(buffer_element_count(input))?;
         Ok(Self {
             count: index_u32(shape.element_count())?,
             rank: index_u32(shape.rank())?,
@@ -141,6 +162,60 @@ impl ReduceArgs {
             axis_len: index_u32(axis_len)?,
             axis_stride: index_u32(axis_stride)?,
         })
+    }
+}
+
+impl MatmulOperand {
+    fn new(
+        operand: &Operand<'_, MetalStorage>,
+        incompatible: impl Fn() -> CoreError,
+    ) -> Result<Self, MetalError> {
+        index_u32(buffer_element_count(operand))?;
+        let (batch_strides, [row_stride, col_stride]) = operand
+            .layout
+            .strides()
+            .split_last_chunk::<2>()
+            .ok_or_else(incompatible)?;
+        Ok(Self {
+            offset: index_u32(operand.layout.offset())?,
+            row_stride: index_u32(*row_stride)?,
+            col_stride: index_u32(*col_stride)?,
+            batch_strides: padded_u32(batch_strides)?,
+        })
+    }
+}
+
+impl MatmulArgs {
+    fn new(
+        lhs: &Operand<'_, MetalStorage>,
+        rhs: &Operand<'_, MetalStorage>,
+    ) -> Result<(Self, MTLSize), MetalError> {
+        let incompatible = || CoreError::MatmulIncompatible {
+            lhs: lhs.layout.shape().dims().to_vec(),
+            rhs: rhs.layout.shape().dims().to_vec(),
+        };
+        let (batch_dims, [m, k]) = lhs
+            .layout
+            .shape()
+            .dims()
+            .split_last_chunk::<2>()
+            .ok_or_else(incompatible)?;
+        let n = rhs.layout.shape().dims().last().ok_or_else(incompatible)?;
+        let args = Self {
+            m: index_u32(*m)?,
+            n: index_u32(*n)?,
+            k: index_u32(*k)?,
+            batch_rank: index_u32(batch_dims.len())?,
+            batch_dims: padded_u32(batch_dims)?,
+            lhs: MatmulOperand::new(lhs, incompatible)?,
+            rhs: MatmulOperand::new(rhs, incompatible)?,
+        };
+        let grid = MTLSize {
+            width: n.div_ceil(MATMUL_TILE),
+            height: m.div_ceil(MATMUL_TILE),
+            depth: batch_dims.iter().product(),
+        };
+        Ok((args, grid))
     }
 }
 
@@ -345,6 +420,74 @@ impl MetalBackend {
         })
     }
 
+    fn dispatch_matmul(
+        &mut self,
+        kernel: &'static str,
+        lhs: &Operand<'_, MetalStorage>,
+        rhs: &Operand<'_, MetalStorage>,
+        output: &MetalStorage,
+    ) -> Result<(), MetalError> {
+        let (args, grid) = MatmulArgs::new(lhs, rhs)?;
+        let pipeline = self.pipeline(kernel)?;
+        let threads = pipeline.maxTotalThreadsPerThreadgroup();
+        if threads < MATMUL_THREADS {
+            return Err(MetalError::ThreadgroupTooSmall {
+                name: kernel,
+                threads,
+                threads_required: MATMUL_THREADS,
+            });
+        }
+        self.encode(&pipeline, |encoder| {
+            // SAFETY: both input buffers are alive for the whole call and the
+            // command buffer retains them; `MatmulOperand::new` checked that
+            // every index the kernel reads fits in each buffer's element count.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&lhs.storage.buffer), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&rhs.storage.buffer), 0, 1);
+            };
+            // SAFETY: the output buffer holds `batch * m * n` elements of the
+            // kernel's type, and the kernel writes only inside `[m, n]` of each
+            // batch.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 2) };
+            // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
+            // layout of `MatmulArgs` in `matmul.metal`; Metal copies the bytes
+            // before the call returns.
+            unsafe {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&args).cast(),
+                    size_of::<MatmulArgs>(),
+                    3,
+                )
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                grid,
+                MTLSize {
+                    width: MATMUL_TILE,
+                    height: MATMUL_TILE,
+                    depth: 1,
+                },
+            );
+        })
+    }
+
+    fn matmul_copy(
+        &mut self,
+        operand: &Operand<'_, MetalStorage>,
+    ) -> Result<Option<(MetalStorage, Layout)>, MetalError> {
+        if is_matmul_ready(operand.layout) {
+            return Ok(None);
+        }
+        let storage = self.copy(Operand {
+            storage: operand.storage,
+            layout: operand.layout,
+            dtype: operand.dtype,
+        })?;
+        Ok(Some((
+            storage,
+            Layout::contiguous(*operand.layout.shape())?,
+        )))
+    }
+
     fn wait_pending(&mut self) -> Result<(), MetalError> {
         self.pending
             .take()
@@ -495,12 +638,23 @@ impl Backend for MetalBackend {
 
     fn matmul(
         &mut self,
-        _lhs: Operand<'_, MetalStorage>,
-        _rhs: Operand<'_, MetalStorage>,
+        lhs: Operand<'_, MetalStorage>,
+        rhs: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        Err(MetalError::NotImplemented {
-            primitive: "matmul",
-        })
+        let kernel = matmul_kernel(lhs.dtype)?;
+        let (dtype, shape) =
+            matmul_rule(lhs.dtype, lhs.layout.shape(), rhs.dtype, rhs.layout.shape())?;
+        index_u32(shape.element_count())?;
+        let output = self.allocate(dtype, &shape)?;
+        if shape.element_count() == 0 {
+            return Ok(output);
+        }
+        let lhs_copy = self.matmul_copy(&lhs)?;
+        let rhs_copy = self.matmul_copy(&rhs)?;
+        let lhs = matmul_operand(lhs, lhs_copy.as_ref());
+        let rhs = matmul_operand(rhs, rhs_copy.as_ref());
+        self.dispatch_matmul(kernel, &lhs, &rhs, &output)?;
+        Ok(output)
     }
 
     fn copy(
@@ -670,6 +824,54 @@ fn reduce_kernel(
     }
 }
 
+fn matmul_kernel(dtype: DType) -> Result<&'static str, MetalError> {
+    match dtype {
+        DType::F32 => Ok("matmul_f32"),
+        DType::F16 => Ok("matmul_f16"),
+        DType::BF16 => Ok("matmul_bf16"),
+        DType::U32 => Err(MetalError::UnsupportedDType {
+            primitive: "matmul",
+            dtype,
+        }),
+    }
+}
+
+fn is_matmul_ready(layout: &Layout) -> bool {
+    match (
+        layout.shape().dims().split_last_chunk::<2>(),
+        layout.strides().split_last_chunk::<2>(),
+    ) {
+        (Some((_, [rows, cols])), Some((_, [row_stride, col_stride]))) => {
+            let is_row_major = *col_stride == 1 || *cols == 1;
+            let is_transposed = *row_stride == 1 || *rows == 1;
+            is_row_major || is_transposed
+        }
+        _ => false,
+    }
+}
+
+fn matmul_operand<'storage>(
+    operand: Operand<'storage, MetalStorage>,
+    copy: Option<&'storage (MetalStorage, Layout)>,
+) -> Operand<'storage, MetalStorage> {
+    match copy {
+        Some((storage, layout)) => Operand {
+            storage,
+            layout,
+            dtype: operand.dtype,
+        },
+        None => operand,
+    }
+}
+
+fn buffer_element_count(input: &Operand<'_, MetalStorage>) -> usize {
+    input
+        .storage
+        .byte_len
+        .checked_div(input.dtype.size_bytes())
+        .unwrap_or(0)
+}
+
 fn index_u32(value: usize) -> Result<u32, MetalError> {
     u32::try_from(value).map_err(|_| MetalError::IndexTooLarge {
         value,
@@ -708,6 +910,7 @@ mod tests {
     use crate::backend::metal::{
         MetalBackend,
         MetalError,
+        is_matmul_ready,
     };
     use crate::core::{
         DType,
@@ -1437,6 +1640,226 @@ mod tests {
                 })
             ),
             "reductions reject u32 on Metal"
+        );
+    }
+
+    fn upload_as(
+        backend: &mut MetalBackend,
+        values: &[f32],
+        dims: &[usize],
+        dtype: DType,
+    ) -> Tensor<MetalBackend> {
+        upload_f32(backend, values, dims)
+            .cast(backend, dtype)
+            .expect("the cast succeeds")
+    }
+
+    fn matmul_to_f32(
+        backend: &mut MetalBackend,
+        lhs: &Tensor<MetalBackend>,
+        rhs: &Tensor<MetalBackend>,
+    ) -> Vec<f32> {
+        let output = lhs
+            .matmul(backend, rhs)
+            .expect("the matmul succeeds")
+            .cast(backend, DType::F32)
+            .expect("the cast succeeds");
+        download_f32(backend, &output)
+    }
+
+    fn eighths(
+        count: u16,
+        seed: u16,
+    ) -> Vec<f32> {
+        (0..count)
+            .map(|index| {
+                let step = index.wrapping_mul(seed).wrapping_add(3) % 17;
+                (f32::from(step) - 8.0) / 8.0
+            })
+            .collect()
+    }
+
+    fn reference_matmul(
+        lhs: &[f32],
+        rhs: &[f32],
+        [m, k, n]: [usize; 3],
+    ) -> Vec<f32> {
+        let lhs_matrix_len = m.checked_mul(k).expect("the lhs matrix size fits");
+        let rhs_matrix_len = k.checked_mul(n).expect("the rhs matrix size fits");
+        lhs.chunks(lhs_matrix_len)
+            .zip(rhs.chunks(rhs_matrix_len))
+            .flat_map(|(lhs_matrix, rhs_matrix)| {
+                lhs_matrix.chunks(k).flat_map(move |row| {
+                    (0..n).map(move |col| {
+                        row.iter()
+                            .zip(rhs_matrix.iter().skip(col).step_by(n))
+                            .map(|(lhs_value, rhs_value)| lhs_value * rhs_value)
+                            .sum::<f32>()
+                    })
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matmul_matches_hand_computed_values_for_each_float_dtype() {
+        let mut backend = backend();
+        FLOAT_DTYPES.into_iter().for_each(|dtype| {
+            let lhs = upload_as(
+                &mut backend,
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                &[2, 3],
+                dtype,
+            );
+            let rhs = upload_as(
+                &mut backend,
+                &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                &[3, 2],
+                dtype,
+            );
+            let actual = matmul_to_f32(&mut backend, &lhs, &rhs);
+            assert_close(
+                &actual,
+                &[58.0, 64.0, 139.0, 154.0],
+                dtype,
+                "[2, 3] x [3, 2]",
+            );
+        });
+    }
+
+    #[test]
+    fn matmul_reads_transposed_right_operand_without_copy() {
+        let mut backend = backend();
+        FLOAT_DTYPES.into_iter().for_each(|dtype| {
+            let x = upload_as(
+                &mut backend,
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                &[2, 3],
+                dtype,
+            );
+            let weight_transposed = upload_as(
+                &mut backend,
+                &[1.0, 0.0, -1.0, 2.0, 1.0, 0.0],
+                &[2, 3],
+                dtype,
+            )
+            .permute(&[1, 0])
+            .expect("the permutation is valid");
+            assert!(
+                !weight_transposed.layout().is_contiguous()
+                    && is_matmul_ready(weight_transposed.layout()),
+                "a transposed weight is read in place"
+            );
+            let actual = matmul_to_f32(&mut backend, &x, &weight_transposed);
+            assert_close(&actual, &[-2.0, 4.0, -2.0, 13.0], dtype, "x . W^T");
+        });
+    }
+
+    #[test]
+    fn matmul_reads_transposed_left_operand_without_copy() {
+        let mut backend = backend();
+        FLOAT_DTYPES.into_iter().for_each(|dtype| {
+            let lhs = upload_as(
+                &mut backend,
+                &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0],
+                &[3, 2],
+                dtype,
+            )
+            .permute(&[1, 0])
+            .expect("the permutation is valid");
+            assert!(
+                is_matmul_ready(lhs.layout()),
+                "a transposed lhs is read in place"
+            );
+            let rhs = upload_as(
+                &mut backend,
+                &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                &[3, 2],
+                dtype,
+            );
+            let actual = matmul_to_f32(&mut backend, &lhs, &rhs);
+            assert_close(&actual, &[58.0, 64.0, 139.0, 154.0], dtype, "L^T x R");
+        });
+    }
+
+    #[test]
+    fn batched_matmul_matches_sum_of_products() {
+        let mut backend = backend();
+        let lhs_values = eighths(8 * 3 * 128, 7);
+        let rhs_values = eighths(8 * 128 * 5, 5);
+        let expected = reference_matmul(&lhs_values, &rhs_values, [3, 128, 5]);
+        [DType::F32, DType::BF16].into_iter().for_each(|dtype| {
+            let lhs = upload_as(&mut backend, &lhs_values, &[8, 3, 128], dtype);
+            let rhs = upload_as(&mut backend, &rhs_values, &[8, 128, 5], dtype);
+            let actual = matmul_to_f32(&mut backend, &lhs, &rhs);
+            assert_close(&actual, &expected, dtype, "[8, 3, 128] x [8, 128, 5]");
+        });
+    }
+
+    #[test]
+    fn matmul_spans_several_tiles() {
+        let mut backend = backend();
+        let lhs_values = eighths(37 * 20, 3);
+        let rhs_values = eighths(20 * 33, 11);
+        let expected = reference_matmul(&lhs_values, &rhs_values, [37, 20, 33]);
+        let lhs = upload_f32(&mut backend, &lhs_values, &[37, 20]);
+        let rhs = upload_f32(&mut backend, &rhs_values, &[20, 33]);
+        let actual = matmul_to_f32(&mut backend, &lhs, &rhs);
+        assert_close(&actual, &expected, DType::F32, "[37, 20] x [20, 33]");
+    }
+
+    #[test]
+    fn matmul_copies_operand_without_unit_stride() {
+        let mut backend = backend();
+        let rhs_contiguous: Vec<f32> = [
+            0_u16, 4, 8, 12, 16, 20, 1, 5, 9, 13, 17, 21, 2, 6, 10, 14, 18, 22, 3, 7, 11, 15, 19,
+            23,
+        ]
+        .into_iter()
+        .map(f32::from)
+        .collect();
+        let lhs_values = iota(16);
+        let expected = reference_matmul(&lhs_values, &rhs_contiguous, [2, 2, 3]);
+        FLOAT_DTYPES.into_iter().for_each(|dtype| {
+            let rhs = upload_as(&mut backend, &iota(24), &[2, 3, 4], dtype)
+                .permute(&[2, 0, 1])
+                .expect("the permutation is valid");
+            assert!(
+                !is_matmul_ready(rhs.layout()),
+                "strides (12, 4) on the last two axes need a copy"
+            );
+            let lhs = upload_as(&mut backend, &lhs_values, &[4, 2, 2], dtype);
+            let actual = matmul_to_f32(&mut backend, &lhs, &rhs);
+            assert_close(&actual, &expected, dtype, "[4, 2, 2] x permuted [4, 2, 3]");
+        });
+    }
+
+    #[test]
+    fn matmul_reads_permuted_batch_axes_in_place() {
+        let mut backend = backend();
+        let lhs = upload_f32(&mut backend, &iota(48), &[2, 3, 2, 4])
+            .permute(&[1, 0, 2, 3])
+            .expect("the permutation is valid");
+        let rhs = upload_f32(&mut backend, &iota(24), &[3, 2, 4, 1]);
+        let lhs_contiguous = lhs.contiguous(&mut backend).expect("the copy succeeds");
+        let expected = matmul_to_f32(&mut backend, &lhs_contiguous, &rhs);
+        let actual = matmul_to_f32(&mut backend, &lhs, &rhs);
+        assert_eq!(
+            actual, expected,
+            "permuted batch strides match the contiguous copy"
+        );
+    }
+
+    #[test]
+    fn matmul_with_empty_output_downloads_nothing() {
+        let mut backend = backend();
+        let lhs = upload_f32(&mut backend, &[], &[0, 3]);
+        let rhs = upload_f32(&mut backend, &iota(6), &[3, 2]);
+        let output = lhs.matmul(&mut backend, &rhs).expect("the matmul succeeds");
+        assert_eq!(output.shape().dims(), &[0, 2], "output shape is [m, n]");
+        assert!(
+            download_f32(&mut backend, &output).is_empty(),
+            "an empty matmul downloads no values"
         );
     }
 }
