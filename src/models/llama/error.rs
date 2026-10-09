@@ -1,9 +1,10 @@
-use tracing::error;
-
-use crate::core::CoreError;
+use crate::core::{
+    CoreError,
+    TensorError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum LlamaError {
+pub enum LlamaConfigError {
     #[error("Reading the config file failed.")]
     ConfigRead,
 
@@ -27,7 +28,10 @@ pub enum LlamaError {
 
     #[error("Word embeddings are not tied.")]
     UntiedEmbeddings,
+}
 
+#[derive(Debug, thiserror::Error)]
+pub enum LlamaError<E: std::error::Error + 'static> {
     #[error("Tensor is not in the weights.")]
     TensorNotFound,
 
@@ -59,10 +63,72 @@ pub enum LlamaError {
     CacheLayerCount,
 
     #[error("Tensor operation failed.")]
-    Tensor,
+    Tensor(#[from] TensorError<E>),
+
+    #[error(transparent)]
+    Validation(#[from] CoreError),
 }
 
-pub fn tensor_failed(error: CoreError) -> LlamaError {
-    error!(message = "Tensor operation failed.", %error);
-    LlamaError::Tensor
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use crate::backend::cpu::CpuError;
+    use crate::core::{
+        CoreError,
+        TensorError,
+    };
+    use crate::models::llama::LlamaError;
+
+    #[test]
+    fn model_propagation_preserves_tensor_and_backend_sources() {
+        fn propagate() -> Result<(), LlamaError<CpuError>> {
+            Err::<(), _>(TensorError::Backend {
+                operation: "upload",
+                source: CpuError::IndexOutOfStorage,
+            })?;
+            Ok(())
+        }
+
+        let error = propagate().expect_err("the backend failure propagates");
+        assert!(
+            matches!(
+                &error,
+                LlamaError::Tensor(TensorError::Backend {
+                    operation: "upload",
+                    source: CpuError::IndexOutOfStorage,
+                })
+            ),
+            "propagation retains the concrete backend error"
+        );
+        let tensor = error
+            .source()
+            .expect("the model failure has a tensor source");
+        assert!(
+            tensor.is::<TensorError<CpuError>>(),
+            "the intermediate error type is retained"
+        );
+        let backend = tensor
+            .source()
+            .expect("the tensor failure has a backend source");
+        assert_eq!(
+            backend.downcast_ref::<CpuError>(),
+            Some(&CpuError::IndexOutOfStorage),
+            "the original backend cause is available without tracing"
+        );
+    }
+
+    #[test]
+    fn model_propagation_preserves_direct_validation_failure() {
+        fn propagate() -> Result<(), LlamaError<CpuError>> {
+            Err::<(), _>(CoreError::AxisOutOfRange)?;
+            Ok(())
+        }
+
+        let error = propagate().expect_err("the validation failure propagates");
+        assert!(
+            matches!(error, LlamaError::Validation(CoreError::AxisOutOfRange)),
+            "pure validation failures do not become backend errors"
+        );
+    }
 }

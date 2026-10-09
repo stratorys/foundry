@@ -4,12 +4,11 @@ use tracing::error;
 
 use crate::core::{
     Backend,
-    CoreError,
     DType,
     Shape,
     Tensor,
+    TensorError,
 };
-use crate::models::llama::error::tensor_failed;
 use crate::models::llama::rope::{
     Llama3Rope,
     RopeAngles,
@@ -53,7 +52,7 @@ impl<B: Backend> Llama<B> {
         config: &LlamaConfig,
         weights: LlamaWeights<B>,
         seq_len_max: usize,
-    ) -> Result<Self, LlamaError> {
+    ) -> Result<Self, LlamaError<B::Error>> {
         let head_dim = config.head_dim();
         let rope = Llama3Rope::new(backend, config, seq_len_max)?;
         let head_dim_non_zero = NonZeroUsize::new(head_dim).ok_or_else(|| {
@@ -66,7 +65,7 @@ impl<B: Backend> Llama<B> {
         Ok(Self {
             weights,
             rope,
-            attention: Attention::new(backend, head_dim_non_zero).map_err(tensor_failed)?,
+            attention: Attention::new(backend, head_dim_non_zero)?,
             heads: config.num_attention_heads(),
             kv_heads: config.num_key_value_heads(),
             head_dim,
@@ -77,7 +76,7 @@ impl<B: Backend> Llama<B> {
     pub fn cache(
         &self,
         backend: &mut B,
-    ) -> Result<Vec<KvCache<B>>, LlamaError> {
+    ) -> Result<Vec<KvCache<B>>, LlamaError<B::Error>> {
         self.weights
             .layers()
             .iter()
@@ -90,8 +89,8 @@ impl<B: Backend> Llama<B> {
                     self.head_dim,
                 )
             })
-            .collect::<Result<Vec<KvCache<B>>, CoreError>>()
-            .map_err(tensor_failed)
+            .collect::<Result<Vec<KvCache<B>>, TensorError<B::Error>>>()
+            .map_err(LlamaError::from)
     }
 
     pub fn forward(
@@ -102,7 +101,7 @@ impl<B: Backend> Llama<B> {
         mask: &Tensor<B>,
         cache: &mut [KvCache<B>],
         position: usize,
-    ) -> Result<Tensor<B>, LlamaError> {
+    ) -> Result<Tensor<B>, LlamaError<B::Error>> {
         let seq_len = token_ids.shape().element_count();
         if seq_len == 0 {
             error!(message = "Forward input holds no token.");
@@ -130,14 +129,14 @@ impl<B: Backend> Llama<B> {
             return Err(LlamaError::CacheLayerCount);
         }
         let step = ForwardStep {
-            angles: self.rope.at(backend, positions).map_err(tensor_failed)?,
+            angles: self.rope.at(backend, positions)?,
             mask,
             position,
             seq_len,
             seq_len_total,
         };
         self.logits(backend, token_ids, cache, &step)
-            .map_err(tensor_failed)
+            .map_err(LlamaError::from)
     }
 
     fn logits(
@@ -146,7 +145,7 @@ impl<B: Backend> Llama<B> {
         token_ids: &Tensor<B>,
         cache: &mut [KvCache<B>],
         step: &ForwardStep<'_, B>,
-    ) -> Result<Tensor<B>, CoreError> {
+    ) -> Result<Tensor<B>, TensorError<B::Error>> {
         let embedded = self.weights.embedding().forward(backend, token_ids)?;
         let hidden = self.weights.layers().iter().zip(cache).try_fold(
             embedded,
@@ -158,7 +157,7 @@ impl<B: Backend> Llama<B> {
         let normed = self.weights.norm().forward(backend, &last)?;
         let logits = self.weights.lm_head().forward(backend, &normed)?;
         let vocab_size = logits.shape().element_count();
-        logits.reshape(Shape::try_from([vocab_size].as_slice())?)
+        Ok(logits.reshape(Shape::try_from([vocab_size].as_slice())?)?)
     }
 
     fn decoder_layer(
@@ -168,7 +167,7 @@ impl<B: Backend> Llama<B> {
         cache: &mut KvCache<B>,
         hidden: &Tensor<B>,
         step: &ForwardStep<'_, B>,
-    ) -> Result<Tensor<B>, CoreError> {
+    ) -> Result<Tensor<B>, TensorError<B::Error>> {
         let normed = layer.input_norm().forward(backend, hidden)?;
         let query_shape = Shape::try_from([step.seq_len, self.heads, self.head_dim].as_slice())?;
         let kv_shape = Shape::try_from([step.seq_len, self.kv_heads, self.head_dim].as_slice())?;

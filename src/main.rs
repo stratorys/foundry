@@ -17,7 +17,7 @@ use clap::{
 };
 use foundry::models::llama::{
     LlamaConfig,
-    LlamaError,
+    LlamaConfigError,
 };
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
@@ -255,7 +255,7 @@ fn summarize_weights<S: AsRef<[u8]>>(
 fn load_architecture(directory: &Path) -> Result<Option<LlamaConfig>, CliError> {
     match LlamaConfig::open(directory) {
         Ok(config) => Ok(Some(config)),
-        Err(LlamaError::ModelType) => {
+        Err(LlamaConfigError::ModelType) => {
             warn!(message = "Model type is not supported; architecture is skipped.");
             Ok(None)
         }

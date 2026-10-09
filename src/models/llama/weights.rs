@@ -5,7 +5,6 @@ use crate::core::{
     DType,
     Tensor,
 };
-use crate::models::llama::error::tensor_failed;
 use crate::models::llama::{
     LlamaConfig,
     LlamaError,
@@ -49,7 +48,7 @@ impl<B: Backend> LlamaWeights<B> {
         backend: &mut B,
         config: &LlamaConfig,
         weights: &Weights<S>,
-    ) -> Result<Self, LlamaError> {
+    ) -> Result<Self, LlamaError<B::Error>> {
         let kv_heads = config.num_key_value_heads();
         let head_dim = config.head_dim();
         let kv_dim = kv_heads.checked_mul(head_dim).ok_or_else(|| {
@@ -70,7 +69,7 @@ impl<B: Backend> LlamaWeights<B> {
         )?;
         let layers = (0..config.num_hidden_layers())
             .map(|index| loader.layer(config, index, kv_dim))
-            .collect::<Result<Vec<LlamaLayerWeights<B>>, LlamaError>>()?;
+            .collect::<Result<Vec<LlamaLayerWeights<B>>, LlamaError<B::Error>>>()?;
         let norm = loader.rms_norm("model.norm.weight", config)?;
         Ok(Self {
             embedding: Embedding::new(embed_tokens.clone()),
@@ -114,7 +113,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         config: &LlamaConfig,
         index: usize,
         kv_dim: usize,
-    ) -> Result<LlamaLayerWeights<B>, LlamaError> {
+    ) -> Result<LlamaLayerWeights<B>, LlamaError<B::Error>> {
         let hidden = config.hidden_size();
         let intermediate = config.intermediate_size();
         let prefix = format!("model.layers.{index}");
@@ -149,7 +148,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
             &format!("{prefix}.mlp.down_proj.weight"),
             [hidden, intermediate],
         )?;
-        let mlp = SwigluMlp::new(self.backend, gate, up, down).map_err(tensor_failed)?;
+        let mlp = SwigluMlp::new(self.backend, gate, up, down)?;
         Ok(LlamaLayerWeights {
             input_norm,
             q_proj,
@@ -165,7 +164,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         &mut self,
         name: &str,
         dims_expected: [usize; 2],
-    ) -> Result<Linear<B>, LlamaError> {
+    ) -> Result<Linear<B>, LlamaError<B::Error>> {
         Ok(Linear::new(self.tensor(name, &dims_expected)?))
     }
 
@@ -173,16 +172,16 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         &mut self,
         name: &str,
         config: &LlamaConfig,
-    ) -> Result<RmsNorm<B>, LlamaError> {
+    ) -> Result<RmsNorm<B>, LlamaError<B::Error>> {
         let weight = self.tensor(name, &[config.hidden_size()])?;
-        RmsNorm::new(self.backend, weight, config.rms_norm_eps()).map_err(tensor_failed)
+        RmsNorm::new(self.backend, weight, config.rms_norm_eps()).map_err(LlamaError::from)
     }
 
     fn tensor(
         &mut self,
         name: &str,
         dims_expected: &[usize],
-    ) -> Result<Tensor<B>, LlamaError> {
+    ) -> Result<Tensor<B>, LlamaError<B::Error>> {
         let view = self.weights.get(name).ok_or_else(|| {
             error!(message = "Tensor is not in the weights.", name);
             LlamaError::TensorNotFound
@@ -205,8 +204,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
             );
             return Err(LlamaError::TensorShapeMismatch);
         }
-        let tensor = Tensor::upload(self.backend, view.bytes, view.dtype, view.shape)
-            .map_err(tensor_failed)?;
+        let tensor = Tensor::upload(self.backend, view.bytes, view.dtype, view.shape)?;
         self.bytes_uploaded = self
             .bytes_uploaded
             .checked_add(view.bytes.len())

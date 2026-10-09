@@ -1095,6 +1095,7 @@ mod tests {
 
     use crate::backend::metal::{
         MetalBackend,
+        MetalError,
         is_matmul_ready,
     };
     use crate::core::primitive::matmul_rule;
@@ -1103,6 +1104,7 @@ mod tests {
         DType,
         Shape,
         Tensor,
+        TensorError,
     };
 
     #[test]
@@ -1265,9 +1267,11 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
         );
-        assert_eq!(
-            result.err(),
-            Some(CoreError::ByteLengthMismatch),
+        assert!(
+            matches!(
+                result.err(),
+                Some(TensorError::Validation(CoreError::ByteLengthMismatch))
+            ),
             "a byte length that does not match shape × dtype is rejected"
         );
     }
@@ -1281,9 +1285,11 @@ mod tests {
             DType::F32,
             Shape::try_from([(1 << 31) - 1].as_slice()).expect("the shape is valid"),
         );
-        assert_eq!(
-            result.err(),
-            Some(CoreError::ByteLengthMismatch),
+        assert!(
+            matches!(
+                result.err(),
+                Some(TensorError::Validation(CoreError::ByteLengthMismatch))
+            ),
             "the byte length is checked before allocation"
         );
     }
@@ -1324,9 +1330,11 @@ mod tests {
         .expect("the upload succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid");
-        assert_eq!(
-            permuted.download(&mut backend).err(),
-            Some(CoreError::DownloadNonContiguous),
+        assert!(
+            matches!(
+                permuted.download(&mut backend).err(),
+                Some(TensorError::Validation(CoreError::DownloadNonContiguous))
+            ),
             "a non-contiguous layout cannot be downloaded"
         );
     }
@@ -1973,9 +1981,11 @@ mod tests {
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
         .expect("the upload succeeds");
-        assert_eq!(
-            indices.add(&mut backend, &indices).err(),
-            Some(CoreError::DTypeNotFloat),
+        assert!(
+            matches!(
+                indices.add(&mut backend, &indices).err(),
+                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+            ),
             "binary ops reject u32 on Metal"
         );
     }
@@ -2396,9 +2406,11 @@ mod tests {
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
         .expect("the upload succeeds");
-        assert_eq!(
-            indices.sum(&mut backend, 0).err(),
-            Some(CoreError::DTypeNotFloat),
+        assert!(
+            matches!(
+                indices.sum(&mut backend, 0).err(),
+                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+            ),
             "reductions reject u32 on Metal"
         );
     }
@@ -3633,9 +3645,11 @@ mod tests {
             Shape::try_from([3, 1].as_slice()).expect("the shape is valid"),
         )
         .expect("the upload succeeds");
-        assert_eq!(
-            target.slice_update(&mut backend, &update, 1, 0),
-            Err(CoreError::SliceUpdateNonContiguous),
+        assert!(
+            matches!(
+                target.slice_update(&mut backend, &update, 1, 0),
+                Err(TensorError::Validation(CoreError::SliceUpdateNonContiguous))
+            ),
             "a broadcast target would be written by several threads"
         );
     }
@@ -3654,9 +3668,11 @@ mod tests {
         .expect("the upload succeeds");
         let update = target.narrow(1, 0, 1).expect("the narrow is valid");
         let result = target.slice_update(&mut backend, &update, 1, 3);
-        assert_eq!(
-            result.err(),
-            Some(CoreError::SharedStorage),
+        assert!(
+            matches!(
+                result.err(),
+                Some(TensorError::Validation(CoreError::SharedStorage))
+            ),
             "an update aliasing the target is rejected"
         );
     }
@@ -3697,9 +3713,11 @@ mod tests {
         );
         let view = target.narrow(0, 0, 1).expect("the narrow is valid");
         let result = target.slice_update(&mut backend, &update, 1, 3);
-        assert_eq!(
-            result.err(),
-            Some(CoreError::SharedStorage),
+        assert!(
+            matches!(
+                result.err(),
+                Some(TensorError::Validation(CoreError::SharedStorage))
+            ),
             "a live view would observe the write"
         );
         assert_eq!(view.shape().dims(), &[1, 4], "the view is still alive");
@@ -3764,9 +3782,14 @@ mod tests {
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
         let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("the upload succeeds");
-        assert_eq!(
-            tensor.download(&mut consumer).err(),
-            Some(CoreError::Backend),
+        assert!(
+            matches!(
+                tensor.download(&mut consumer).err(),
+                Some(TensorError::Backend {
+                    operation: "download",
+                    source: MetalError::ForeignStorage
+                })
+            ),
             "a storage from another backend cannot be downloaded"
         );
     }
@@ -3778,9 +3801,14 @@ mod tests {
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
         let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("the upload succeeds");
-        assert_eq!(
-            tensor.neg(&mut consumer).err(),
-            Some(CoreError::Backend),
+        assert!(
+            matches!(
+                tensor.neg(&mut consumer).err(),
+                Some(TensorError::Backend {
+                    operation: "unary",
+                    source: MetalError::ForeignStorage
+                })
+            ),
             "a storage from another backend cannot be read by a kernel"
         );
     }
@@ -3801,9 +3829,14 @@ mod tests {
             Shape::try_from(&[2_usize, 1][..]).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        assert_eq!(
-            target.slice_update(&mut consumer, &update, 1, 0),
-            Err(CoreError::Backend),
+        assert!(
+            matches!(
+                target.slice_update(&mut consumer, &update, 1, 0),
+                Err(TensorError::Backend {
+                    operation: "slice_update",
+                    source: MetalError::ForeignStorage
+                })
+            ),
             "a target from another backend cannot be written"
         );
     }
@@ -3842,14 +3875,18 @@ mod tests {
                 .expect("the upload succeeds")
             },
         );
-        assert_eq!(
-            values.gather(&mut backend, &indices).err(),
-            Some(CoreError::DTypeNotFloat),
+        assert!(
+            matches!(
+                values.gather(&mut backend, &indices).err(),
+                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+            ),
             "gather rejects a u32 table on Metal"
         );
-        assert_eq!(
-            values.concat(&mut backend, &values, 0).err(),
-            Some(CoreError::DTypeNotFloat),
+        assert!(
+            matches!(
+                values.concat(&mut backend, &values, 0).err(),
+                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+            ),
             "concat rejects u32 on Metal"
         );
     }

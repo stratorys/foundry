@@ -77,7 +77,19 @@ pub enum CoreError {
 
     #[error("Keys and values do not have the same shape.")]
     KvIncompatible,
+}
 
-    #[error("Backend primitive failed.")]
-    Backend,
+/// A validation failure or a concrete backend failure during a tensor
+/// operation.
+#[derive(Debug, thiserror::Error)]
+pub enum TensorError<E: std::error::Error + 'static> {
+    #[error(transparent)]
+    Validation(#[from] CoreError),
+
+    #[error("Backend operation `{operation}` failed.")]
+    Backend {
+        operation: &'static str,
+        #[source]
+        source: E,
+    },
 }

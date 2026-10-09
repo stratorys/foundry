@@ -1,9 +1,9 @@
 use crate::core::{
     Backend,
-    CoreError,
     DType,
     Shape,
     Tensor,
+    TensorError,
     exact_f32,
 };
 
@@ -18,7 +18,7 @@ impl<B: Backend> RmsNorm<B> {
         backend: &mut B,
         weight: Tensor<B>,
         eps: f32,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError<B::Error>> {
         let dim_f32 = exact_f32(weight.shape().element_count())?;
         let scalar_shape = Shape::try_from([1].as_slice())?;
         Ok(Self {
@@ -37,7 +37,7 @@ impl<B: Backend> RmsNorm<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, CoreError> {
+    ) -> Result<Tensor<B>, TensorError<B::Error>> {
         let axis = x.shape().last_axis()?;
         let x_f32 = x.cast(backend, DType::F32)?;
         let scale = x_f32

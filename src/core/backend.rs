@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::error::Error;
 
 use crate::core::primitive::{
     BinaryOp,
@@ -17,7 +17,7 @@ use crate::core::{
 
 pub trait Backend {
     type Storage;
-    type Error: Display;
+    type Error: Error + 'static;
 
     fn upload(
         &mut self,

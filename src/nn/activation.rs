@@ -1,9 +1,9 @@
 use crate::core::{
     Backend,
-    CoreError,
     DType,
     Shape,
     Tensor,
+    TensorError,
 };
 
 pub struct Silu<B: Backend> {
@@ -11,7 +11,7 @@ pub struct Silu<B: Backend> {
 }
 
 impl<B: Backend> Silu<B> {
-    pub fn new(backend: &mut B) -> Result<Self, CoreError> {
+    pub fn new(backend: &mut B) -> Result<Self, TensorError<B::Error>> {
         Ok(Self {
             one: Tensor::upload(
                 backend,
@@ -26,7 +26,7 @@ impl<B: Backend> Silu<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, CoreError> {
+    ) -> Result<Tensor<B>, TensorError<B::Error>> {
         let x_f32 = x.cast(backend, DType::F32)?;
         let denominator = x_f32.neg(backend)?.exp(backend)?.add(backend, &self.one)?;
         x_f32.div(backend, &denominator)?.cast(backend, x.dtype())
@@ -36,7 +36,7 @@ impl<B: Backend> Silu<B> {
 pub fn softmax_last_axis<B: Backend>(
     backend: &mut B,
     x: &Tensor<B>,
-) -> Result<Tensor<B>, CoreError> {
+) -> Result<Tensor<B>, TensorError<B::Error>> {
     let axis = x.shape().last_axis()?;
     let x_f32 = x.cast(backend, DType::F32)?;
     let row_max = x_f32.max(backend, axis)?;

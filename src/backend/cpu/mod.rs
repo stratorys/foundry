@@ -559,6 +559,7 @@ mod tests {
         DType,
         Shape,
         Tensor,
+        TensorError,
     };
 
     #[test]
@@ -624,15 +625,17 @@ mod tests {
     #[test]
     fn upload_with_wrong_byte_length_is_rejected() {
         let mut backend = CpuBackend::new();
-        assert_eq!(
-            Tensor::upload(
-                &mut backend,
-                &[0; 6],
-                DType::F32,
-                Shape::try_from([2].as_slice()).expect("the shape is valid"),
-            )
-            .err(),
-            Some(CoreError::ByteLengthMismatch),
+        assert!(
+            matches!(
+                Tensor::upload(
+                    &mut backend,
+                    &[0; 6],
+                    DType::F32,
+                    Shape::try_from([2].as_slice()).expect("the shape is valid"),
+                )
+                .err(),
+                Some(TensorError::Validation(CoreError::ByteLengthMismatch))
+            ),
             "six bytes for two f32 are rejected"
         );
     }
@@ -648,9 +651,11 @@ mod tests {
         .expect("the zeros succeed")
         .permute(&[1, 0])
         .expect("the permutation is valid");
-        assert_eq!(
-            tensor.download(&mut backend).err(),
-            Some(CoreError::DownloadNonContiguous),
+        assert!(
+            matches!(
+                tensor.download(&mut backend).err(),
+                Some(TensorError::Validation(CoreError::DownloadNonContiguous))
+            ),
             "a permuted view is not downloaded"
         );
     }
@@ -1035,9 +1040,11 @@ mod tests {
             Shape::try_from([2].as_slice()).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        assert_eq!(
-            tensor.add(&mut backend, &tensor).err(),
-            Some(CoreError::DTypeNotFloat),
+        assert!(
+            matches!(
+                tensor.add(&mut backend, &tensor).err(),
+                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+            ),
             "add rejects u32"
         );
     }
@@ -1426,9 +1433,11 @@ mod tests {
             Shape::try_from([2].as_slice()).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        assert_eq!(
-            tensor.concat(&mut backend, &tensor, 0).err(),
-            Some(CoreError::DTypeNotFloat),
+        assert!(
+            matches!(
+                tensor.concat(&mut backend, &tensor, 0).err(),
+                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+            ),
             "concat rejects u32"
         );
     }

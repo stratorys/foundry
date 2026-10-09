@@ -333,9 +333,8 @@ fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
         .expect("the config is valid");
 
     let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
-    assert_eq!(
-        result.err(),
-        Some(LlamaError::TensorShapeMismatch),
+    assert!(
+        matches!(result.err(), Some(LlamaError::TensorShapeMismatch)),
         "k_proj of shape [4, 4] where the config expects [2, 4] is rejected"
     );
 }
@@ -490,9 +489,8 @@ fn llama_weights_reject_a_non_bf16_tensor() {
         .expect("the config is valid");
 
     let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
-    assert_eq!(
-        result.err(),
-        Some(LlamaError::TensorDTypeMismatch),
+    assert!(
+        matches!(result.err(), Some(LlamaError::TensorDTypeMismatch)),
         "an f32 model.norm.weight is rejected"
     );
 }
@@ -638,9 +636,8 @@ fn llama_weights_reject_a_missing_tensor() {
         .expect("the config is valid");
 
     let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
-    assert_eq!(
-        result.err(),
-        Some(LlamaError::TensorNotFound),
+    assert!(
+        matches!(result.err(), Some(LlamaError::TensorNotFound)),
         "a missing model.norm.weight is rejected"
     );
 }

@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::Deserialize;
 use tracing::error;
 
-use crate::models::llama::LlamaError;
+use crate::models::llama::LlamaConfigError;
 
 const CONFIG_FILE: &str = "config.json";
 const CONFIG_BYTES_MAX: u64 = 1024 * 1024;
@@ -84,7 +84,7 @@ impl From<EosTokenIds> for Vec<u32> {
 }
 
 impl LlamaConfig {
-    pub fn open(directory: &Path) -> Result<Self, LlamaError> {
+    pub fn open(directory: &Path) -> Result<Self, LlamaConfigError> {
         let path = directory.join(CONFIG_FILE);
         let read_error = |error| {
             error!(
@@ -92,7 +92,7 @@ impl LlamaConfig {
                 path = %path.display(),
                 %error,
             );
-            LlamaError::ConfigRead
+            LlamaConfigError::ConfigRead
         };
         let bytes = fs::metadata(&path).map_err(read_error)?.len();
         if bytes > CONFIG_BYTES_MAX {
@@ -102,13 +102,13 @@ impl LlamaConfig {
                 bytes,
                 bytes_max = CONFIG_BYTES_MAX,
             );
-            return Err(LlamaError::ConfigTooLarge);
+            return Err(LlamaConfigError::ConfigTooLarge);
         }
         let json = fs::read(&path).map_err(read_error)?;
         Self::parse(&json)
     }
 
-    pub fn parse(json: &[u8]) -> Result<Self, LlamaError> {
+    pub fn parse(json: &[u8]) -> Result<Self, LlamaConfigError> {
         let ModelTypeFile {
             model_type,
         } = serde_json::from_slice(json).map_err(config_json_error)?;
@@ -143,7 +143,7 @@ impl LlamaConfig {
 }
 
 impl TryFrom<ConfigFile> for LlamaConfig {
-    type Error = LlamaError;
+    type Error = LlamaConfigError;
 
     fn try_from(file: ConfigFile) -> Result<Self, Self::Error> {
         check_model_type(&file.model_type)?;
@@ -154,7 +154,7 @@ impl TryFrom<ConfigFile> for LlamaConfig {
                 num_attention_heads = file.num_attention_heads,
                 head_dim = file.head_dim,
             );
-            return Err(LlamaError::HiddenSizeMismatch);
+            return Err(LlamaConfigError::HiddenSizeMismatch);
         }
         if file
             .num_attention_heads
@@ -166,18 +166,18 @@ impl TryFrom<ConfigFile> for LlamaConfig {
                 num_attention_heads = file.num_attention_heads,
                 num_key_value_heads = file.num_key_value_heads,
             );
-            return Err(LlamaError::HeadRatio);
+            return Err(LlamaConfigError::HeadRatio);
         }
         if file.rope_scaling.rope_type != ROPE_TYPE {
             error!(
                 message = "RoPE type is not llama3.",
                 rope_type = file.rope_scaling.rope_type,
             );
-            return Err(LlamaError::RopeType);
+            return Err(LlamaConfigError::RopeType);
         }
         if !file.tie_word_embeddings {
             error!(message = "Word embeddings are not tied.");
-            return Err(LlamaError::UntiedEmbeddings);
+            return Err(LlamaConfigError::UntiedEmbeddings);
         }
         Ok(Self {
             hidden_size: file.hidden_size,
@@ -203,17 +203,17 @@ impl TryFrom<ConfigFile> for LlamaConfig {
     }
 }
 
-fn config_json_error(error: serde_json::Error) -> LlamaError {
+fn config_json_error(error: serde_json::Error) -> LlamaConfigError {
     error!(message = "Config is not valid JSON or misses a field.", %error);
-    LlamaError::ConfigJson
+    LlamaConfigError::ConfigJson
 }
 
-fn check_model_type(model_type: &str) -> Result<(), LlamaError> {
+fn check_model_type(model_type: &str) -> Result<(), LlamaConfigError> {
     if model_type == MODEL_TYPE {
         Ok(())
     } else {
         error!(message = "Model type is not llama.", model_type);
-        Err(LlamaError::ModelType)
+        Err(LlamaConfigError::ModelType)
     }
 }
 
@@ -227,7 +227,7 @@ mod tests {
     use crate::models::llama::{
         Llama3RopeScaling,
         LlamaConfig,
-        LlamaError,
+        LlamaConfigError,
     };
 
     fn instruct_config() -> Value {
@@ -279,7 +279,7 @@ mod tests {
         config
     }
 
-    fn parse(config: &Value) -> Result<LlamaConfig, LlamaError> {
+    fn parse(config: &Value) -> Result<LlamaConfig, LlamaConfigError> {
         LlamaConfig::parse(&serde_json::to_vec(config).expect("the config serializes"))
     }
 
@@ -323,7 +323,11 @@ mod tests {
     #[test]
     fn other_model_type_is_rejected_before_missing_fields() {
         let result = parse(&json!({ "model_type": "qwen3", "hidden_size": 1024 }));
-        assert_eq!(result, Err(LlamaError::ModelType), "the config is rejected");
+        assert_eq!(
+            result,
+            Err(LlamaConfigError::ModelType),
+            "the config is rejected"
+        );
     }
 
     #[test]
@@ -331,7 +335,7 @@ mod tests {
         let result = parse(&with(instruct_config(), "hidden_size", json!(3000)));
         assert_eq!(
             result,
-            Err(LlamaError::HiddenSizeMismatch),
+            Err(LlamaConfigError::HiddenSizeMismatch),
             "the config is rejected"
         );
     }
@@ -339,13 +343,21 @@ mod tests {
     #[test]
     fn heads_not_a_multiple_of_key_value_heads_are_rejected() {
         let result = parse(&with(instruct_config(), "num_key_value_heads", json!(7)));
-        assert_eq!(result, Err(LlamaError::HeadRatio), "the config is rejected");
+        assert_eq!(
+            result,
+            Err(LlamaConfigError::HeadRatio),
+            "the config is rejected"
+        );
     }
 
     #[test]
     fn zero_key_value_heads_are_rejected() {
         let result = parse(&with(instruct_config(), "num_key_value_heads", json!(0)));
-        assert_eq!(result, Err(LlamaError::HeadRatio), "the config is rejected");
+        assert_eq!(
+            result,
+            Err(LlamaConfigError::HeadRatio),
+            "the config is rejected"
+        );
     }
 
     #[test]
@@ -358,7 +370,11 @@ mod tests {
             "rope_type": "default"
         });
         let result = parse(&with(instruct_config(), "rope_scaling", rope_scaling));
-        assert_eq!(result, Err(LlamaError::RopeType), "the config is rejected");
+        assert_eq!(
+            result,
+            Err(LlamaConfigError::RopeType),
+            "the config is rejected"
+        );
     }
 
     #[test]
@@ -370,7 +386,7 @@ mod tests {
         ));
         assert_eq!(
             result,
-            Err(LlamaError::UntiedEmbeddings),
+            Err(LlamaConfigError::UntiedEmbeddings),
             "the config is rejected"
         );
     }
@@ -385,7 +401,7 @@ mod tests {
         let result = parse(&config);
         assert_eq!(
             result,
-            Err(LlamaError::ConfigJson),
+            Err(LlamaConfigError::ConfigJson),
             "the config is rejected"
         );
     }

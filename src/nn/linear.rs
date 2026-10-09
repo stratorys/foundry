@@ -1,7 +1,7 @@
 use crate::core::{
     Backend,
-    CoreError,
     Tensor,
+    TensorError,
 };
 
 pub struct Linear<B: Backend> {
@@ -19,7 +19,7 @@ impl<B: Backend> Linear<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, CoreError> {
+    ) -> Result<Tensor<B>, TensorError<B::Error>> {
         x.matmul(backend, &self.weight.permute(&[1, 0])?)
     }
 }
@@ -39,7 +39,7 @@ impl<B: Backend> Embedding<B> {
         &self,
         backend: &mut B,
         token_ids: &Tensor<B>,
-    ) -> Result<Tensor<B>, CoreError> {
+    ) -> Result<Tensor<B>, TensorError<B::Error>> {
         self.table.gather(backend, token_ids)
     }
 }

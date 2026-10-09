@@ -6,6 +6,7 @@ use crate::core::{
     DType,
     Shape,
     Tensor,
+    TensorError,
 };
 
 const SEQ_AXIS: usize = 1;
@@ -22,7 +23,7 @@ impl<B: Backend> KvCache<B> {
         kv_heads: usize,
         seq_len_max: usize,
         head_dim: usize,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError<B::Error>> {
         let shape = Shape::try_from([kv_heads, seq_len_max, head_dim].as_slice())?;
         Ok(Self {
             keys: Tensor::zeros(backend, dtype, shape)?,
@@ -36,14 +37,14 @@ impl<B: Backend> KvCache<B> {
         keys: &Tensor<B>,
         values: &Tensor<B>,
         position: usize,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), TensorError<B::Error>> {
         if keys.shape() != values.shape() {
             error!(
                 message = "Keys and values do not have the same shape.",
                 keys = ?keys.shape().dims(),
                 values = ?values.shape().dims(),
             );
-            return Err(CoreError::KvIncompatible);
+            return Err(CoreError::KvIncompatible.into());
         }
         if keys.dtype() != values.dtype() {
             error!(
@@ -51,7 +52,7 @@ impl<B: Backend> KvCache<B> {
                 keys = ?keys.dtype(),
                 values = ?values.dtype(),
             );
-            return Err(CoreError::DTypeMismatch);
+            return Err(CoreError::DTypeMismatch.into());
         }
         self.keys.slice_update(backend, keys, SEQ_AXIS, position)?;
         self.values

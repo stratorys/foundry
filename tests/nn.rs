@@ -6,6 +6,7 @@ use foundry::core::{
     DType,
     Shape,
     Tensor,
+    TensorError,
 };
 use foundry::nn::{
     Attention,
@@ -164,9 +165,11 @@ fn rms_norm_rejects_a_dimension_beyond_u16() {
         Shape::try_from([65_536].as_slice()).expect("the shape is valid"),
     )
     .expect("the zeros succeed");
-    assert_eq!(
-        RmsNorm::new(&mut backend, weight, 1e-5).err(),
-        Some(CoreError::DimensionTooLargeForF32),
+    assert!(
+        matches!(
+            RmsNorm::new(&mut backend, weight, 1e-5).err(),
+            Some(TensorError::Validation(CoreError::DimensionTooLargeForF32))
+        ),
         "a dimension above u16::MAX is rejected"
     );
 }
@@ -334,9 +337,11 @@ fn kv_cache_update_beyond_capacity_is_rejected() {
         .expect("the zeros succeed")
     });
     let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 2, 2).expect("the cache is built");
-    assert_eq!(
-        cache.update(&mut backend, &key, &value, 0),
-        Err(CoreError::SliceUpdateOutOfBounds),
+    assert!(
+        matches!(
+            cache.update(&mut backend, &key, &value, 0),
+            Err(TensorError::Validation(CoreError::SliceUpdateOutOfBounds))
+        ),
         "writing three positions to a cache of two is rejected"
     );
 }
@@ -353,9 +358,11 @@ fn kv_cache_update_rejects_keys_and_values_of_different_shapes() {
         .expect("the zeros succeed")
     });
     let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
-    assert_eq!(
-        cache.update(&mut backend, &key, &value, 0),
-        Err(CoreError::KvIncompatible),
+    assert!(
+        matches!(
+            cache.update(&mut backend, &key, &value, 0),
+            Err(TensorError::Validation(CoreError::KvIncompatible))
+        ),
         "keys of two positions with values of one position are rejected"
     );
 }
@@ -640,11 +647,13 @@ fn attention_rejects_a_head_dim_other_than_its_own() {
         NonZeroUsize::new(4).expect("the head dim is non-zero"),
     )
     .expect("the attention is built");
-    assert_eq!(
-        attention
-            .forward(&mut backend, &query, &cache, 2, &mask)
-            .err(),
-        Some(CoreError::AttentionHeadDimMismatch),
+    assert!(
+        matches!(
+            attention
+                .forward(&mut backend, &query, &cache, 2, &mask)
+                .err(),
+            Some(TensorError::Validation(CoreError::AttentionHeadDimMismatch))
+        ),
         "a head dim of 2 is rejected by an attention built for 4"
     );
 }

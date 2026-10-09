@@ -8,6 +8,7 @@ use crate::core::{
     DType,
     Shape,
     Tensor,
+    TensorError,
     exact_f32,
 };
 use crate::nn::{
@@ -36,7 +37,7 @@ impl<B: Backend> Attention<B> {
     pub fn new(
         backend: &mut B,
         head_dim: NonZeroUsize,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError<B::Error>> {
         let head_dim_f32 = exact_f32(head_dim.get())?;
         Ok(Self {
             head_dim,
@@ -56,7 +57,7 @@ impl<B: Backend> Attention<B> {
         cache: &KvCache<B>,
         seq_len_total: usize,
         mask: &Tensor<B>,
-    ) -> Result<Tensor<B>, CoreError> {
+    ) -> Result<Tensor<B>, TensorError<B::Error>> {
         let keys = &cache.keys().narrow(SEQ_AXIS, 0, seq_len_total)?;
         let values = &cache.values().narrow(SEQ_AXIS, 0, seq_len_total)?;
         let AttentionDims {
@@ -80,7 +81,7 @@ impl<B: Backend> Attention<B> {
             .cast(backend, DType::F32)?
             .mul(backend, &self.scale)?
             .add(backend, &mask_f32)?;
-        softmax_last_axis(backend, &scores)?
+        Ok(softmax_last_axis(backend, &scores)?
             .cast(backend, query.dtype())?
             .reshape(Shape::try_from([kv_heads, rows, seq_len_total].as_slice())?)?
             .matmul(backend, values)?
@@ -89,7 +90,7 @@ impl<B: Backend> Attention<B> {
             .contiguous(backend)?
             .reshape(Shape::try_from(
                 [seq_len, heads.saturating_mul(head_dim)].as_slice(),
-            )?)
+            )?)?)
     }
 }
 

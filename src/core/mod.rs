@@ -13,7 +13,10 @@ pub use self::dtype::{
     FloatDType,
     exact_f32,
 };
-pub use self::error::CoreError;
+pub use self::error::{
+    CoreError,
+    TensorError,
+};
 pub use self::layout::Layout;
 pub use self::shape::{
     RANK_MAX,
