@@ -20,6 +20,7 @@ use crate::core::{
     DType,
     Layout,
     Operand,
+    OperandMut,
     Shape,
 };
 
@@ -244,7 +245,16 @@ impl<B: Backend> Tensor<B> {
             axis,
             start,
         )?;
-        backend.slice_update(self.operand(), update.operand(), axis, start)
+        if !self.layout.is_contiguous() {
+            return Err(CoreError::SliceUpdateNonContiguous.into());
+        }
+        let storage = Rc::get_mut(&mut self.storage).ok_or(CoreError::SharedStorage)?;
+        backend.slice_update(
+            OperandMut::new(storage, &self.layout, self.dtype),
+            update.operand(),
+            axis,
+            start,
+        )
     }
 
     fn unary(
@@ -304,11 +314,7 @@ impl<B: Backend> Tensor<B> {
     }
 
     fn operand(&self) -> Operand<'_, B::Storage> {
-        Operand {
-            storage: &self.storage,
-            layout: &self.layout,
-            dtype: self.dtype,
-        }
+        Operand::new(&self.storage, &self.layout, self.dtype)
     }
 }
 

@@ -66,6 +66,15 @@ pub fn reduce_rule(
         ReduceOp::Sum | ReduceOp::Max => dtype,
         ReduceOp::Argmax => DType::U32,
     };
+    let axis_len = dim(shape, axis)?;
+    let needs_element = matches!(op, ReduceOp::Max | ReduceOp::Argmax);
+    if needs_element && axis_len == 0 {
+        return Err(CoreError::EmptyReduction {
+            op,
+            axis,
+            dims: shape.dims().to_vec(),
+        });
+    }
     Ok((dtype_output, with_dim(shape, axis, 1)?))
 }
 
@@ -365,7 +374,16 @@ mod tests {
             .into_iter()
             .for_each(|op| {
                 let result = reduce_rule(op, DType::F32, &shape(&[2, 0]), 1);
-                assert!(result.is_err(), "{op:?} got {result:?}");
+                assert!(
+                    matches!(
+                        result,
+                        Err(CoreError::EmptyReduction {
+                            axis: 1,
+                            ..
+                        })
+                    ),
+                    "{op:?} got {result:?}"
+                );
             });
     }
 

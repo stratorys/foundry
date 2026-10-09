@@ -1,4 +1,5 @@
 use crate::core::DType;
+use crate::core::primitive::ReduceOp;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -79,4 +80,17 @@ pub enum CoreError {
         target: Vec<usize>,
         update: Vec<usize>,
     },
+
+    #[error("Reduction {op:?} over empty axis {axis} of shape {dims:?} has no result.")]
+    EmptyReduction {
+        op: ReduceOp,
+        axis: usize,
+        dims: Vec<usize>,
+    },
+
+    #[error("Slice update target shares its storage with another tensor.")]
+    SharedStorage,
+
+    #[error("Slice update requires a contiguous target layout.")]
+    SliceUpdateNonContiguous,
 }

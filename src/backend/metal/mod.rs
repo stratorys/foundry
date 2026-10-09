@@ -42,6 +42,7 @@ use crate::core::{
     DType,
     Layout,
     Operand,
+    OperandMut,
     RANK_MAX,
     Shape,
 };
@@ -82,6 +83,12 @@ pub struct MetalBackend {
     library: Library,
     pipelines: HashMap<&'static str, Pipeline>,
     pending: Option<CommandBuffer>,
+}
+
+struct BufferView<'buffer> {
+    storage: &'buffer MetalStorage,
+    layout: &'buffer Layout,
+    dtype: DType,
 }
 
 #[repr(C)]
@@ -130,44 +137,51 @@ struct GatherArgs {
     indices: StridedArgs,
 }
 
+impl<'buffer> From<&Operand<'buffer, MetalStorage>> for BufferView<'buffer> {
+    fn from(operand: &Operand<'buffer, MetalStorage>) -> Self {
+        Self {
+            storage: operand.storage(),
+            layout: operand.layout(),
+            dtype: operand.dtype(),
+        }
+    }
+}
+
 impl StridedArgs {
-    fn new(input: &Operand<'_, MetalStorage>) -> Result<Self, MetalError> {
-        Self::with_shape(input, input.layout.shape())
+    fn new(input: &BufferView<'_>) -> Result<Self, MetalError> {
+        Self::with_shape(input.layout, input.layout.shape())
     }
 
     fn with_shape(
-        input: &Operand<'_, MetalStorage>,
+        layout: &Layout,
         shape: &Shape,
     ) -> Result<Self, MetalError> {
-        index_u32(buffer_element_count(input))?;
         Ok(Self {
             count: index_u32(shape.element_count())?,
             rank: index_u32(shape.rank())?,
             dims: padded_u32(shape.dims())?,
-            strides: padded_u32(input.layout.strides())?,
-            offset: index_u32(input.layout.offset())?,
+            strides: padded_u32(layout.strides())?,
+            offset: index_u32(layout.offset())?,
         })
     }
 
     fn window(
-        target: &Operand<'_, MetalStorage>,
+        target: &Layout,
         shape: &Shape,
         axis: usize,
         start: usize,
     ) -> Result<Self, MetalError> {
-        let axis_stride =
-            target
-                .layout
-                .strides()
-                .get(axis)
-                .copied()
-                .ok_or(CoreError::AxisOutOfRange {
-                    axis,
-                    rank: target.layout.shape().rank(),
-                })?;
+        let axis_stride = target
+            .strides()
+            .get(axis)
+            .copied()
+            .ok_or(CoreError::AxisOutOfRange {
+                axis,
+                rank: target.shape().rank(),
+            })?;
         let offset = start
             .checked_mul(axis_stride)
-            .and_then(|skipped| skipped.checked_add(target.layout.offset()))
+            .and_then(|skipped| skipped.checked_add(target.offset()))
             .ok_or(MetalError::IndexTooLarge {
                 value: start,
             })?;
@@ -180,8 +194,8 @@ impl StridedArgs {
 
 impl GatherArgs {
     fn new(
-        table: &Operand<'_, MetalStorage>,
-        indices: &Operand<'_, MetalStorage>,
+        table: &BufferView<'_>,
+        indices: &BufferView<'_>,
     ) -> Result<Self, MetalError> {
         let incompatible = || CoreError::GatherIncompatible {
             table: table.layout.shape().dims().to_vec(),
@@ -198,7 +212,6 @@ impl GatherArgs {
             .element_count()
             .checked_mul(*cols)
             .ok_or_else(incompatible)?;
-        index_u32(buffer_element_count(table))?;
         Ok(Self {
             count: index_u32(count)?,
             rows: index_u32(*rows)?,
@@ -213,7 +226,7 @@ impl GatherArgs {
 
 impl ReduceArgs {
     fn new(
-        input: &Operand<'_, MetalStorage>,
+        input: &BufferView<'_>,
         axis: usize,
         rows: &Shape,
     ) -> Result<Self, MetalError> {
@@ -235,7 +248,7 @@ impl ReduceArgs {
             .copied()
             .ok_or_else(axis_out_of_range)?;
         Ok(Self {
-            rows: StridedArgs::with_shape(input, rows)?,
+            rows: StridedArgs::with_shape(input.layout, rows)?,
             axis_len: index_u32(axis_len)?,
             axis_stride: index_u32(axis_stride)?,
         })
@@ -244,10 +257,9 @@ impl ReduceArgs {
 
 impl MatmulOperand {
     fn new(
-        operand: &Operand<'_, MetalStorage>,
+        operand: &BufferView<'_>,
         incompatible: impl Fn() -> CoreError,
     ) -> Result<Self, MetalError> {
-        index_u32(buffer_element_count(operand))?;
         let (batch_strides, [row_stride, col_stride]) = operand
             .layout
             .strides()
@@ -264,8 +276,8 @@ impl MatmulOperand {
 
 impl MatmulArgs {
     fn new(
-        lhs: &Operand<'_, MetalStorage>,
-        rhs: &Operand<'_, MetalStorage>,
+        lhs: &BufferView<'_>,
+        rhs: &BufferView<'_>,
     ) -> Result<(Self, MTLSize), MetalError> {
         let incompatible = || CoreError::MatmulIncompatible {
             lhs: lhs.layout.shape().dims().to_vec(),
@@ -320,6 +332,7 @@ impl MetalBackend {
         dtype: DType,
         shape: &Shape,
     ) -> Result<MetalStorage, MetalError> {
+        index_u32(shape.element_count())?;
         let byte_len = byte_len(dtype, shape)?;
         let bytes_max = self.device.maxBufferLength();
         if byte_len > bytes_max {
@@ -387,7 +400,7 @@ impl MetalBackend {
     fn dispatch_strided(
         &mut self,
         kernel: &'static str,
-        inputs: &[&Operand<'_, MetalStorage>],
+        inputs: &[&BufferView<'_>],
         output: &MetalStorage,
     ) -> Result<(), MetalError> {
         let count = inputs
@@ -406,9 +419,17 @@ impl MetalBackend {
         self.encode(&pipeline, |encoder| {
             inputs.iter().enumerate().for_each(|(index, input)| {
                 // SAFETY: the input buffer is alive for the whole call and the
-                // command buffer retains it; `StridedArgs::new` checked that
-                // every index the kernel reads fits in the
-                // buffer's element count.
+                // command buffer retains it. The view comes from a `Tensor`
+                // operand, which only `crate::core` can build, or from a
+                // buffer this backend allocated with a contiguous layout of
+                // its shape, so every index its layout addresses stays inside
+                // its storage; `allocate` bounds that storage to `u32::MAX`
+                // elements, so the kernel's `u32` indices do not wrap. Every
+                // input has the dispatch shape: `count` is the first input's
+                // element count, and `Tensor` broadcasts both binary operands
+                // to the same shape before calling the backend, so the kernel
+                // reads each input, `rhs` included, only for `gid < count`
+                // inside its layout.
                 unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, index) };
             });
             // SAFETY: the output buffer holds `count` elements of the kernel's
@@ -447,7 +468,7 @@ impl MetalBackend {
     fn dispatch_reduce(
         &mut self,
         kernel: &'static str,
-        input: &Operand<'_, MetalStorage>,
+        input: &BufferView<'_>,
         args: &ReduceArgs,
         rows: usize,
         output: &MetalStorage,
@@ -466,8 +487,11 @@ impl MetalBackend {
         }
         self.encode(&pipeline, |encoder| {
             // SAFETY: the input buffer is alive for the whole call and the
-            // command buffer retains it; `ReduceArgs::new` checked that every
-            // index the kernel reads fits in the buffer's element count.
+            // command buffer retains it. The view comes from a `Tensor`
+            // operand, which only `crate::core` can build, so every index its
+            // layout addresses stays inside its storage; `allocate` bounds that
+            // storage to `u32::MAX` elements, so the kernel's `u32` indices do
+            // not wrap.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
             // SAFETY: the output buffer holds one element of the kernel's
             // output type per dispatched threadgroup.
@@ -500,8 +524,8 @@ impl MetalBackend {
     fn dispatch_matmul(
         &mut self,
         kernel: &'static str,
-        lhs: &Operand<'_, MetalStorage>,
-        rhs: &Operand<'_, MetalStorage>,
+        lhs: &BufferView<'_>,
+        rhs: &BufferView<'_>,
         output: &MetalStorage,
     ) -> Result<(), MetalError> {
         let (args, grid) = MatmulArgs::new(lhs, rhs)?;
@@ -516,8 +540,12 @@ impl MetalBackend {
         }
         self.encode(&pipeline, |encoder| {
             // SAFETY: both input buffers are alive for the whole call and the
-            // command buffer retains them; `MatmulOperand::new` checked that
-            // every index the kernel reads fits in each buffer's element count.
+            // command buffer retains them. Each view comes from a `Tensor`
+            // operand, which only `crate::core` can build, or from a copy this
+            // backend allocated with a contiguous layout of its shape, so every
+            // index its layout addresses stays inside its storage; `allocate`
+            // bounds each storage to `u32::MAX` elements, so the kernel's `u32`
+            // indices do not wrap.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&lhs.storage.buffer), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&rhs.storage.buffer), 0, 1);
@@ -550,8 +578,8 @@ impl MetalBackend {
     fn dispatch_gather(
         &mut self,
         kernel: &'static str,
-        table: &Operand<'_, MetalStorage>,
-        indices: &Operand<'_, MetalStorage>,
+        table: &BufferView<'_>,
+        indices: &BufferView<'_>,
         args: &GatherArgs,
         count: usize,
         output: &MetalStorage,
@@ -563,9 +591,12 @@ impl MetalBackend {
         let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
         self.encode(&pipeline, |encoder| {
             // SAFETY: both input buffers are alive for the whole call and the
-            // command buffer retains them; `GatherArgs::new` checked that every
-            // index read from either buffer fits in its element count, and the
-            // kernel reads a table row only when its index is below `rows`.
+            // command buffer retains them. Both views come from `Tensor`
+            // operands, which only `crate::core` can build, so every index
+            // their layouts address stays inside their storage; `allocate`
+            // bounds each storage to `u32::MAX` elements, so the kernel's `u32`
+            // indices do not wrap, and the kernel reads a table row only when
+            // its index is below `rows`.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&table.storage.buffer), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&indices.storage.buffer), 0, 1);
@@ -601,9 +632,9 @@ impl MetalBackend {
     fn dispatch_write(
         &mut self,
         kernel: &'static str,
-        input: &Operand<'_, MetalStorage>,
+        input: &BufferView<'_>,
         window: &StridedArgs,
-        output: &MetalStorage,
+        output: &mut MetalStorage,
     ) -> Result<(), MetalError> {
         let count = input.layout.shape().element_count();
         if count == 0 {
@@ -614,13 +645,21 @@ impl MetalBackend {
         let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
         self.encode(&pipeline, |encoder| {
             // SAFETY: the input buffer is alive for the whole call and the
-            // command buffer retains it; `StridedArgs::new` checked that every
-            // index the kernel reads fits in the buffer's element count.
+            // command buffer retains it. The view comes from a `Tensor`
+            // operand, which only `crate::core` can build, so every index its
+            // layout addresses stays inside its storage; `allocate` bounds that
+            // storage to `u32::MAX` elements, so the kernel's `u32` indices do
+            // not wrap.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
             // SAFETY: the output buffer is alive for the whole call and the
-            // command buffer retains it; `window` addresses a sub-range of a
-            // contiguous layout of that buffer whose shape rule was checked, so
-            // every written index is in bounds and written by one thread only.
+            // command buffer retains it. It is borrowed mutably, so no other
+            // reference to it is live during encoding: either a slice update
+            // target, which `Tensor::slice_update` checked to be contiguous
+            // and owned by no other tensor before building its `OperandMut`,
+            // or a fresh concat output with a contiguous layout. The shape rule
+            // bounds `window` inside that layout, so every written
+            // index stays inside the storage and is written by one
+            // thread only.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 1) };
             // SAFETY: `input_args` and `window` are `#[repr(C)]` structs of
             // `u32` that match the layout of `StridedArgs` in `common.metal`;
@@ -652,18 +691,23 @@ impl MetalBackend {
         })
     }
 
+    fn copy_view(
+        &mut self,
+        input: &BufferView<'_>,
+    ) -> Result<MetalStorage, MetalError> {
+        let output = self.allocate(input.dtype, input.layout.shape())?;
+        self.dispatch_strided(copy_kernel(input.dtype), &[input], &output)?;
+        Ok(output)
+    }
+
     fn matmul_copy(
         &mut self,
-        operand: &Operand<'_, MetalStorage>,
+        operand: &BufferView<'_>,
     ) -> Result<Option<(MetalStorage, Layout)>, MetalError> {
         if is_matmul_ready(operand.layout) {
             return Ok(None);
         }
-        let storage = self.copy(Operand {
-            storage: operand.storage,
-            layout: operand.layout,
-            dtype: operand.dtype,
-        })?;
+        let storage = self.copy_view(operand)?;
         Ok(Some((
             storage,
             Layout::contiguous(*operand.layout.shape())?,
@@ -687,13 +731,14 @@ impl Backend for MetalBackend {
         dtype: DType,
         shape: &Shape,
     ) -> Result<MetalStorage, MetalError> {
-        let storage = self.allocate(dtype, shape)?;
-        if bytes.len() != storage.byte_len {
+        let bytes_expected = byte_len(dtype, shape)?;
+        if bytes.len() != bytes_expected {
             return Err(MetalError::ByteLengthMismatch {
                 bytes: bytes.len(),
-                bytes_expected: storage.byte_len,
+                bytes_expected,
             });
         }
+        let storage = self.allocate(dtype, shape)?;
         // SAFETY: the buffer is freshly allocated in shared storage with at
         // least `storage.byte_len == bytes.len()` bytes, and no GPU
         // work references it yet.
@@ -735,6 +780,7 @@ impl Backend for MetalBackend {
         &mut self,
         input: Operand<'_, MetalStorage>,
     ) -> Result<Vec<u8>, MetalError> {
+        let input = BufferView::from(&input);
         if !input.layout.is_contiguous() {
             return Err(MetalError::DownloadNonContiguous);
         }
@@ -786,6 +832,7 @@ impl Backend for MetalBackend {
         op: UnaryOp,
         input: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
+        let input = BufferView::from(&input);
         let kernel = unary_kernel(op, input.dtype)?;
         let output = self.allocate(input.dtype, input.layout.shape())?;
         self.dispatch_strided(kernel, &[&input], &output)?;
@@ -798,6 +845,8 @@ impl Backend for MetalBackend {
         lhs: Operand<'_, MetalStorage>,
         rhs: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
+        let lhs = BufferView::from(&lhs);
+        let rhs = BufferView::from(&rhs);
         let kernel = binary_kernel(op, lhs.dtype)?;
         let output = self.allocate(lhs.dtype, lhs.layout.shape())?;
         self.dispatch_strided(kernel, &[&lhs, &rhs], &output)?;
@@ -810,6 +859,7 @@ impl Backend for MetalBackend {
         input: Operand<'_, MetalStorage>,
         axis: usize,
     ) -> Result<MetalStorage, MetalError> {
+        let input = BufferView::from(&input);
         let kernel = reduce_kernel(op, input.dtype)?;
         let (dtype, shape) = reduce_rule(op, input.dtype, input.layout.shape(), axis)?;
         let args = ReduceArgs::new(&input, axis, &shape)?;
@@ -823,6 +873,8 @@ impl Backend for MetalBackend {
         lhs: Operand<'_, MetalStorage>,
         rhs: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
+        let lhs = BufferView::from(&lhs);
+        let rhs = BufferView::from(&rhs);
         let kernel = matmul_kernel(lhs.dtype)?;
         let (dtype, shape) =
             matmul_rule(lhs.dtype, lhs.layout.shape(), rhs.dtype, rhs.layout.shape())?;
@@ -843,9 +895,7 @@ impl Backend for MetalBackend {
         &mut self,
         input: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        let output = self.allocate(input.dtype, input.layout.shape())?;
-        self.dispatch_strided(copy_kernel(input.dtype), &[&input], &output)?;
-        Ok(output)
+        self.copy_view(&BufferView::from(&input))
     }
 
     fn cast(
@@ -853,6 +903,7 @@ impl Backend for MetalBackend {
         input: Operand<'_, MetalStorage>,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
+        let input = BufferView::from(&input);
         let kernel = cast_kernel(input.dtype, dtype)?;
         let output = self.allocate(dtype, input.layout.shape())?;
         self.dispatch_strided(kernel, &[&input], &output)?;
@@ -864,6 +915,8 @@ impl Backend for MetalBackend {
         table: Operand<'_, MetalStorage>,
         indices: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
+        let table = BufferView::from(&table);
+        let indices = BufferView::from(&indices);
         let kernel = gather_kernel(table.dtype)?;
         let (dtype, shape) = gather_rule(
             table.dtype,
@@ -890,6 +943,8 @@ impl Backend for MetalBackend {
         rhs: Operand<'_, MetalStorage>,
         axis: usize,
     ) -> Result<MetalStorage, MetalError> {
+        let lhs = BufferView::from(&lhs);
+        let rhs = BufferView::from(&rhs);
         let kernel = slice_update_kernel("concat", lhs.dtype)?;
         let (dtype, shape) = concat_rule(
             lhs.dtype,
@@ -908,41 +963,36 @@ impl Backend for MetalBackend {
                     axis,
                     rank: lhs.layout.shape().rank(),
                 })?;
-        let output = self.allocate(dtype, &shape)?;
+        let mut output = self.allocate(dtype, &shape)?;
         let layout = Layout::contiguous(shape)?;
-        let target = Operand {
-            storage: &output,
-            layout: &layout,
-            dtype,
-        };
-        let lhs_window = StridedArgs::window(&target, lhs.layout.shape(), axis, 0)?;
-        let rhs_window = StridedArgs::window(&target, rhs.layout.shape(), axis, lhs_len)?;
-        self.dispatch_write(kernel, &lhs, &lhs_window, &output)?;
-        self.dispatch_write(kernel, &rhs, &rhs_window, &output)?;
+        let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), axis, 0)?;
+        let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), axis, lhs_len)?;
+        self.dispatch_write(kernel, &lhs, &lhs_window, &mut output)?;
+        self.dispatch_write(kernel, &rhs, &rhs_window, &mut output)?;
         Ok(output)
     }
 
     fn slice_update(
         &mut self,
-        target: Operand<'_, MetalStorage>,
+        mut target: OperandMut<'_, MetalStorage>,
         update: Operand<'_, MetalStorage>,
         axis: usize,
         start: usize,
     ) -> Result<(), MetalError> {
-        let kernel = slice_update_kernel("slice_update", target.dtype)?;
+        let layout = target.layout();
+        let dtype = target.dtype();
+        let update = BufferView::from(&update);
+        let kernel = slice_update_kernel("slice_update", dtype)?;
         slice_update_rule(
-            target.dtype,
-            target.layout.shape(),
+            dtype,
+            layout.shape(),
             update.dtype,
             update.layout.shape(),
             axis,
             start,
         )?;
-        if !target.layout.is_contiguous() {
-            return Err(MetalError::SliceUpdateNonContiguous);
-        }
-        let window = StridedArgs::window(&target, update.layout.shape(), axis, start)?;
-        self.dispatch_write(kernel, &update, &window, target.storage)
+        let window = StridedArgs::window(layout, update.layout.shape(), axis, start)?;
+        self.dispatch_write(kernel, &update, &window, target.storage_mut())
     }
 }
 
@@ -1112,26 +1162,18 @@ fn is_matmul_ready(layout: &Layout) -> bool {
     }
 }
 
-fn matmul_operand<'storage>(
-    operand: Operand<'storage, MetalStorage>,
-    copy: Option<&'storage (MetalStorage, Layout)>,
-) -> Operand<'storage, MetalStorage> {
+fn matmul_operand<'buffer>(
+    operand: BufferView<'buffer>,
+    copy: Option<&'buffer (MetalStorage, Layout)>,
+) -> BufferView<'buffer> {
     match copy {
-        Some((storage, layout)) => Operand {
+        Some((storage, layout)) => BufferView {
             storage,
             layout,
             dtype: operand.dtype,
         },
         None => operand,
     }
-}
-
-fn buffer_element_count(input: &Operand<'_, MetalStorage>) -> usize {
-    input
-        .storage
-        .byte_len
-        .checked_div(input.dtype.size_bytes())
-        .unwrap_or(0)
 }
 
 fn index_u32(value: usize) -> Result<u32, MetalError> {
@@ -1175,6 +1217,7 @@ mod tests {
         is_matmul_ready,
     };
     use crate::core::{
+        CoreError,
         DType,
         Shape,
         Tensor,
@@ -1309,6 +1352,16 @@ mod tests {
         assert!(
             matches!(result, Err(MetalError::ByteLengthMismatch { .. })),
             "the byte length is checked before allocation, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn zeros_with_more_than_u32_max_elements_is_rejected() {
+        let result = Tensor::zeros(&mut backend(), DType::F16, shape(&[1 << 32]));
+        assert!(
+            matches!(result, Err(MetalError::IndexTooLarge { .. })),
+            "storage is bounded to u32::MAX elements, got {:?}",
             result.err()
         );
     }
@@ -2353,7 +2406,7 @@ mod tests {
         assert!(
             matches!(
                 target.slice_update(&mut backend, &update, 1, 0),
-                Err(MetalError::SliceUpdateNonContiguous)
+                Err(MetalError::Core(CoreError::SliceUpdateNonContiguous))
             ),
             "a broadcast target would be written by several threads"
         );
@@ -2366,7 +2419,7 @@ mod tests {
         let update = target.narrow(1, 0, 1).expect("the narrow is valid");
         let result = target.slice_update(&mut backend, &update, 1, 3);
         assert!(
-            result.is_err(),
+            matches!(result, Err(MetalError::Core(CoreError::SharedStorage))),
             "an update aliasing the target is rejected, got {result:?}"
         );
     }
@@ -2379,7 +2432,7 @@ mod tests {
         let update = upload_f32(&mut backend, &[100.0, 101.0], &[2, 1]);
         let result = target.slice_update(&mut backend, &update, 1, 3);
         assert!(
-            result.is_err(),
+            matches!(result, Err(MetalError::Core(CoreError::SharedStorage))),
             "a live view would observe the write, got {result:?}"
         );
         assert_eq!(view.shape().dims(), &[1, 4], "the view is still alive");

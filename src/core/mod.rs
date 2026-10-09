@@ -9,6 +9,7 @@ mod tensor;
 pub use self::backend::{
     Backend,
     Operand,
+    OperandMut,
 };
 pub use self::dtype::DType;
 pub use self::error::CoreError;
