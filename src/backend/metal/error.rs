@@ -1,4 +1,7 @@
-use crate::core::CoreError;
+use crate::core::{
+    CoreError,
+    DType,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetalError {
@@ -28,6 +31,24 @@ pub enum MetalError {
 
     #[error("Metal blit command encoder creation failed.")]
     BlitEncoderCreation,
+
+    #[error("Metal compute command encoder creation failed.")]
+    ComputeEncoderCreation,
+
+    #[error("Kernel {name} is not in the Metal library.")]
+    KernelNotFound { name: &'static str },
+
+    #[error("Metal pipeline creation for kernel {name} failed: {message}")]
+    PipelineCreation { name: &'static str, message: String },
+
+    #[error("Value {value} does not fit in a 32-bit kernel index.")]
+    IndexTooLarge { value: usize },
+
+    #[error("Primitive {primitive} does not support dtype {dtype:?} on Metal.")]
+    UnsupportedDType {
+        primitive: &'static str,
+        dtype: DType,
+    },
 
     #[error("Metal command buffer failed: {message}")]
     CommandBufferFailed { message: String },
