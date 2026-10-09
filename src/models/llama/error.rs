@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::io;
 use std::path::PathBuf;
 
@@ -5,7 +6,7 @@ use crate::core::DType;
 use crate::weights::WeightsError;
 
 #[derive(Debug, thiserror::Error)]
-pub enum LlamaConfigError {
+pub enum LlamaError<E = Infallible> {
     #[error("I/O on {path:?} failed.")]
     Io {
         path: PathBuf,
@@ -50,10 +51,7 @@ pub enum LlamaConfigError {
 
     #[error("Word embeddings are not tied.")]
     UntiedEmbeddings,
-}
 
-#[derive(Debug, thiserror::Error)]
-pub enum LlamaWeightsError<E> {
     #[error(transparent)]
     Weights(#[from] WeightsError),
 
@@ -79,4 +77,36 @@ pub enum LlamaWeightsError<E> {
 
     #[error("Uploaded byte count overflows usize.")]
     ByteCountOverflow,
+
+    #[error("Maximum sequence length {seq_len_max} exceeds the allowed {seq_len_max_allowed}.")]
+    SeqLenMaxTooLarge {
+        seq_len_max: usize,
+        seq_len_max_allowed: usize,
+    },
+
+    #[error("Head dim {head_dim} is not a positive even number, as rotate-half RoPE requires.")]
+    HeadDimInvalid { head_dim: usize },
+
+    #[error("{name} {dim} exceeds {dim_max}, the largest value converted exactly to f32.")]
+    DimensionTooLargeForF32 {
+        name: &'static str,
+        dim: usize,
+        dim_max: usize,
+    },
+
+    #[error("Forward input holds no token.")]
+    EmptyInput,
+
+    #[error(
+        "{seq_len} tokens at position {position} exceed the cache length of {seq_len_max} \
+         positions."
+    )]
+    CacheOverflow {
+        position: usize,
+        seq_len: usize,
+        seq_len_max: usize,
+    },
+
+    #[error("{caches} layer caches were given for {layers} layers.")]
+    CacheLayerCount { caches: usize, layers: usize },
 }

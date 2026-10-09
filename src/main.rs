@@ -17,7 +17,7 @@ use clap::{
 };
 use foundry::models::llama::{
     LlamaConfig,
-    LlamaConfigError,
+    LlamaError,
 };
 use foundry::weights::{
     Weights,
@@ -82,7 +82,7 @@ enum CliError {
     Weights(#[from] WeightsError),
 
     #[error(transparent)]
-    Config(#[from] LlamaConfigError),
+    Config(#[from] LlamaError),
 
     #[error(transparent)]
     Summary(#[from] WeightsSummaryError),
@@ -253,7 +253,7 @@ fn summarize_weights<S: AsRef<[u8]>>(
 fn load_architecture(directory: &Path) -> Result<Option<LlamaConfig>, CliError> {
     match LlamaConfig::open(directory) {
         Ok(config) => Ok(Some(config)),
-        Err(LlamaConfigError::ModelType {
+        Err(LlamaError::ModelType {
             model_type,
         }) => {
             warn!(

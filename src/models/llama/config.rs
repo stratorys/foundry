@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::models::llama::LlamaConfigError;
+use crate::models::llama::LlamaError;
 
 const CONFIG_FILE: &str = "config.json";
 const CONFIG_BYTES_MAX: u64 = 1024 * 1024;
@@ -83,15 +83,15 @@ impl From<EosTokenIds> for Vec<u32> {
 }
 
 impl LlamaConfig {
-    pub fn open(directory: &Path) -> Result<Self, LlamaConfigError> {
+    pub fn open(directory: &Path) -> Result<Self, LlamaError> {
         let path = directory.join(CONFIG_FILE);
-        let io_error = |error| LlamaConfigError::Io {
+        let io_error = |error| LlamaError::Io {
             path: path.clone(),
             error,
         };
         let bytes = fs::metadata(&path).map_err(io_error)?.len();
         if bytes > CONFIG_BYTES_MAX {
-            return Err(LlamaConfigError::ConfigTooLarge {
+            return Err(LlamaError::ConfigTooLarge {
                 path,
                 bytes,
                 bytes_max: CONFIG_BYTES_MAX,
@@ -101,16 +101,16 @@ impl LlamaConfig {
         Self::parse(&json)
     }
 
-    pub fn parse(json: &[u8]) -> Result<Self, LlamaConfigError> {
+    pub fn parse(json: &[u8]) -> Result<Self, LlamaError> {
         let ModelTypeFile {
             model_type,
-        } = serde_json::from_slice(json).map_err(LlamaConfigError::Json)?;
+        } = serde_json::from_slice(json).map_err(LlamaError::Json)?;
         if model_type != MODEL_TYPE {
-            return Err(LlamaConfigError::ModelType {
+            return Err(LlamaError::ModelType {
                 model_type,
             });
         }
-        let file: ConfigFile = serde_json::from_slice(json).map_err(LlamaConfigError::Json)?;
+        let file: ConfigFile = serde_json::from_slice(json).map_err(LlamaError::Json)?;
         Self::try_from(file)
     }
 
@@ -140,16 +140,16 @@ impl LlamaConfig {
 }
 
 impl TryFrom<ConfigFile> for LlamaConfig {
-    type Error = LlamaConfigError;
+    type Error = LlamaError;
 
     fn try_from(file: ConfigFile) -> Result<Self, Self::Error> {
         if file.model_type != MODEL_TYPE {
-            return Err(LlamaConfigError::ModelType {
+            return Err(LlamaError::ModelType {
                 model_type: file.model_type,
             });
         }
         if file.num_attention_heads.checked_mul(file.head_dim) != Some(file.hidden_size) {
-            return Err(LlamaConfigError::HiddenSizeMismatch {
+            return Err(LlamaError::HiddenSizeMismatch {
                 hidden_size: file.hidden_size,
                 num_attention_heads: file.num_attention_heads,
                 head_dim: file.head_dim,
@@ -160,18 +160,18 @@ impl TryFrom<ConfigFile> for LlamaConfig {
             .checked_rem(file.num_key_value_heads)
             != Some(0)
         {
-            return Err(LlamaConfigError::HeadRatio {
+            return Err(LlamaError::HeadRatio {
                 num_attention_heads: file.num_attention_heads,
                 num_key_value_heads: file.num_key_value_heads,
             });
         }
         if file.rope_scaling.rope_type != ROPE_TYPE {
-            return Err(LlamaConfigError::RopeType {
+            return Err(LlamaError::RopeType {
                 rope_type: file.rope_scaling.rope_type,
             });
         }
         if !file.tie_word_embeddings {
-            return Err(LlamaConfigError::UntiedEmbeddings);
+            return Err(LlamaError::UntiedEmbeddings);
         }
         Ok(Self {
             hidden_size: file.hidden_size,
@@ -207,7 +207,7 @@ mod tests {
     use crate::models::llama::{
         Llama3RopeScaling,
         LlamaConfig,
-        LlamaConfigError,
+        LlamaError,
     };
 
     fn instruct_config() -> Value {
@@ -259,7 +259,7 @@ mod tests {
         config
     }
 
-    fn parse(config: &Value) -> Result<LlamaConfig, LlamaConfigError> {
+    fn parse(config: &Value) -> Result<LlamaConfig, LlamaError> {
         LlamaConfig::parse(&serde_json::to_vec(config).expect("the config serializes"))
     }
 
@@ -304,7 +304,7 @@ mod tests {
     fn other_model_type_is_rejected_before_missing_fields() {
         let result = parse(&json!({ "model_type": "qwen3", "hidden_size": 1024 }));
         assert!(
-            matches!(&result, Err(LlamaConfigError::ModelType { model_type }) if model_type == "qwen3"),
+            matches!(&result, Err(LlamaError::ModelType { model_type }) if model_type == "qwen3"),
             "got {result:?}"
         );
     }
@@ -315,7 +315,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(LlamaConfigError::HiddenSizeMismatch {
+                Err(LlamaError::HiddenSizeMismatch {
                     hidden_size: 3000,
                     ..
                 })
@@ -330,7 +330,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(LlamaConfigError::HeadRatio {
+                Err(LlamaError::HeadRatio {
                     num_key_value_heads: 7,
                     ..
                 })
@@ -345,7 +345,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(LlamaConfigError::HeadRatio {
+                Err(LlamaError::HeadRatio {
                     num_key_value_heads: 0,
                     ..
                 })
@@ -365,7 +365,7 @@ mod tests {
         });
         let result = parse(&with(instruct_config(), "rope_scaling", rope_scaling));
         assert!(
-            matches!(&result, Err(LlamaConfigError::RopeType { rope_type }) if rope_type == "default"),
+            matches!(&result, Err(LlamaError::RopeType { rope_type }) if rope_type == "default"),
             "got {result:?}"
         );
     }
@@ -378,7 +378,7 @@ mod tests {
             json!(false),
         ));
         assert!(
-            matches!(result, Err(LlamaConfigError::UntiedEmbeddings)),
+            matches!(result, Err(LlamaError::UntiedEmbeddings)),
             "got {result:?}"
         );
     }
@@ -391,9 +391,6 @@ mod tests {
             .expect("the config is an object")
             .remove("rope_scaling");
         let result = parse(&config);
-        assert!(
-            matches!(result, Err(LlamaConfigError::Json(_))),
-            "got {result:?}"
-        );
+        assert!(matches!(result, Err(LlamaError::Json(_))), "got {result:?}");
     }
 }

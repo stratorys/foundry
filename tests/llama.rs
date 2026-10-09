@@ -2,8 +2,8 @@ use foundry::backend::cpu::CpuBackend;
 use foundry::core::DType;
 use foundry::models::llama::{
     LlamaConfig,
+    LlamaError,
     LlamaWeights,
-    LlamaWeightsError,
 };
 use foundry::weights::{
     Weights,
@@ -272,7 +272,7 @@ fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
     assert!(
         matches!(
             &result,
-            Err(LlamaWeightsError::ShapeMismatch { name, dims, dims_expected })
+            Err(LlamaError::ShapeMismatch { name, dims, dims_expected })
                 if name == "model.layers.1.self_attn.k_proj.weight"
                     && dims == &[4, 4]
                     && dims_expected == &[2, 4]
@@ -401,7 +401,7 @@ fn llama_weights_reject_a_non_bf16_tensor() {
     assert!(
         matches!(
             &result,
-            Err(LlamaWeightsError::DTypeMismatch {
+            Err(LlamaError::DTypeMismatch {
                 name,
                 dtype: DType::F32,
                 dtype_expected: DType::BF16,
@@ -525,7 +525,7 @@ fn llama_weights_reject_a_missing_tensor() {
     assert!(
         matches!(
             &result,
-            Err(LlamaWeightsError::Weights(WeightsError::TensorNotFound { name }))
+            Err(LlamaError::Weights(WeightsError::TensorNotFound { name }))
                 if name == "model.norm.weight"
         ),
         "got {:?}",

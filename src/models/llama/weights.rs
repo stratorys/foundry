@@ -5,7 +5,7 @@ use crate::core::{
 };
 use crate::models::llama::{
     LlamaConfig,
-    LlamaWeightsError,
+    LlamaError,
 };
 use crate::nn::{
     Embedding,
@@ -46,16 +46,15 @@ impl<B: Backend> LlamaWeights<B> {
         backend: &mut B,
         config: &LlamaConfig,
         weights: &Weights<S>,
-    ) -> Result<Self, LlamaWeightsError<B::Error>> {
+    ) -> Result<Self, LlamaError<B::Error>> {
         let kv_heads = config.num_key_value_heads();
         let head_dim = config.head_dim();
-        let kv_dim =
-            kv_heads
-                .checked_mul(head_dim)
-                .ok_or(LlamaWeightsError::DimensionOverflow {
-                    kv_heads,
-                    head_dim,
-                })?;
+        let kv_dim = kv_heads
+            .checked_mul(head_dim)
+            .ok_or(LlamaError::DimensionOverflow {
+                kv_heads,
+                head_dim,
+            })?;
         let mut loader = Loader {
             backend,
             weights,
@@ -67,7 +66,7 @@ impl<B: Backend> LlamaWeights<B> {
         )?;
         let layers = (0..config.num_hidden_layers())
             .map(|index| loader.layer(config, index, kv_dim))
-            .collect::<Result<Vec<LlamaLayerWeights<B>>, LlamaWeightsError<B::Error>>>()?;
+            .collect::<Result<Vec<LlamaLayerWeights<B>>, LlamaError<B::Error>>>()?;
         let norm = loader.rms_norm("model.norm.weight", config)?;
         Ok(Self {
             embedding: Embedding::new(embed_tokens.clone()),
@@ -111,7 +110,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         config: &LlamaConfig,
         index: usize,
         kv_dim: usize,
-    ) -> Result<LlamaLayerWeights<B>, LlamaWeightsError<B::Error>> {
+    ) -> Result<LlamaLayerWeights<B>, LlamaError<B::Error>> {
         let hidden = config.hidden_size();
         let intermediate = config.intermediate_size();
         let prefix = format!("model.layers.{index}");
@@ -146,8 +145,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
             &format!("{prefix}.mlp.down_proj.weight"),
             [hidden, intermediate],
         )?;
-        let mlp =
-            SwigluMlp::new(self.backend, gate, up, down).map_err(LlamaWeightsError::Backend)?;
+        let mlp = SwigluMlp::new(self.backend, gate, up, down).map_err(LlamaError::Backend)?;
         Ok(LlamaLayerWeights {
             input_norm,
             q_proj,
@@ -163,7 +161,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         &mut self,
         name: &str,
         dims_expected: [usize; 2],
-    ) -> Result<Linear<B>, LlamaWeightsError<B::Error>> {
+    ) -> Result<Linear<B>, LlamaError<B::Error>> {
         Ok(Linear::new(self.tensor(name, &dims_expected)?))
     }
 
@@ -171,38 +169,37 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         &mut self,
         name: &str,
         config: &LlamaConfig,
-    ) -> Result<RmsNorm<B>, LlamaWeightsError<B::Error>> {
+    ) -> Result<RmsNorm<B>, LlamaError<B::Error>> {
         let weight = self.tensor(name, &[config.hidden_size()])?;
-        RmsNorm::new(self.backend, weight, config.rms_norm_eps())
-            .map_err(LlamaWeightsError::Backend)
+        RmsNorm::new(self.backend, weight, config.rms_norm_eps()).map_err(LlamaError::Backend)
     }
 
     fn tensor(
         &mut self,
         name: &str,
         dims_expected: &[usize],
-    ) -> Result<Tensor<B>, LlamaWeightsError<B::Error>> {
+    ) -> Result<Tensor<B>, LlamaError<B::Error>> {
         let view = self.weights.get(name)?;
         if view.dtype != DTYPE {
-            return Err(LlamaWeightsError::DTypeMismatch {
+            return Err(LlamaError::DTypeMismatch {
                 name: name.to_owned(),
                 dtype: view.dtype,
                 dtype_expected: DTYPE,
             });
         }
         if view.shape.dims() != dims_expected {
-            return Err(LlamaWeightsError::ShapeMismatch {
+            return Err(LlamaError::ShapeMismatch {
                 name: name.to_owned(),
                 dims: view.shape.dims().to_vec(),
                 dims_expected: dims_expected.to_vec(),
             });
         }
         let tensor = Tensor::upload(self.backend, view.bytes, view.dtype, view.shape)
-            .map_err(LlamaWeightsError::Backend)?;
+            .map_err(LlamaError::Backend)?;
         self.bytes_uploaded = self
             .bytes_uploaded
             .checked_add(view.bytes.len())
-            .ok_or(LlamaWeightsError::ByteCountOverflow)?;
+            .ok_or(LlamaError::ByteCountOverflow)?;
         Ok(tensor)
     }
 }
