@@ -5,6 +5,7 @@ edition = "2024"
 license = "MPL-2.0"
 
 [dependencies]
+thiserror = { version = "2.0.21", default-features = false }
 
 [lints.rust]
 warnings = "deny"
