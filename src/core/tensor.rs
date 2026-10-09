@@ -30,6 +30,10 @@ pub struct Tensor<B: Backend> {
     dtype: DType,
 }
 
+impl<B: Backend> Clone for Tensor<B> {
+    fn clone(&self) -> Self { self.view(self.layout) }
+}
+
 impl<B: Backend> Tensor<B> {
     pub fn upload(
         backend: &mut B,

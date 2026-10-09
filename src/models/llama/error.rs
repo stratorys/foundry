@@ -1,6 +1,9 @@
 use std::io;
 use std::path::PathBuf;
 
+use crate::core::DType;
+use crate::weights::WeightsError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlamaConfigError {
     #[error("I/O on {path:?} failed.")]
@@ -47,4 +50,33 @@ pub enum LlamaConfigError {
 
     #[error("Word embeddings are not tied.")]
     UntiedEmbeddings,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LlamaWeightsError<E> {
+    #[error(transparent)]
+    Weights(#[from] WeightsError),
+
+    #[error(transparent)]
+    Backend(E),
+
+    #[error("Tensor {name} has shape {dims:?}; the config expects {dims_expected:?}.")]
+    ShapeMismatch {
+        name: String,
+        dims: Vec<usize>,
+        dims_expected: Vec<usize>,
+    },
+
+    #[error("Tensor {name} has dtype {dtype:?}; {dtype_expected:?} is expected.")]
+    DTypeMismatch {
+        name: String,
+        dtype: DType,
+        dtype_expected: DType,
+    },
+
+    #[error("{kv_heads} key-value heads times head dim {head_dim} overflows usize.")]
+    DimensionOverflow { kv_heads: usize, head_dim: usize },
+
+    #[error("Uploaded byte count overflows usize.")]
+    ByteCountOverflow,
 }

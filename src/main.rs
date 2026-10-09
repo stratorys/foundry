@@ -10,14 +10,26 @@ use std::path::{
 };
 use std::process::ExitCode;
 use std::str::FromStr;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 use clap::{
     Parser,
     Subcommand,
 };
+#[cfg(target_os = "macos")]
+use foundry::backend::metal::{
+    MetalBackend,
+    MetalError,
+};
 use foundry::models::llama::{
     LlamaConfig,
     LlamaConfigError,
+};
+#[cfg(target_os = "macos")]
+use foundry::models::llama::{
+    LlamaWeights,
+    LlamaWeightsError,
 };
 use foundry::weights::{
     Weights,
@@ -55,6 +67,14 @@ enum Command {
         #[arg(long, help = "List every tensor with its dtype, shape and size.")]
         tensors: bool,
     },
+    #[cfg(target_os = "macos")]
+    #[command(
+        about = "Load a model from the Hugging Face cache onto Metal and check the uploaded bytes."
+    )]
+    Load {
+        #[arg(long, help = "Hugging Face repository id, as owner/name.")]
+        model: ModelId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +103,14 @@ enum CliError {
 
     #[error(transparent)]
     Config(#[from] LlamaConfigError),
+
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    Metal(#[from] MetalError),
+
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    Load(#[from] LlamaWeightsError<MetalError>),
 
     #[error("Total byte count of model {model} overflows usize.")]
     ByteCountOverflow { model: String },
@@ -150,6 +178,10 @@ fn main() -> ExitCode {
             model,
             tensors,
         } => inspect(&model, tensors),
+        #[cfg(target_os = "macos")]
+        Command::Load {
+            model,
+        } => load(&model),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -196,6 +228,49 @@ fn inspect(
     if let Some(rows) = &tensor_rows {
         write_tensors(&mut out, rows)?;
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn load(model: &ModelId) -> Result<(), CliError> {
+    let directory = resolve_snapshot(model)?;
+    let config = LlamaConfig::open(&directory)?;
+    let weights = Weights::open(&directory)?;
+    let mut backend = MetalBackend::new()?;
+    let started = Instant::now();
+    let llama = LlamaWeights::load(&mut backend, &config, &weights)?;
+    let load_ms = started.elapsed().as_millis();
+    let bytes = llama.bytes_uploaded();
+    let bytes_declared = weights.bytes_declared();
+    if let Some(bytes_declared) = bytes_declared
+        && u64::try_from(bytes).ok() != Some(bytes_declared)
+    {
+        return Err(CliError::BytesMismatch {
+            model: model.to_string(),
+            bytes,
+            bytes_declared,
+        });
+    }
+    let size_gib = format_gib(bytes);
+    let mut out = io::stdout().lock();
+    write_header(&mut out, model, &directory)?;
+    writeln!(out)?;
+    writeln!(out, "Metal")?;
+    write_field(&mut out, "Layers", llama.layers().len())?;
+    write_field(
+        &mut out,
+        "Uploaded",
+        format_args!("{bytes} bytes ({} GiB)", size_gib.as_deref().unwrap_or("?")),
+    )?;
+    match bytes_declared {
+        Some(bytes_declared) => write_field(
+            &mut out,
+            "Declared",
+            format_args!("{bytes_declared} bytes (match)"),
+        )?,
+        None => write_field(&mut out, "Declared", "no index")?,
+    }
+    write_field(&mut out, "Load time", format_args!("{load_ms} ms"))?;
     Ok(())
 }
 
