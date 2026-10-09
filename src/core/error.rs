@@ -103,4 +103,16 @@ pub enum CoreError {
         key: Vec<usize>,
         value: Vec<usize>,
     },
+
+    #[error("Head dim {head_dim} was given where head dim {head_dim_expected} is expected.")]
+    AttentionHeadDimMismatch {
+        head_dim: usize,
+        head_dim_expected: usize,
+    },
+
+    #[error("Keys {keys:?} and values {values:?} do not have the same shape.")]
+    KvIncompatible {
+        keys: Vec<usize>,
+        values: Vec<usize>,
+    },
 }

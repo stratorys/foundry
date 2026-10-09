@@ -11,7 +11,6 @@ const SEQ_AXIS: usize = 1;
 pub struct KvCache<B: Backend> {
     keys: Tensor<B>,
     values: Tensor<B>,
-    length: usize,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -26,18 +25,30 @@ impl<B: Backend> KvCache<B> {
         Ok(Self {
             keys: Tensor::zeros(backend, dtype, shape)?,
             values: Tensor::zeros(backend, dtype, shape)?,
-            length: 0,
         })
     }
 
-    pub fn length(&self) -> usize { self.length }
-
-    pub fn append(
+    pub fn update(
         &mut self,
         backend: &mut B,
         keys: &Tensor<B>,
         values: &Tensor<B>,
-    ) -> Result<(), B::Error> {
+        position: usize,
+    ) -> Result<(Tensor<B>, Tensor<B>), B::Error> {
+        if keys.shape() != values.shape() {
+            return Err(CoreError::KvIncompatible {
+                keys: keys.shape().dims().to_vec(),
+                values: values.shape().dims().to_vec(),
+            }
+            .into());
+        }
+        if keys.dtype() != values.dtype() {
+            return Err(CoreError::DTypeMismatch {
+                lhs: keys.dtype(),
+                rhs: values.dtype(),
+            }
+            .into());
+        }
         let seq_len =
             keys.shape()
                 .dims()
@@ -47,19 +58,21 @@ impl<B: Backend> KvCache<B> {
                     axis: SEQ_AXIS,
                     rank: keys.shape().rank(),
                 })?;
-        self.keys
-            .slice_update(backend, keys, SEQ_AXIS, self.length)?;
+        let length =
+            position
+                .checked_add(seq_len)
+                .ok_or_else(|| CoreError::SliceUpdateOutOfBounds {
+                    axis: SEQ_AXIS,
+                    start: position,
+                    target: self.keys.shape().dims().to_vec(),
+                    update: keys.shape().dims().to_vec(),
+                })?;
+        self.keys.slice_update(backend, keys, SEQ_AXIS, position)?;
         self.values
-            .slice_update(backend, values, SEQ_AXIS, self.length)?;
-        self.length = self.length.saturating_add(seq_len);
-        Ok(())
-    }
-
-    pub fn keys(&self) -> Result<Tensor<B>, CoreError> {
-        self.keys.narrow(SEQ_AXIS, 0, self.length)
-    }
-
-    pub fn values(&self) -> Result<Tensor<B>, CoreError> {
-        self.values.narrow(SEQ_AXIS, 0, self.length)
+            .slice_update(backend, values, SEQ_AXIS, position)?;
+        Ok((
+            self.keys.narrow(SEQ_AXIS, 0, length)?,
+            self.values.narrow(SEQ_AXIS, 0, length)?,
+        ))
     }
 }
