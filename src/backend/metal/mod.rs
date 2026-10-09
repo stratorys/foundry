@@ -332,7 +332,6 @@ impl MetalBackend {
         dtype: DType,
         shape: &Shape,
     ) -> Result<MetalStorage, MetalError> {
-        index_u32(shape.element_count())?;
         let byte_len = byte_len(dtype, shape)?;
         let bytes_max = self.device.maxBufferLength();
         if byte_len > bytes_max {
@@ -423,8 +422,9 @@ impl MetalBackend {
                 // operand, which only `crate::core` can build, or from a
                 // buffer this backend allocated with a contiguous layout of
                 // its shape, so every index its layout addresses stays inside
-                // its storage; `allocate` bounds that storage to `u32::MAX`
-                // elements, so the kernel's `u32` indices do not wrap. Every
+                // its storage. Every `Shape` has at most `i32::MAX` non-zero
+                // elements, so the storage size and every address its layout
+                // produces stay below `u32::MAX` and do not wrap. Every
                 // input has the dispatch shape: `count` is the first input's
                 // element count, and `Tensor` broadcasts both binary operands
                 // to the same shape before calling the backend, so the kernel
@@ -489,9 +489,9 @@ impl MetalBackend {
             // SAFETY: the input buffer is alive for the whole call and the
             // command buffer retains it. The view comes from a `Tensor`
             // operand, which only `crate::core` can build, so every index its
-            // layout addresses stays inside its storage; `allocate` bounds that
-            // storage to `u32::MAX` elements, so the kernel's `u32` indices do
-            // not wrap.
+            // layout addresses stays inside its storage. Every `Shape` has at
+            // most `i32::MAX` non-zero elements, so addresses and the loop
+            // counter `k += 256` stay below `u32::MAX` and do not wrap.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
             // SAFETY: the output buffer holds one element of the kernel's
             // output type per dispatched threadgroup.
@@ -543,9 +543,10 @@ impl MetalBackend {
             // command buffer retains them. Each view comes from a `Tensor`
             // operand, which only `crate::core` can build, or from a copy this
             // backend allocated with a contiguous layout of its shape, so every
-            // index its layout addresses stays inside its storage; `allocate`
-            // bounds each storage to `u32::MAX` elements, so the kernel's `u32`
-            // indices do not wrap.
+            // index its layout addresses stays inside its storage. Every
+            // `Shape` has at most `i32::MAX` non-zero elements, so addresses
+            // and the loop counter `k_start += 16` stay below `u32::MAX` and do
+            // not wrap.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&lhs.storage.buffer), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&rhs.storage.buffer), 0, 1);
@@ -593,10 +594,10 @@ impl MetalBackend {
             // SAFETY: both input buffers are alive for the whole call and the
             // command buffer retains them. Both views come from `Tensor`
             // operands, which only `crate::core` can build, so every index
-            // their layouts address stays inside their storage; `allocate`
-            // bounds each storage to `u32::MAX` elements, so the kernel's `u32`
-            // indices do not wrap, and the kernel reads a table row only when
-            // its index is below `rows`.
+            // their layouts address stays inside their storage. Every `Shape`
+            // has at most `i32::MAX` non-zero elements, so addresses stay below
+            // `u32::MAX` and do not wrap, and the kernel reads a table row only
+            // when its index is below `rows`.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&table.storage.buffer), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&indices.storage.buffer), 0, 1);
@@ -647,9 +648,9 @@ impl MetalBackend {
             // SAFETY: the input buffer is alive for the whole call and the
             // command buffer retains it. The view comes from a `Tensor`
             // operand, which only `crate::core` can build, so every index its
-            // layout addresses stays inside its storage; `allocate` bounds that
-            // storage to `u32::MAX` elements, so the kernel's `u32` indices do
-            // not wrap.
+            // layout addresses stays inside its storage. Every `Shape` has at
+            // most `i32::MAX` non-zero elements, so addresses stay below
+            // `u32::MAX` and do not wrap.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
             // SAFETY: the output buffer is alive for the whole call and the
             // command buffer retains it. It is borrowed mutably, so no other
@@ -708,10 +709,7 @@ impl MetalBackend {
             return Ok(None);
         }
         let storage = self.copy_view(operand)?;
-        Ok(Some((
-            storage,
-            Layout::contiguous(*operand.layout.shape())?,
-        )))
+        Ok(Some((storage, Layout::contiguous(*operand.layout.shape()))))
     }
 
     fn wait_pending(&mut self) -> Result<(), MetalError> {
@@ -878,7 +876,6 @@ impl Backend for MetalBackend {
         let kernel = matmul_kernel(lhs.dtype)?;
         let (dtype, shape) =
             matmul_rule(lhs.dtype, lhs.layout.shape(), rhs.dtype, rhs.layout.shape())?;
-        index_u32(shape.element_count())?;
         let output = self.allocate(dtype, &shape)?;
         if shape.element_count() == 0 {
             return Ok(output);
@@ -964,7 +961,7 @@ impl Backend for MetalBackend {
                     rank: lhs.layout.shape().rank(),
                 })?;
         let mut output = self.allocate(dtype, &shape)?;
-        let layout = Layout::contiguous(shape)?;
+        let layout = Layout::contiguous(shape);
         let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), axis, 0)?;
         let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), axis, lhs_len)?;
         self.dispatch_write(kernel, &lhs, &lhs_window, &mut output)?;
@@ -1348,20 +1345,10 @@ mod tests {
 
     #[test]
     fn upload_of_empty_bytes_for_oversized_shape_reports_byte_length_mismatch() {
-        let result = Tensor::upload(&mut backend(), &[], DType::F32, shape(&[1 << 20, 1 << 20]));
+        let result = Tensor::upload(&mut backend(), &[], DType::F32, shape(&[(1 << 31) - 1]));
         assert!(
             matches!(result, Err(MetalError::ByteLengthMismatch { .. })),
             "the byte length is checked before allocation, got {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn zeros_with_more_than_u32_max_elements_is_rejected() {
-        let result = Tensor::zeros(&mut backend(), DType::F16, shape(&[1 << 32]));
-        assert!(
-            matches!(result, Err(MetalError::IndexTooLarge { .. })),
-            "storage is bounded to u32::MAX elements, got {:?}",
             result.err()
         );
     }
@@ -1947,6 +1934,20 @@ mod tests {
             download_f32(&mut backend, &sum),
             vec![3.0, 5.0, 7.0],
             "row sums of [[0, 3], [1, 4], [2, 5]]"
+        );
+    }
+
+    #[test]
+    fn sum_over_empty_axis_downloads_zeros() {
+        let mut backend = backend();
+        let sum = upload_f32(&mut backend, &[], &[2, 0])
+            .sum(&mut backend, 1)
+            .expect("the sum succeeds");
+        assert_eq!(sum.shape().dims(), &[2, 1], "the axis is kept");
+        assert_eq!(
+            download_f32(&mut backend, &sum),
+            vec![0.0, 0.0],
+            "an empty sum is zero"
         );
     }
 

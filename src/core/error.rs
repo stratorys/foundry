@@ -6,11 +6,11 @@ pub enum CoreError {
     #[error("Rank {rank} exceeds the maximum rank {rank_max}.")]
     RankTooLarge { rank: usize, rank_max: usize },
 
-    #[error("Element count of shape {dims:?} overflows usize.")]
-    ElementCountOverflow { dims: Vec<usize> },
-
-    #[error("Contiguous strides of shape {dims:?} overflow usize.")]
-    StrideOverflow { dims: Vec<usize> },
+    #[error("Shape {dims:?} has more than {element_count_max} non-zero elements.")]
+    ElementCountOverflow {
+        dims: Vec<usize>,
+        element_count_max: usize,
+    },
 
     #[error("Offset {offset} plus start {start} times stride {stride} overflows usize.")]
     OffsetOverflow {

@@ -4,10 +4,13 @@ use crate::core::CoreError;
 
 pub const RANK_MAX: usize = 4;
 
+const ELEMENT_COUNT_MAX: usize = 0x7FFF_FFFF;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Shape {
     dims: [usize; RANK_MAX],
     rank: usize,
+    element_count: usize,
 }
 
 impl Shape {
@@ -15,7 +18,7 @@ impl Shape {
 
     pub fn rank(&self) -> usize { self.rank }
 
-    pub fn element_count(&self) -> usize { self.dims().iter().product() }
+    pub fn element_count(&self) -> usize { self.element_count }
 
     pub fn broadcast(
         lhs: &Shape,
@@ -54,14 +57,24 @@ impl TryFrom<&[usize]> for Shape {
                 rank_max: RANK_MAX,
             });
         }
-        dims.iter()
+        let element_count_non_zero = dims
+            .iter()
+            .filter(|&&dim| dim != 0)
             .try_fold(1_usize, |count, &dim| count.checked_mul(dim))
+            .filter(|&count| count <= ELEMENT_COUNT_MAX)
             .ok_or_else(|| CoreError::ElementCountOverflow {
                 dims: dims.to_vec(),
+                element_count_max: ELEMENT_COUNT_MAX,
             })?;
+        let element_count = if dims.contains(&0) {
+            0
+        } else {
+            element_count_non_zero
+        };
         Ok(Self {
             dims: array::from_fn(|axis| dims.get(axis).copied().unwrap_or(1)),
             rank,
+            element_count,
         })
     }
 }
@@ -125,5 +138,50 @@ mod tests {
             matches!(result, Err(CoreError::ElementCountOverflow { .. })),
             "got {result:?}"
         );
+    }
+
+    #[test]
+    fn element_count_above_i32_max_is_rejected() {
+        let result = Shape::try_from([1 << 31].as_slice());
+        assert!(
+            matches!(result, Err(CoreError::ElementCountOverflow { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn element_count_at_i32_max_is_accepted() {
+        assert_eq!(
+            shape(&[(1 << 31) - 1]).element_count(),
+            (1 << 31) - 1,
+            "element count"
+        );
+    }
+
+    #[test]
+    fn non_zero_product_above_i32_max_is_rejected_in_any_axis_order() {
+        [
+            [usize::MAX, 2, 0],
+            [usize::MAX, 0, 2],
+            [0, usize::MAX, 2],
+            [1 << 30, 0, 2],
+        ]
+        .into_iter()
+        .for_each(|dims| {
+            let result = Shape::try_from(dims.as_slice());
+            assert!(
+                matches!(result, Err(CoreError::ElementCountOverflow { .. })),
+                "dims {dims:?} got {result:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn empty_shape_within_bound_is_accepted_in_any_axis_order() {
+        [[(1 << 30) - 1, 0, 2], [0, (1 << 30) - 1, 2]]
+            .into_iter()
+            .for_each(|dims| {
+                assert_eq!(shape(&dims).element_count(), 0, "dims {dims:?}");
+            });
     }
 }

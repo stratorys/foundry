@@ -38,7 +38,7 @@ impl<B: Backend> Tensor<B> {
         shape: Shape,
     ) -> Result<Self, B::Error> {
         let storage = backend.upload(bytes, dtype, &shape)?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn zeros(
@@ -47,7 +47,7 @@ impl<B: Backend> Tensor<B> {
         shape: Shape,
     ) -> Result<Self, B::Error> {
         let storage = backend.zeros(dtype, &shape)?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn download(
@@ -184,7 +184,7 @@ impl<B: Backend> Tensor<B> {
     ) -> Result<Self, B::Error> {
         let (dtype, shape) = matmul_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape())?;
         let storage = backend.matmul(self.operand(), rhs.operand())?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn contiguous(
@@ -196,7 +196,7 @@ impl<B: Backend> Tensor<B> {
         }
         let (dtype, shape) = copy_rule(self.dtype, self.shape())?;
         let storage = backend.copy(self.operand())?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn cast(
@@ -206,7 +206,7 @@ impl<B: Backend> Tensor<B> {
     ) -> Result<Self, B::Error> {
         let (dtype_output, shape) = cast_rule(self.dtype, dtype, self.shape())?;
         let storage = backend.cast(self.operand(), dtype)?;
-        Ok(Self::from_storage(storage, dtype_output, shape)?)
+        Ok(Self::from_storage(storage, dtype_output, shape))
     }
 
     pub fn gather(
@@ -216,7 +216,7 @@ impl<B: Backend> Tensor<B> {
     ) -> Result<Self, B::Error> {
         let (dtype, shape) = gather_rule(self.dtype, self.shape(), indices.dtype, indices.shape())?;
         let storage = backend.gather(self.operand(), indices.operand())?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn concat(
@@ -227,7 +227,7 @@ impl<B: Backend> Tensor<B> {
     ) -> Result<Self, B::Error> {
         let (dtype, shape) = concat_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape(), axis)?;
         let storage = backend.concat(self.operand(), rhs.operand(), axis)?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn slice_update(
@@ -264,7 +264,7 @@ impl<B: Backend> Tensor<B> {
     ) -> Result<Self, B::Error> {
         let (dtype, shape) = unary_rule(self.dtype, self.shape())?;
         let storage = backend.unary(op, self.operand())?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     fn binary(
@@ -276,7 +276,7 @@ impl<B: Backend> Tensor<B> {
         let (dtype, shape) = binary_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape())?;
         let (lhs, rhs) = (self.broadcast_as(shape)?, rhs.broadcast_as(shape)?);
         let storage = backend.binary(op, lhs.operand(), rhs.operand())?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     fn reduce(
@@ -287,19 +287,19 @@ impl<B: Backend> Tensor<B> {
     ) -> Result<Self, B::Error> {
         let (dtype, shape) = reduce_rule(op, self.dtype, self.shape(), axis)?;
         let storage = backend.reduce(op, self.operand(), axis)?;
-        Ok(Self::from_storage(storage, dtype, shape)?)
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     fn from_storage(
         storage: B::Storage,
         dtype: DType,
         shape: Shape,
-    ) -> Result<Self, CoreError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             storage: Rc::new(storage),
-            layout: Layout::contiguous(shape)?,
+            layout: Layout::contiguous(shape),
             dtype,
-        })
+        }
     }
 
     fn view(
@@ -326,7 +326,7 @@ mod tests {
     };
 
     fn contiguous(dims: &[usize]) -> Layout {
-        Layout::contiguous(Shape::try_from(dims).expect("valid shape")).expect("valid layout")
+        Layout::contiguous(Shape::try_from(dims).expect("valid shape"))
     }
 
     #[test]

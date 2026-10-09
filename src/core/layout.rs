@@ -14,12 +14,12 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn contiguous(shape: Shape) -> Result<Self, CoreError> {
-        Ok(Self {
+    pub fn contiguous(shape: Shape) -> Self {
+        Self {
             shape,
-            strides: contiguous_strides(&shape)?,
+            strides: contiguous_strides(&shape),
             offset: 0,
-        })
+        }
     }
 
     pub fn shape(&self) -> &Shape { &self.shape }
@@ -29,13 +29,12 @@ impl Layout {
     pub fn offset(&self) -> usize { self.offset }
 
     pub fn is_contiguous(&self) -> bool {
-        contiguous_strides(&self.shape).is_ok_and(|expected| {
-            self.shape
-                .dims()
-                .iter()
-                .zip(self.strides().iter().zip(expected.iter()))
-                .all(|(&dim, (&stride, &stride_expected))| dim == 1 || stride == stride_expected)
-        })
+        let expected = contiguous_strides(&self.shape);
+        self.shape
+            .dims()
+            .iter()
+            .zip(self.strides().iter().zip(expected.iter()))
+            .all(|(&dim, (&stride, &stride_expected))| dim == 1 || stride == stride_expected)
     }
 
     pub fn reshape(
@@ -54,7 +53,7 @@ impl Layout {
         }
         Ok(Self {
             offset: self.offset,
-            ..Self::contiguous(shape)?
+            ..Self::contiguous(shape)
         })
     }
 
@@ -167,23 +166,16 @@ impl Layout {
     }
 }
 
-fn contiguous_strides(shape: &Shape) -> Result<[usize; RANK_MAX], CoreError> {
-    let (strides_reversed, _) = shape
-        .dims()
-        .iter()
-        .rev()
-        .try_fold(
-            (Vec::with_capacity(RANK_MAX), 1_usize),
-            |(mut strides, stride_next), &dim| {
-                strides.push(stride_next);
-                stride_next.checked_mul(dim).map(|stride| (strides, stride))
-            },
-        )
-        .ok_or_else(|| CoreError::StrideOverflow {
-            dims: shape.dims().to_vec(),
-        })?;
+fn contiguous_strides(shape: &Shape) -> [usize; RANK_MAX] {
+    let (strides_reversed, _) = shape.dims().iter().rev().fold(
+        (Vec::with_capacity(RANK_MAX), 1_usize),
+        |(mut strides, stride_next), &dim| {
+            strides.push(stride_next);
+            (strides, stride_next.saturating_mul(dim))
+        },
+    );
     let strides: Vec<usize> = strides_reversed.into_iter().rev().collect();
-    Ok(padded(&strides))
+    padded(&strides)
 }
 
 fn permuted(
@@ -206,7 +198,7 @@ mod tests {
     };
 
     fn contiguous(dims: &[usize]) -> Layout {
-        Layout::contiguous(Shape::try_from(dims).expect("valid shape")).expect("valid layout")
+        Layout::contiguous(Shape::try_from(dims).expect("valid shape"))
     }
 
     #[test]
@@ -216,16 +208,6 @@ mod tests {
         assert!(
             layout.is_contiguous(),
             "contiguous layout reports contiguous"
-        );
-    }
-
-    #[test]
-    fn contiguous_rejects_stride_overflow() {
-        let shape = Shape::try_from([0, usize::MAX, 2].as_slice()).expect("valid shape");
-        let result = Layout::contiguous(shape);
-        assert!(
-            matches!(result, Err(CoreError::StrideOverflow { .. })),
-            "got {result:?}"
         );
     }
 
@@ -359,13 +341,13 @@ mod tests {
     fn with_dims(
         dims: &[usize],
         size: impl Fn(usize, usize) -> usize,
-    ) -> Option<Shape> {
+    ) -> Shape {
         let dims: Vec<usize> = dims
             .iter()
             .enumerate()
             .map(|(axis, &dim)| size(axis, dim))
             .collect();
-        Shape::try_from(dims.as_slice()).ok()
+        Shape::try_from(dims.as_slice()).expect("a widened shape is valid")
     }
 
     fn narrows(layout: &Layout) -> Vec<Layout> {
@@ -382,7 +364,11 @@ mod tests {
                 ]
                 .into_iter()
                 .flatten()
-                .filter_map(move |(start, len)| layout.narrow(axis, start, len).ok())
+                .map(move |(start, len)| {
+                    layout
+                        .narrow(axis, start, len)
+                        .expect("the window is in bounds")
+                })
             })
             .collect()
     }
@@ -393,7 +379,7 @@ mod tests {
         let rotated: Vec<usize> = (1..rank).chain((rank > 0).then_some(0)).collect();
         [reversed, rotated]
             .iter()
-            .filter_map(|axes| layout.permute(axes).ok())
+            .map(|axes| layout.permute(axes).expect("the axes are a permutation"))
             .collect()
     }
 
@@ -411,15 +397,17 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|&(_, &dim)| dim == 1)
-            .filter_map(|(widened, _)| {
-                with_dims(dims, |axis, dim| if axis == widened { 2 } else { dim })
-            });
+            .map(|(widened, _)| with_dims(dims, |axis, dim| if axis == widened { 2 } else { dim }));
         Shape::try_from(leading.as_slice())
             .ok()
             .into_iter()
-            .chain(widened_all)
+            .chain([widened_all])
             .chain(widened_each)
-            .filter_map(|shape| layout.broadcast_as(shape).ok())
+            .map(|shape| {
+                layout
+                    .broadcast_as(shape)
+                    .expect("the shape is broadcastable")
+            })
             .collect()
     }
 
@@ -485,6 +473,28 @@ mod tests {
             widened.contains(&[2, 3, 5, 4].as_slice())
                 && widened.contains(&[1, 3, 2, 4].as_slice()),
             "got {widened:?}"
+        );
+    }
+
+    #[test]
+    fn broadcast_as_beyond_i32_max_is_rejected() {
+        let dim = usize::try_from(u32::MAX).expect("u32 fits in usize");
+        let result = Shape::try_from([dim].as_slice())
+            .and_then(|shape| contiguous(&[1]).broadcast_as(shape));
+        assert!(result.is_err(), "got {result:?}");
+    }
+
+    #[test]
+    fn empty_contiguous_strides_do_not_depend_on_axis_order() {
+        assert_eq!(
+            contiguous(&[(1 << 30) - 1, 0, 2]).strides(),
+            &[0, 2, 1],
+            "zero dim in the middle"
+        );
+        assert_eq!(
+            contiguous(&[0, (1 << 30) - 1, 2]).strides(),
+            &[(1 << 31) - 2, 2, 1],
+            "zero dim first"
         );
     }
 
