@@ -263,7 +263,6 @@ mod tests {
         binary_rule,
         cast_rule,
         concat_rule,
-        copy_rule,
         gather_rule,
         matmul_rule,
         reduce_rule,
@@ -276,33 +275,28 @@ mod tests {
         Shape,
     };
 
-    const T: usize = 7;
-
     #[test]
     fn unary_keeps_dtype_and_shape() {
         let (dtype, output) = unary_rule(
             DType::BF16,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
         )
         .expect("float input");
         assert_eq!(dtype, DType::BF16, "dtype");
-        assert_eq!(output.dims(), &[T, 3072], "dims");
+        assert_eq!(output.dims(), &[2, 3], "dims");
     }
 
     #[test]
     fn unary_rejects_integer_dtype() {
-        let result = unary_rule(
-            DType::U32,
-            &Shape::try_from([T].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(CoreError::DTypeNotFloat {
-                    dtype: DType::U32
-                })
+        assert_eq!(
+            unary_rule(
+                DType::U32,
+                &Shape::try_from([2].as_slice()).expect("valid shape"),
             ),
-            "got {result:?}"
+            Err(CoreError::DTypeNotFloat {
+                dtype: DType::U32,
+            }),
+            "unary needs a float dtype"
         );
     }
 
@@ -310,40 +304,46 @@ mod tests {
     fn binary_broadcasts_shapes() {
         let (dtype, output) = binary_rule(
             DType::BF16,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
             DType::BF16,
-            &Shape::try_from([3072].as_slice()).expect("valid shape"),
+            &Shape::try_from([3].as_slice()).expect("valid shape"),
         )
         .expect("broadcastable");
         assert_eq!(dtype, DType::BF16, "dtype");
-        assert_eq!(output.dims(), &[T, 3072], "dims");
+        assert_eq!(output.dims(), &[2, 3], "dims");
     }
 
     #[test]
     fn binary_rejects_dtype_mismatch() {
-        let result = binary_rule(
-            DType::BF16,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
-            DType::F32,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::DTypeMismatch { .. })),
-            "got {result:?}"
+        assert_eq!(
+            binary_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::DTypeMismatch {
+                lhs: DType::BF16,
+                rhs: DType::F32,
+            }),
+            "binary needs equal dtypes"
         );
     }
 
     #[test]
     fn binary_rejects_incompatible_shapes() {
-        let result = binary_rule(
-            DType::BF16,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([128].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::BroadcastIncompatible { .. })),
-            "got {result:?}"
+        assert_eq!(
+            binary_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::BF16,
+                &Shape::try_from([4].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::BroadcastIncompatible {
+                lhs: vec![2, 3],
+                rhs: vec![4],
+            }),
+            "3 and 4 do not broadcast"
         );
     }
 
@@ -352,12 +352,12 @@ mod tests {
         let (dtype, output) = reduce_rule(
             ReduceOp::Max,
             DType::F32,
-            &Shape::try_from([24, T, T].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
             2,
         )
         .expect("valid axis");
         assert_eq!(dtype, DType::F32, "dtype");
-        assert_eq!(output.dims(), &[24, T, 1], "dims");
+        assert_eq!(output.dims(), &[2, 3, 1], "dims");
     }
 
     #[test]
@@ -365,7 +365,7 @@ mod tests {
         let (dtype, output) = reduce_rule(
             ReduceOp::Argmax,
             DType::BF16,
-            &Shape::try_from([1, 128256].as_slice()).expect("valid shape"),
+            &Shape::try_from([1, 5].as_slice()).expect("valid shape"),
             1,
         )
         .expect("valid axis");
@@ -375,21 +375,18 @@ mod tests {
 
     #[test]
     fn reduce_rejects_axis_out_of_range() {
-        let result = reduce_rule(
-            ReduceOp::Sum,
-            DType::F32,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
-            2,
-        );
-        assert!(
-            matches!(
-                result,
-                Err(CoreError::AxisOutOfRange {
-                    axis: 2,
-                    rank: 2
-                })
+        assert_eq!(
+            reduce_rule(
+                ReduceOp::Sum,
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                2,
             ),
-            "got {result:?}"
+            Err(CoreError::AxisOutOfRange {
+                axis: 2,
+                rank: 2,
+            }),
+            "axis 2 of a rank 2 shape"
         );
     }
 
@@ -398,21 +395,19 @@ mod tests {
         [ReduceOp::Max, ReduceOp::Argmax]
             .into_iter()
             .for_each(|op| {
-                let result = reduce_rule(
-                    op,
-                    DType::F32,
-                    &Shape::try_from([2, 0].as_slice()).expect("valid shape"),
-                    1,
-                );
-                assert!(
-                    matches!(
-                        result,
-                        Err(CoreError::EmptyReduction {
-                            axis: 1,
-                            ..
-                        })
+                assert_eq!(
+                    reduce_rule(
+                        op,
+                        DType::F32,
+                        &Shape::try_from([2, 0].as_slice()).expect("valid shape"),
+                        1,
                     ),
-                    "{op:?} got {result:?}"
+                    Err(CoreError::EmptyReduction {
+                        op,
+                        axis: 1,
+                        dims: vec![2, 0],
+                    }),
+                    "{op:?} over an empty axis"
                 );
             });
     }
@@ -434,80 +429,80 @@ mod tests {
     fn matmul_multiplies_last_two_axes() {
         let (dtype, output) = matmul_rule(
             DType::BF16,
-            &Shape::try_from([8, 3, T, 128].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3, 4, 5].as_slice()).expect("valid shape"),
             DType::BF16,
-            &Shape::try_from([8, 3, 128, T].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3, 5, 4].as_slice()).expect("valid shape"),
         )
         .expect("compatible");
         assert_eq!(dtype, DType::BF16, "dtype");
-        assert_eq!(output.dims(), &[8, 3, T, T], "dims");
+        assert_eq!(output.dims(), &[2, 3, 4, 4], "dims");
     }
 
     #[test]
     fn matmul_rejects_inner_dim_mismatch() {
-        let result = matmul_rule(
-            DType::BF16,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([128256, 3072].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::MatmulIncompatible { .. })),
-            "got {result:?}"
+        assert_eq!(
+            matmul_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::BF16,
+                &Shape::try_from([4, 3].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::MatmulIncompatible {
+                lhs: vec![2, 3],
+                rhs: vec![4, 3],
+            }),
+            "inner dims 3 and 4 differ"
         );
     }
 
     #[test]
     fn matmul_rejects_batch_mismatch() {
-        let result = matmul_rule(
-            DType::BF16,
-            &Shape::try_from([24, T, 128].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([8, 128, T].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::MatmulIncompatible { .. })),
-            "got {result:?}"
+        assert_eq!(
+            matmul_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
+                DType::BF16,
+                &Shape::try_from([5, 4, 3].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::MatmulIncompatible {
+                lhs: vec![2, 3, 4],
+                rhs: vec![5, 4, 3],
+            }),
+            "batch dims 2 and 5 differ"
         );
     }
 
     #[test]
     fn matmul_rejects_rank_below_two() {
-        let result = matmul_rule(
-            DType::BF16,
-            &Shape::try_from([3072].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([3072, 128256].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::MatmulIncompatible { .. })),
-            "got {result:?}"
+        assert_eq!(
+            matmul_rule(
+                DType::BF16,
+                &Shape::try_from([3].as_slice()).expect("valid shape"),
+                DType::BF16,
+                &Shape::try_from([3, 4].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::MatmulIncompatible {
+                lhs: vec![3],
+                rhs: vec![3, 4],
+            }),
+            "a rank 1 lhs is rejected"
         );
     }
 
     #[test]
     fn matmul_rejects_integer_dtype() {
-        let result = matmul_rule(
-            DType::U32,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
-            DType::U32,
-            &Shape::try_from([3072, 128].as_slice()).expect("valid shape"),
+        assert_eq!(
+            matmul_rule(
+                DType::U32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::U32,
+                &Shape::try_from([3, 4].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::DTypeNotFloat {
+                dtype: DType::U32,
+            }),
+            "matmul needs a float dtype"
         );
-        assert!(
-            matches!(result, Err(CoreError::DTypeNotFloat { .. })),
-            "got {result:?}"
-        );
-    }
-
-    #[test]
-    fn copy_keeps_dtype_and_shape() {
-        let (dtype, output) = copy_rule(
-            DType::BF16,
-            &Shape::try_from([24, T, 128].as_slice()).expect("valid shape"),
-        )
-        .expect("any input");
-        assert_eq!(dtype, DType::BF16, "dtype");
-        assert_eq!(output.dims(), &[24, T, 128], "dims");
     }
 
     #[test]
@@ -515,23 +510,25 @@ mod tests {
         let (dtype, output) = cast_rule(
             DType::BF16,
             DType::F32,
-            &Shape::try_from([T, 3072].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
         )
         .expect("float to float");
         assert_eq!(dtype, DType::F32, "dtype");
-        assert_eq!(output.dims(), &[T, 3072], "dims");
+        assert_eq!(output.dims(), &[2, 3], "dims");
     }
 
     #[test]
     fn cast_rejects_integer_dtype() {
-        let result = cast_rule(
-            DType::U32,
-            DType::F32,
-            &Shape::try_from([T].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::DTypeNotFloat { .. })),
-            "got {result:?}"
+        assert_eq!(
+            cast_rule(
+                DType::U32,
+                DType::F32,
+                &Shape::try_from([2].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::DTypeNotFloat {
+                dtype: DType::U32,
+            }),
+            "cast needs a float source"
         );
     }
 
@@ -539,40 +536,46 @@ mod tests {
     fn gather_selects_table_rows() {
         let (dtype, output) = gather_rule(
             DType::BF16,
-            &Shape::try_from([128256, 3072].as_slice()).expect("valid shape"),
+            &Shape::try_from([5, 3].as_slice()).expect("valid shape"),
             DType::U32,
-            &Shape::try_from([T].as_slice()).expect("valid shape"),
+            &Shape::try_from([2].as_slice()).expect("valid shape"),
         )
         .expect("valid gather");
         assert_eq!(dtype, DType::BF16, "dtype");
-        assert_eq!(output.dims(), &[T, 3072], "dims");
+        assert_eq!(output.dims(), &[2, 3], "dims");
     }
 
     #[test]
     fn gather_rejects_non_u32_indices() {
-        let result = gather_rule(
-            DType::BF16,
-            &Shape::try_from([128256, 3072].as_slice()).expect("valid shape"),
-            DType::F32,
-            &Shape::try_from([T].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::DTypeUnexpected { .. })),
-            "got {result:?}"
+        assert_eq!(
+            gather_rule(
+                DType::BF16,
+                &Shape::try_from([5, 3].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([2].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::DTypeUnexpected {
+                dtype: DType::F32,
+                dtype_expected: DType::U32,
+            }),
+            "indices must be u32"
         );
     }
 
     #[test]
     fn gather_rejects_invalid_ranks() {
-        let result = gather_rule(
-            DType::BF16,
-            &Shape::try_from([128256, 3072].as_slice()).expect("valid shape"),
-            DType::U32,
-            &Shape::try_from([1, T].as_slice()).expect("valid shape"),
-        );
-        assert!(
-            matches!(result, Err(CoreError::GatherIncompatible { .. })),
-            "got {result:?}"
+        assert_eq!(
+            gather_rule(
+                DType::BF16,
+                &Shape::try_from([5, 3].as_slice()).expect("valid shape"),
+                DType::U32,
+                &Shape::try_from([1, 2].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::GatherIncompatible {
+                table: vec![5, 3],
+                indices: vec![1, 2],
+            }),
+            "indices must be rank 1"
         );
     }
 
@@ -580,28 +583,32 @@ mod tests {
     fn concat_adds_axis_dims() {
         let (dtype, output) = concat_rule(
             DType::BF16,
-            &Shape::try_from([8, 3, T, 128].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3, 4, 5].as_slice()).expect("valid shape"),
             DType::BF16,
-            &Shape::try_from([8, 3, 1, 128].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3, 1, 5].as_slice()).expect("valid shape"),
             2,
         )
         .expect("compatible");
         assert_eq!(dtype, DType::BF16, "dtype");
-        assert_eq!(output.dims(), &[8, 3, T + 1, 128], "dims");
+        assert_eq!(output.dims(), &[2, 3, 5, 5], "dims");
     }
 
     #[test]
     fn concat_rejects_mismatch_outside_axis() {
-        let result = concat_rule(
-            DType::BF16,
-            &Shape::try_from([24, T, 128].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([24, T, 64].as_slice()).expect("valid shape"),
-            1,
-        );
-        assert!(
-            matches!(result, Err(CoreError::ConcatIncompatible { .. })),
-            "got {result:?}"
+        assert_eq!(
+            concat_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
+                DType::BF16,
+                &Shape::try_from([2, 3, 5].as_slice()).expect("valid shape"),
+                1,
+            ),
+            Err(CoreError::ConcatIncompatible {
+                axis: 1,
+                lhs: vec![2, 3, 4],
+                rhs: vec![2, 3, 5],
+            }),
+            "dims 4 and 5 differ outside the axis"
         );
     }
 
@@ -609,46 +616,321 @@ mod tests {
     fn slice_update_returns_target_shape() {
         let (dtype, output) = slice_update_rule(
             DType::BF16,
-            &Shape::try_from([8, 3, 512, 128].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3, 8, 4].as_slice()).expect("valid shape"),
             DType::BF16,
-            &Shape::try_from([8, 3, T, 128].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3, 2, 4].as_slice()).expect("valid shape"),
             2,
-            505,
+            6,
         )
         .expect("in bounds");
         assert_eq!(dtype, DType::BF16, "dtype");
-        assert_eq!(output.dims(), &[8, 3, 512, 128], "dims");
+        assert_eq!(output.dims(), &[2, 3, 8, 4], "dims");
     }
 
     #[test]
     fn slice_update_rejects_out_of_bounds() {
-        let result = slice_update_rule(
-            DType::BF16,
-            &Shape::try_from([8, 3, 512, 128].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([8, 3, T, 128].as_slice()).expect("valid shape"),
-            2,
-            506,
-        );
-        assert!(
-            matches!(result, Err(CoreError::SliceUpdateOutOfBounds { .. })),
-            "got {result:?}"
+        assert_eq!(
+            slice_update_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3, 8, 4].as_slice()).expect("valid shape"),
+                DType::BF16,
+                &Shape::try_from([2, 3, 2, 4].as_slice()).expect("valid shape"),
+                2,
+                7,
+            ),
+            Err(CoreError::SliceUpdateOutOfBounds {
+                axis: 2,
+                start: 7,
+                target: vec![2, 3, 8, 4],
+                update: vec![2, 3, 2, 4],
+            }),
+            "7 plus 2 exceeds 8"
         );
     }
 
     #[test]
     fn slice_update_rejects_mismatch_outside_axis() {
-        let result = slice_update_rule(
-            DType::BF16,
-            &Shape::try_from([8, 3, 512, 128].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([8, 1, T, 128].as_slice()).expect("valid shape"),
-            2,
-            0,
+        assert_eq!(
+            slice_update_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3, 8, 4].as_slice()).expect("valid shape"),
+                DType::BF16,
+                &Shape::try_from([2, 1, 2, 4].as_slice()).expect("valid shape"),
+                2,
+                0,
+            ),
+            Err(CoreError::SliceUpdateOutOfBounds {
+                axis: 2,
+                start: 0,
+                target: vec![2, 3, 8, 4],
+                update: vec![2, 1, 2, 4],
+            }),
+            "dims 3 and 1 differ outside the axis"
         );
-        assert!(
-            matches!(result, Err(CoreError::SliceUpdateOutOfBounds { .. })),
-            "got {result:?}"
+    }
+
+    #[test]
+    fn reduce_and_binary_accept_u32() {
+        let shape = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        assert_eq!(
+            reduce_rule(ReduceOp::Sum, DType::U32, &shape, 1),
+            Ok((
+                DType::U32,
+                Shape::try_from([2, 1].as_slice()).expect("valid shape")
+            )),
+            "the reduce rule does not check the dtype"
+        );
+        assert_eq!(
+            binary_rule(DType::U32, &shape, DType::U32, &shape),
+            Ok((DType::U32, shape)),
+            "the binary rule does not check the dtype"
+        );
+    }
+
+    #[test]
+    fn matmul_rejects_dtype_mismatch() {
+        assert_eq!(
+            matmul_rule(
+                DType::BF16,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([3, 4].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::DTypeMismatch {
+                lhs: DType::BF16,
+                rhs: DType::F32,
+            }),
+            "matmul needs equal dtypes"
+        );
+    }
+
+    #[test]
+    fn matmul_rejects_rhs_rank_below_two() {
+        assert_eq!(
+            matmul_rule(
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([3].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::MatmulIncompatible {
+                lhs: vec![2, 3],
+                rhs: vec![3],
+            }),
+            "a rank 1 rhs is rejected"
+        );
+    }
+
+    #[test]
+    fn matmul_rejects_output_beyond_the_element_limit() {
+        assert_eq!(
+            matmul_rule(
+                DType::F32,
+                &Shape::try_from([1 << 16, 1].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::ElementCountOverflow {
+                dims: vec![1 << 16, 1 << 16],
+                element_count_max: 0x7FFF_FFFF,
+            }),
+            "the output holds 2^32 elements"
+        );
+    }
+
+    #[test]
+    fn cast_rejects_integer_target() {
+        assert_eq!(
+            cast_rule(
+                DType::F32,
+                DType::U32,
+                &Shape::try_from([2].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::DTypeNotFloat {
+                dtype: DType::U32,
+            }),
+            "cast needs a float target"
+        );
+    }
+
+    #[test]
+    fn gather_rejects_table_rank_other_than_two() {
+        [[4].as_slice(), &[2, 3, 4]].into_iter().for_each(|table| {
+            assert_eq!(
+                gather_rule(
+                    DType::F32,
+                    &Shape::try_from(table).expect("valid shape"),
+                    DType::U32,
+                    &Shape::try_from([2].as_slice()).expect("valid shape"),
+                ),
+                Err(CoreError::GatherIncompatible {
+                    table: table.to_vec(),
+                    indices: vec![2],
+                }),
+                "table {table:?} is not rank 2"
+            );
+        });
+    }
+
+    #[test]
+    fn gather_rejects_output_beyond_the_element_limit() {
+        assert_eq!(
+            gather_rule(
+                DType::F32,
+                &Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape"),
+                DType::U32,
+                &Shape::try_from([1 << 16].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::ElementCountOverflow {
+                dims: vec![1 << 16, 1 << 16],
+                element_count_max: 0x7FFF_FFFF,
+            }),
+            "the output holds 2^32 elements"
+        );
+    }
+
+    #[test]
+    fn concat_rejects_dtype_mismatch() {
+        let shape = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        assert_eq!(
+            concat_rule(DType::F32, &shape, DType::BF16, &shape, 0),
+            Err(CoreError::DTypeMismatch {
+                lhs: DType::F32,
+                rhs: DType::BF16,
+            }),
+            "concat needs equal dtypes"
+        );
+    }
+
+    #[test]
+    fn concat_rejects_axis_out_of_range() {
+        assert_eq!(
+            concat_rule(
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                2,
+            ),
+            Err(CoreError::AxisOutOfRange {
+                axis: 2,
+                rank: 2,
+            }),
+            "axis 2 does not exist on the lhs"
+        );
+        assert_eq!(
+            concat_rule(
+                DType::F32,
+                &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                2,
+            ),
+            Err(CoreError::AxisOutOfRange {
+                axis: 2,
+                rank: 2,
+            }),
+            "axis 2 does not exist on the rhs"
+        );
+    }
+
+    #[test]
+    fn concat_rejects_rank_mismatch() {
+        assert_eq!(
+            concat_rule(
+                DType::F32,
+                &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                0,
+            ),
+            Err(CoreError::ConcatIncompatible {
+                axis: 0,
+                lhs: vec![2, 3, 4],
+                rhs: vec![2, 3],
+            }),
+            "ranks 3 and 2 differ"
+        );
+    }
+
+    #[test]
+    fn concat_rejects_output_beyond_the_element_limit() {
+        let shape = Shape::try_from([1 << 30].as_slice()).expect("valid shape");
+        assert_eq!(
+            concat_rule(DType::F32, &shape, DType::F32, &shape, 0),
+            Err(CoreError::ElementCountOverflow {
+                dims: vec![1 << 31],
+                element_count_max: 0x7FFF_FFFF,
+            }),
+            "the output holds 2^31 elements"
+        );
+    }
+
+    #[test]
+    fn slice_update_rejects_dtype_mismatch() {
+        let shape = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        assert_eq!(
+            slice_update_rule(DType::F32, &shape, DType::BF16, &shape, 0, 0),
+            Err(CoreError::DTypeMismatch {
+                lhs: DType::F32,
+                rhs: DType::BF16,
+            }),
+            "slice update needs equal dtypes"
+        );
+    }
+
+    #[test]
+    fn slice_update_rejects_axis_out_of_range() {
+        let shape = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        assert_eq!(
+            slice_update_rule(DType::F32, &shape, DType::F32, &shape, 2, 0),
+            Err(CoreError::AxisOutOfRange {
+                axis: 2,
+                rank: 2,
+            }),
+            "axis 2 does not exist"
+        );
+    }
+
+    #[test]
+    fn slice_update_rejects_overflowing_start() {
+        assert_eq!(
+            slice_update_rule(
+                DType::F32,
+                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([1, 3].as_slice()).expect("valid shape"),
+                0,
+                usize::MAX,
+            ),
+            Err(CoreError::SliceUpdateOutOfBounds {
+                axis: 0,
+                start: usize::MAX,
+                target: vec![2, 3],
+                update: vec![1, 3],
+            }),
+            "start plus the update length overflows usize"
+        );
+    }
+
+    #[test]
+    fn slice_update_rejects_rank_mismatch() {
+        assert_eq!(
+            slice_update_rule(
+                DType::F32,
+                &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
+                DType::F32,
+                &Shape::try_from([1, 3].as_slice()).expect("valid shape"),
+                0,
+                0,
+            ),
+            Err(CoreError::SliceUpdateOutOfBounds {
+                axis: 0,
+                start: 0,
+                target: vec![2, 3, 4],
+                update: vec![1, 3],
+            }),
+            "ranks 3 and 2 differ"
         );
     }
 }

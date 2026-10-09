@@ -115,42 +115,109 @@ mod tests {
             &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
             &Shape::try_from([4, 3].as_slice()).expect("valid shape"),
         );
-        assert!(
-            matches!(result, Err(CoreError::BroadcastIncompatible { .. })),
-            "got {result:?}"
+        assert_eq!(
+            result,
+            Err(CoreError::BroadcastIncompatible {
+                lhs: vec![2, 3],
+                rhs: vec![4, 3],
+            }),
+            "dims 2 and 4 do not broadcast"
+        );
+    }
+
+    #[test]
+    fn broadcast_prepends_missing_axes_on_the_left() {
+        let short = Shape::try_from([3].as_slice()).expect("valid shape");
+        let long = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        assert_eq!(
+            Shape::broadcast(&short, &long),
+            Ok(long),
+            "the shorter shape on the left"
+        );
+        assert_eq!(
+            Shape::broadcast(&long, &short),
+            Ok(long),
+            "the shorter shape on the right"
+        );
+    }
+
+    #[test]
+    fn broadcast_of_a_scalar_takes_the_other_shape() {
+        let scalar = Shape::try_from([].as_slice()).expect("valid shape");
+        let matrix = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        assert_eq!(
+            Shape::broadcast(&scalar, &matrix),
+            Ok(matrix),
+            "a scalar broadcasts to any shape"
+        );
+    }
+
+    #[test]
+    fn broadcast_beyond_the_element_limit_is_rejected() {
+        assert_eq!(
+            Shape::broadcast(
+                &Shape::try_from([1 << 30, 1].as_slice()).expect("valid shape"),
+                &Shape::try_from([1, 4].as_slice()).expect("valid shape"),
+            ),
+            Err(CoreError::ElementCountOverflow {
+                dims: vec![1 << 30, 4],
+                element_count_max: 0x7FFF_FFFF,
+            }),
+            "two valid shapes can broadcast to an invalid one"
         );
     }
 
     #[test]
     fn rank_above_max_is_rejected() {
-        let result = Shape::try_from([1, 2, 3, 4, 5].as_slice());
-        assert!(
-            matches!(
-                result,
-                Err(CoreError::RankTooLarge {
-                    rank: 5,
-                    ..
-                })
-            ),
-            "got {result:?}"
+        assert_eq!(
+            Shape::try_from([1, 2, 3, 4, 5].as_slice()),
+            Err(CoreError::RankTooLarge {
+                rank: 5,
+                rank_max: 4,
+            }),
+            "rank 5 is rejected"
+        );
+    }
+
+    #[test]
+    fn rank_at_max_is_accepted() {
+        assert_eq!(
+            Shape::try_from([1, 2, 3, 4].as_slice()).map(|shape| shape.rank()),
+            Ok(4),
+            "rank 4 is accepted"
+        );
+    }
+
+    #[test]
+    fn scalar_has_one_element() {
+        assert_eq!(
+            Shape::try_from([].as_slice()).map(|shape| shape.element_count()),
+            Ok(1),
+            "a rank 0 shape holds one element"
         );
     }
 
     #[test]
     fn element_count_overflow_is_rejected() {
-        let result = Shape::try_from([usize::MAX, 2].as_slice());
-        assert!(
-            matches!(result, Err(CoreError::ElementCountOverflow { .. })),
-            "got {result:?}"
+        assert_eq!(
+            Shape::try_from([usize::MAX, 2].as_slice()),
+            Err(CoreError::ElementCountOverflow {
+                dims: vec![usize::MAX, 2],
+                element_count_max: 0x7FFF_FFFF,
+            }),
+            "the product overflows usize"
         );
     }
 
     #[test]
     fn element_count_above_i32_max_is_rejected() {
-        let result = Shape::try_from([1 << 31].as_slice());
-        assert!(
-            matches!(result, Err(CoreError::ElementCountOverflow { .. })),
-            "got {result:?}"
+        assert_eq!(
+            Shape::try_from([1 << 31].as_slice()),
+            Err(CoreError::ElementCountOverflow {
+                dims: vec![1 << 31],
+                element_count_max: 0x7FFF_FFFF,
+            }),
+            "one element above i32::MAX"
         );
     }
 
@@ -175,10 +242,13 @@ mod tests {
         ]
         .into_iter()
         .for_each(|dims| {
-            let result = Shape::try_from(dims.as_slice());
-            assert!(
-                matches!(result, Err(CoreError::ElementCountOverflow { .. })),
-                "dims {dims:?} got {result:?}"
+            assert_eq!(
+                Shape::try_from(dims.as_slice()),
+                Err(CoreError::ElementCountOverflow {
+                    dims: dims.to_vec(),
+                    element_count_max: 0x7FFF_FFFF,
+                }),
+                "dims {dims:?}"
             );
         });
     }

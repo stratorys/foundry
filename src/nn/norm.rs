@@ -82,7 +82,7 @@ mod tests {
     use crate::nn::RmsNorm;
 
     #[test]
-    fn rms_norm_of_constant_rows_is_the_weight() {
+    fn rms_norm_matches_hand_computed_values() {
         let mut backend = CpuBackend::new();
         let weight = Tensor::upload(
             &mut backend,
@@ -99,7 +99,7 @@ mod tests {
         let norm = RmsNorm::new(&mut backend, weight, 1e-5).expect("the norm is built");
         let x = Tensor::upload(
             &mut backend,
-            &[2.0_f32, 2.0, 2.0, 2.0, -3.0, -3.0, -3.0, -3.0]
+            &[1.0_f32, 2.0, 3.0, 4.0, -2.0, 0.0, 2.0, 4.0]
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
@@ -122,7 +122,16 @@ mod tests {
             .iter()
             .map(|&chunk| f32::from_le_bytes(chunk))
             .collect();
-        let expected = [1.0_f32, 2.0, 0.5, -1.0, -1.0, -2.0, -0.5, 1.0];
+        let expected = [
+            0.365_148_f32,
+            1.460_593,
+            0.547_722,
+            -1.460_593,
+            -0.816_496,
+            0.0,
+            0.408_248,
+            -1.632_992,
+        ];
         assert_eq!(actual.len(), expected.len(), "element count");
         actual.iter().zip(expected).for_each(|(&actual, expected)| {
             assert!(

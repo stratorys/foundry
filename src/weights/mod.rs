@@ -10,13 +10,18 @@ use std::fs::{
     self,
     File,
 };
+use std::io;
 use std::ops::Range;
 use std::path::Path;
 
 use memmap2::Mmap;
 use serde::Deserialize;
 
-pub use self::error::WeightsError;
+pub use self::error::{
+    IoError,
+    JsonError,
+    WeightsError,
+};
 use crate::core::{
     DType,
     Shape,
@@ -29,13 +34,13 @@ const HEADER_LEN_BYTES: usize = 8;
 const HEADER_BYTES_MAX: usize = 100 * 1024 * 1024;
 const INDEX_BYTES_MAX: u64 = 100 * 1024 * 1024;
 
-pub struct Weights {
-    shards: Vec<Mmap>,
+pub struct Weights<S = Mmap> {
+    shards: Vec<S>,
     tensors: HashMap<String, TensorEntry>,
     bytes_declared: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WeightView<'weights> {
     pub dtype: DType,
     pub shape: Shape,
@@ -80,7 +85,7 @@ impl Weights {
     pub fn open(directory: &Path) -> Result<Self, WeightsError> {
         let index_path = directory.join(INDEX_FILE);
         let index = if index_path.is_file() {
-            Some(read_index(&index_path)?)
+            Some(parse_index(&index_path, &read_index(&index_path)?)?)
         } else {
             None
         };
@@ -94,12 +99,65 @@ impl Weights {
                 .collect(),
             None => vec![SINGLE_FILE.to_owned()],
         };
-        let (shards, shard_tensors): (Vec<Mmap>, Vec<Vec<ShardTensor>>) = shard_names
-            .iter()
-            .map(|name| open_shard(directory, name))
-            .collect::<Result<Vec<_>, WeightsError>>()?
+        let shards = shard_names
             .into_iter()
-            .unzip();
+            .map(|name| {
+                let shard = open_shard(directory, &name)?;
+                Ok((name, shard))
+            })
+            .collect::<Result<Vec<(String, Mmap)>, WeightsError>>()?;
+        Self::assemble(directory, index, shards)
+    }
+}
+
+impl<S: AsRef<[u8]>> Weights<S> {
+    pub fn from_shards(
+        index: Option<&[u8]>,
+        shards: Vec<(String, S)>,
+    ) -> Result<Self, WeightsError> {
+        let index = index
+            .map(|bytes| parse_index(Path::new(INDEX_FILE), bytes))
+            .transpose()?;
+        Self::assemble(Path::new(""), index, shards)
+    }
+
+    pub fn get(
+        &self,
+        name: &str,
+    ) -> Result<WeightView<'_>, WeightsError> {
+        let not_found = || WeightsError::TensorNotFound {
+            name: name.to_owned(),
+        };
+        let entry = self.tensors.get(name).ok_or_else(not_found)?;
+        let bytes = self
+            .shards
+            .get(entry.shard_index)
+            .and_then(|shard| shard.as_ref().get(entry.byte_range.clone()))
+            .ok_or_else(not_found)?;
+        Ok(WeightView {
+            dtype: entry.dtype,
+            shape: entry.shape,
+            bytes,
+        })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> { self.tensors.keys().map(String::as_str) }
+
+    pub fn shard_count(&self) -> usize { self.shards.len() }
+
+    pub fn bytes_declared(&self) -> Option<u64> { self.bytes_declared }
+
+    fn assemble(
+        directory: &Path,
+        index: Option<IndexFile>,
+        shards: Vec<(String, S)>,
+    ) -> Result<Self, WeightsError> {
+        let (shard_names, shards): (Vec<String>, Vec<S>) = shards.into_iter().unzip();
+        let shard_tensors = shard_names
+            .iter()
+            .zip(&shards)
+            .map(|(name, shard)| parse_shard(&directory.join(name), shard.as_ref()))
+            .collect::<Result<Vec<Vec<ShardTensor>>, WeightsError>>()?;
         let tensors = shard_tensors
             .into_iter()
             .enumerate()
@@ -135,38 +193,12 @@ impl Weights {
             bytes_declared,
         })
     }
-
-    pub fn get(
-        &self,
-        name: &str,
-    ) -> Result<WeightView<'_>, WeightsError> {
-        let not_found = || WeightsError::TensorNotFound {
-            name: name.to_owned(),
-        };
-        let entry = self.tensors.get(name).ok_or_else(not_found)?;
-        let bytes = self
-            .shards
-            .get(entry.shard_index)
-            .and_then(|shard| shard.get(entry.byte_range.clone()))
-            .ok_or_else(not_found)?;
-        Ok(WeightView {
-            dtype: entry.dtype,
-            shape: entry.shape,
-            bytes,
-        })
-    }
-
-    pub fn names(&self) -> impl Iterator<Item = &str> { self.tensors.keys().map(String::as_str) }
-
-    pub fn shard_count(&self) -> usize { self.shards.len() }
-
-    pub fn bytes_declared(&self) -> Option<u64> { self.bytes_declared }
 }
 
-fn read_index(path: &Path) -> Result<IndexFile, WeightsError> {
-    let io_error = |error| WeightsError::Io {
+fn read_index(path: &Path) -> Result<Vec<u8>, WeightsError> {
+    let io_error = |error: io::Error| WeightsError::Io {
         path: path.to_path_buf(),
-        error,
+        error: error.into(),
     };
     let bytes = fs::metadata(path).map_err(io_error)?.len();
     if bytes > INDEX_BYTES_MAX {
@@ -176,34 +208,44 @@ fn read_index(path: &Path) -> Result<IndexFile, WeightsError> {
             bytes_max: INDEX_BYTES_MAX,
         });
     }
-    let contents = fs::read(path).map_err(io_error)?;
-    serde_json::from_slice(&contents).map_err(|error| WeightsError::IndexJson {
+    fs::read(path).map_err(io_error)
+}
+
+fn parse_index(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<IndexFile, WeightsError> {
+    serde_json::from_slice(bytes).map_err(|error| WeightsError::IndexJson {
         path: path.to_path_buf(),
-        error,
+        error: error.into(),
     })
+}
+
+fn check_shard_name(name: &str) -> Result<(), WeightsError> {
+    if Path::new(name).file_name() == Some(OsStr::new(name)) {
+        Ok(())
+    } else {
+        Err(WeightsError::InvalidShardName {
+            name: name.to_owned(),
+        })
+    }
 }
 
 fn open_shard(
     directory: &Path,
     name: &str,
-) -> Result<(Mmap, Vec<ShardTensor>), WeightsError> {
-    if Path::new(name).file_name() != Some(OsStr::new(name)) {
-        return Err(WeightsError::InvalidShardName {
-            name: name.to_owned(),
-        });
-    }
+) -> Result<Mmap, WeightsError> {
+    check_shard_name(name)?;
     let path = directory.join(name);
-    let io_error = |error| WeightsError::Io {
+    let io_error = |error: io::Error| WeightsError::Io {
         path: path.clone(),
-        error,
+        error: error.into(),
     };
     let file = File::open(&path).map_err(io_error)?;
     // SAFETY: the file is opened read-only and Foundry never writes to it. The
     // model files are required to stay unmodified and untruncated while the
     // mapping, owned by `Weights`, is alive.
-    let mmap = unsafe { Mmap::map(&file) }.map_err(io_error)?;
-    let tensors = parse_shard(&path, &mmap)?;
-    Ok((mmap, tensors))
+    unsafe { Mmap::map(&file) }.map_err(io_error)
 }
 
 fn parse_shard(
@@ -237,7 +279,7 @@ fn parse_shard(
     let entries: BTreeMap<String, serde_json::Value> =
         serde_json::from_slice(header).map_err(|error| WeightsError::HeaderJson {
             path: path.to_path_buf(),
-            error,
+            error: error.into(),
         })?;
     let tensors = entries
         .into_iter()
@@ -261,7 +303,7 @@ fn parse_tensor(
             return Err(WeightsError::TensorHeaderJson {
                 path: path.to_path_buf(),
                 name,
-                error,
+                error: error.into(),
             });
         }
     };
@@ -372,84 +414,64 @@ fn check_index(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::{
-        Path,
-        PathBuf,
-    };
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     use serde_json::json;
 
-    use crate::core::DType;
+    use crate::core::{
+        CoreError,
+        DType,
+        Shape,
+    };
     use crate::weights::{
+        HEADER_BYTES_MAX,
+        IndexFile,
+        JsonError,
+        TensorHeader,
+        WeightView,
         Weights,
         WeightsError,
+        check_shard_name,
     };
-
-    fn test_dir(name: &str) -> PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("foundry-weights-{name}-{}", std::process::id()));
-        if directory.exists() {
-            fs::remove_dir_all(&directory).expect("the old test directory is removed");
-        }
-        fs::create_dir_all(&directory).expect("the test directory is created");
-        directory
-    }
-
-    fn safetensors_bytes(
-        header: &serde_json::Value,
-        data: &[u8],
-    ) -> Vec<u8> {
-        let header = serde_json::to_vec(header).expect("the header serializes");
-        let header_len = u64::try_from(header.len()).expect("the header length fits in u64");
-        header_len
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(data.iter().copied())
-            .collect()
-    }
-
-    fn write_safetensors(
-        path: &Path,
-        header: &serde_json::Value,
-        data: &[u8],
-    ) {
-        fs::write(path, safetensors_bytes(header, data)).expect("the safetensors file is written");
-    }
-
-    fn data(len: u8) -> Vec<u8> { (0..len).collect() }
-
-    fn open_single(
-        name: &str,
-        header: &serde_json::Value,
-        data: &[u8],
-    ) -> Result<Weights, WeightsError> {
-        let directory = test_dir(name);
-        write_safetensors(&directory.join("model.safetensors"), header, data);
-        Weights::open(&directory)
-    }
 
     #[test]
     fn valid_file_returns_dtype_shape_and_bytes() {
-        let header = json!({
+        let header = serde_json::to_vec(&json!({
             "__metadata__": { "format": "pt" },
             "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 12] },
             "b": { "dtype": "F32", "shape": [4], "data_offsets": [12, 28] },
-        });
-        let bytes = data(28);
-        let weights = open_single("valid", &header, &bytes).expect("the file is valid");
-
-        let a = weights.get("a").expect("tensor a exists");
-        assert_eq!(a.dtype, DType::BF16, "dtype of a");
-        assert_eq!(a.shape.dims(), &[2, 3], "shape of a");
-        assert_eq!(Some(a.bytes), bytes.get(0..12), "bytes of a");
-
-        let b = weights.get("b").expect("tensor b exists");
-        assert_eq!(b.dtype, DType::F32, "dtype of b");
-        assert_eq!(b.shape.dims(), &[4], "shape of b");
-        assert_eq!(Some(b.bytes), bytes.get(12..28), "bytes of b");
-
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..28)
+            .collect();
+        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
+            .expect("the file is valid");
+        let a_bytes: Vec<u8> = (0..12).collect();
+        let b_bytes: Vec<u8> = (12..28).collect();
+        assert_eq!(
+            weights.get("a"),
+            Ok(WeightView {
+                dtype: DType::BF16,
+                shape: Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                bytes: &a_bytes,
+            }),
+            "tensor a"
+        );
+        assert_eq!(
+            weights.get("b"),
+            Ok(WeightView {
+                dtype: DType::F32,
+                shape: Shape::try_from([4].as_slice()).expect("the shape is valid"),
+                bytes: &b_bytes,
+            }),
+            "tensor b"
+        );
         assert_eq!(weights.names().count(), 2, "metadata is not a tensor");
         assert_eq!(weights.shard_count(), 1, "single file is one shard");
         assert_eq!(weights.bytes_declared(), None, "no index, no declared size");
@@ -457,36 +479,47 @@ mod tests {
 
     #[test]
     fn index_with_two_shards_loads_both() {
-        let directory = test_dir("index");
-        write_safetensors(
-            &directory.join("s1.safetensors"),
-            &json!({ "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] } }),
-            &data(4),
-        );
-        write_safetensors(
-            &directory.join("s2.safetensors"),
-            &json!({ "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
-            &[9, 8, 7, 6],
-        );
-        let index = json!({
+        let [first, second] = [
+            (
+                json!({ "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] } }),
+                vec![0, 1, 2, 3],
+            ),
+            (
+                json!({ "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+                vec![9, 8, 7, 6],
+            ),
+        ]
+        .map(|(header, data)| {
+            let header = serde_json::to_vec(&header).expect("the header serializes");
+            u64::try_from(header.len())
+                .expect("the header length fits in u64")
+                .to_le_bytes()
+                .into_iter()
+                .chain(header)
+                .chain(data)
+                .collect::<Vec<u8>>()
+        });
+        let index = serde_json::to_vec(&json!({
             "metadata": { "total_size": 8 },
             "weight_map": { "a": "s1.safetensors", "b": "s2.safetensors" },
-        });
-        fs::write(
-            directory.join("model.safetensors.index.json"),
-            serde_json::to_vec(&index).expect("the index serializes"),
+        }))
+        .expect("the index serializes");
+        let weights = Weights::from_shards(
+            Some(&index),
+            vec![
+                ("s1.safetensors".to_owned(), first),
+                ("s2.safetensors".to_owned(), second),
+            ],
         )
-        .expect("the index is written");
-
-        let weights = Weights::open(&directory).expect("the shards are valid");
+        .expect("the shards are valid");
         assert_eq!(
-            weights.get("a").expect("tensor a exists").bytes,
-            &[0, 1, 2, 3],
+            weights.get("a").map(|view| view.bytes),
+            Ok([0, 1, 2, 3].as_slice()),
             "bytes of a"
         );
         assert_eq!(
-            weights.get("b").expect("tensor b exists").bytes,
-            &[9, 8, 7, 6],
+            weights.get("b").map(|view| view.bytes),
+            Ok([9, 8, 7, 6].as_slice()),
             "bytes of b"
         );
         assert_eq!(weights.shard_count(), 2, "two shards");
@@ -495,166 +528,624 @@ mod tests {
 
     #[test]
     fn index_naming_the_wrong_shard_is_rejected() {
-        let directory = test_dir("index-mismatch");
-        write_safetensors(
-            &directory.join("s1.safetensors"),
+        let header = serde_json::to_vec(
             &json!({ "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] } }),
-            &data(4),
-        );
-        let index = json!({ "weight_map": { "a": "s1.safetensors", "c": "s1.safetensors" } });
-        fs::write(
-            directory.join("model.safetensors.index.json"),
-            serde_json::to_vec(&index).expect("the index serializes"),
         )
-        .expect("the index is written");
-
-        let result = Weights::open(&directory);
-        assert!(
-            matches!(&result, Err(WeightsError::IndexMismatch { name, .. }) if name == "c"),
-            "got {:?}",
-            result.err()
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        let index = serde_json::to_vec(
+            &json!({ "weight_map": { "a": "s1.safetensors", "c": "s1.safetensors" } }),
+        )
+        .expect("the index serializes");
+        assert_eq!(
+            Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::IndexMismatch {
+                name: "c".to_owned(),
+                shard: "s1.safetensors".to_owned(),
+            }),
+            "the index names a tensor the shard does not hold"
         );
     }
 
     #[test]
-    fn shard_name_outside_the_directory_is_rejected() {
-        let directory = test_dir("shard-name");
-        let index = json!({ "weight_map": { "a": "../s1.safetensors" } });
-        fs::write(
-            directory.join("model.safetensors.index.json"),
-            serde_json::to_vec(&index).expect("the index serializes"),
+    fn index_naming_another_existing_shard_is_rejected() {
+        let [first, second] = ["a", "b"].map(|name| {
+            let header = serde_json::to_vec(
+                &json!({ name: { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+            )
+            .expect("the header serializes");
+            u64::try_from(header.len())
+                .expect("the header length fits in u64")
+                .to_le_bytes()
+                .into_iter()
+                .chain(header)
+                .chain(0..4)
+                .collect::<Vec<u8>>()
+        });
+        let index = serde_json::to_vec(
+            &json!({ "weight_map": { "a": "s2.safetensors", "b": "s2.safetensors" } }),
         )
-        .expect("the index is written");
+        .expect("the index serializes");
+        assert_eq!(
+            Weights::from_shards(
+                Some(&index),
+                vec![
+                    ("s1.safetensors".to_owned(), first),
+                    ("s2.safetensors".to_owned(), second),
+                ],
+            )
+            .err(),
+            Some(WeightsError::IndexMismatch {
+                name: "a".to_owned(),
+                shard: "s2.safetensors".to_owned(),
+            }),
+            "tensor a lives in s1, not in s2"
+        );
+    }
 
-        let result = Weights::open(&directory);
-        assert!(
-            matches!(result, Err(WeightsError::InvalidShardName { .. })),
-            "got {:?}",
-            result.err()
+    #[test]
+    fn index_without_metadata_declares_no_size() {
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        let index = serde_json::to_vec(&json!({ "weight_map": { "a": "s1.safetensors" } }))
+            .expect("the index serializes");
+        let weights = Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)])
+            .expect("the shard is valid");
+        assert_eq!(
+            weights.bytes_declared(),
+            None,
+            "no metadata, no declared size"
+        );
+    }
+
+    #[test]
+    fn empty_weight_map_gives_no_tensors() {
+        let index = serde_json::to_vec(&json!({ "weight_map": {} })).expect("the index serializes");
+        let weights =
+            Weights::<Vec<u8>>::from_shards(Some(&index), vec![]).expect("the index is valid");
+        assert_eq!(weights.names().count(), 0, "no tensors");
+        assert_eq!(weights.shard_count(), 0, "no shards");
+    }
+
+    #[test]
+    fn invalid_index_json_is_rejected() {
+        let index = b"{";
+        assert_eq!(
+            Weights::<Vec<u8>>::from_shards(Some(index), vec![]).err(),
+            Some(WeightsError::IndexJson {
+                path: PathBuf::from("model.safetensors.index.json"),
+                error: JsonError::from(
+                    serde_json::from_slice::<IndexFile>(index)
+                        .err()
+                        .expect("the index is not valid JSON")
+                ),
+            }),
+            "an unterminated index is rejected"
+        );
+    }
+
+    #[test]
+    fn duplicate_tensor_across_shards_is_rejected() {
+        let [first, second] = [(); 2].map(|()| {
+            let header = serde_json::to_vec(
+                &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+            )
+            .expect("the header serializes");
+            u64::try_from(header.len())
+                .expect("the header length fits in u64")
+                .to_le_bytes()
+                .into_iter()
+                .chain(header)
+                .chain(0..4)
+                .collect::<Vec<u8>>()
+        });
+        assert_eq!(
+            Weights::from_shards(
+                None,
+                vec![
+                    ("s1.safetensors".to_owned(), first),
+                    ("s2.safetensors".to_owned(), second),
+                ],
+            )
+            .err(),
+            Some(WeightsError::DuplicateTensor {
+                name: "a".to_owned(),
+            }),
+            "tensor a in two shards is rejected"
+        );
+    }
+
+    #[test]
+    fn shard_names_with_a_path_are_rejected() {
+        ["a/b", "", "..", "../s1.safetensors"]
+            .into_iter()
+            .for_each(|name| {
+                assert_eq!(
+                    check_shard_name(name),
+                    Err(WeightsError::InvalidShardName {
+                        name: name.to_owned(),
+                    }),
+                    "shard name {name:?} is rejected"
+                );
+            });
+        assert_eq!(
+            check_shard_name("s1.safetensors"),
+            Ok(()),
+            "a plain file name is accepted"
         );
     }
 
     #[test]
     fn file_shorter_than_the_length_prefix_is_truncated() {
-        let directory = test_dir("truncated-prefix");
-        fs::write(directory.join("model.safetensors"), [1, 0, 0, 0]).expect("the file is written");
-
-        let result = Weights::open(&directory);
-        assert!(
-            matches!(
-                result,
-                Err(WeightsError::TruncatedHeader {
-                    bytes: 4,
-                    ..
-                })
-            ),
-            "got {:?}",
-            result.err()
+        assert_eq!(
+            Weights::from_shards(
+                None,
+                vec![("model.safetensors".to_owned(), vec![1, 0, 0, 0])]
+            )
+            .err(),
+            Some(WeightsError::TruncatedHeader {
+                path: PathBuf::from("model.safetensors"),
+                bytes: 4,
+            }),
+            "four bytes cannot hold the length prefix"
         );
     }
 
     #[test]
     fn header_longer_than_the_file_is_truncated() {
-        let directory = test_dir("truncated-header");
-        let bytes: Vec<u8> = 100_u64.to_le_bytes().into_iter().chain(*b"{}").collect();
-        fs::write(directory.join("model.safetensors"), bytes).expect("the file is written");
-
-        let result = Weights::open(&directory);
-        assert!(
-            matches!(result, Err(WeightsError::TruncatedHeader { .. })),
-            "got {:?}",
-            result.err()
+        let file: Vec<u8> = 100_u64.to_le_bytes().into_iter().chain(*b"{}").collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::TruncatedHeader {
+                path: PathBuf::from("model.safetensors"),
+                bytes: 10,
+            }),
+            "a header of 100 bytes does not fit in 10 bytes"
         );
     }
 
     #[test]
     fn header_above_the_limit_is_rejected() {
-        let directory = test_dir("header-too-large");
         let header_bytes = 100_u64 * 1024 * 1024 + 1;
-        fs::write(
-            directory.join("model.safetensors"),
-            header_bytes.to_le_bytes(),
-        )
-        .expect("the file is written");
-
-        let result = Weights::open(&directory);
-        assert!(
-            matches!(result, Err(WeightsError::HeaderTooLarge { bytes, .. }) if bytes == header_bytes),
-            "got {:?}",
-            result.err()
+        assert_eq!(
+            Weights::from_shards(
+                None,
+                vec![(
+                    "model.safetensors".to_owned(),
+                    header_bytes.to_le_bytes().to_vec()
+                )]
+            )
+            .err(),
+            Some(WeightsError::HeaderTooLarge {
+                path: PathBuf::from("model.safetensors"),
+                bytes: header_bytes,
+                bytes_max: HEADER_BYTES_MAX,
+            }),
+            "a header one byte above the limit is rejected"
         );
     }
 
     #[test]
-    fn overlapping_ranges_are_rejected() {
-        let header = json!({
-            "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] },
-            "b": { "dtype": "F32", "shape": [2], "data_offsets": [4, 12] },
-        });
-        let result = open_single("overlap", &header, &data(12));
-        assert!(
-            matches!(&result, Err(WeightsError::OverlappingRanges { first, second }) if first == "a" && second == "b"),
-            "got {:?}",
-            result.err()
+    fn header_at_the_limit_is_not_too_large() {
+        let header_bytes = u64::try_from(HEADER_BYTES_MAX).expect("the limit fits in u64");
+        assert_eq!(
+            Weights::from_shards(
+                None,
+                vec![(
+                    "model.safetensors".to_owned(),
+                    header_bytes.to_le_bytes().to_vec()
+                )]
+            )
+            .err(),
+            Some(WeightsError::TruncatedHeader {
+                path: PathBuf::from("model.safetensors"),
+                bytes: 8,
+            }),
+            "a header at the limit passes the size check and is then truncated"
         );
+    }
+
+    #[test]
+    fn invalid_header_json_is_rejected() {
+        [b"{".as_slice(), b"[]", b"null", &[0xFF]]
+            .into_iter()
+            .for_each(|header| {
+                let file: Vec<u8> = u64::try_from(header.len())
+                    .expect("the header length fits in u64")
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(header.iter().copied())
+                    .collect();
+                assert_eq!(
+                    Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+                    Some(WeightsError::HeaderJson {
+                        path: PathBuf::from("model.safetensors"),
+                        error: JsonError::from(
+                            serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(header)
+                                .expect_err("the header is not a JSON object")
+                        ),
+                    }),
+                    "header {header:?} is rejected"
+                );
+            });
+    }
+
+    #[test]
+    fn malformed_tensor_entry_is_rejected() {
+        [
+            json!({ "dtype": "F32", "shape": [1] }),
+            json!({ "dtype": "F32", "shape": [1], "data_offsets": [0, 4, 8] }),
+        ]
+        .into_iter()
+        .for_each(|entry| {
+            let header = serde_json::to_vec(&json!({ "a": entry })).expect("the header serializes");
+            let file: Vec<u8> = u64::try_from(header.len())
+                .expect("the header length fits in u64")
+                .to_le_bytes()
+                .into_iter()
+                .chain(header)
+                .chain(0..8)
+                .collect();
+            assert_eq!(
+                Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+                Some(WeightsError::TensorHeaderJson {
+                    path: PathBuf::from("model.safetensors"),
+                    name: "a".to_owned(),
+                    error: JsonError::from(
+                        serde_json::from_value::<TensorHeader>(entry.clone())
+                            .err()
+                            .expect("the entry is malformed")
+                    ),
+                }),
+                "entry {entry} is rejected"
+            );
+        });
     }
 
     #[test]
     fn unknown_dtype_is_rejected() {
-        let header = json!({ "a": { "dtype": "Q4", "shape": [2], "data_offsets": [0, 1] } });
-        let result = open_single("unknown-dtype", &header, &data(1));
-        assert!(
-            matches!(&result, Err(WeightsError::UnknownDType { dtype, .. }) if dtype == "Q4"),
-            "got {:?}",
-            result.err()
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "Q4", "shape": [2], "data_offsets": [0, 1] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..1)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::UnknownDType {
+                name: "a".to_owned(),
+                dtype: "Q4".to_owned(),
+            }),
+            "dtype Q4 is unknown"
+        );
+    }
+
+    #[test]
+    fn lowercase_dtype_is_rejected() {
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "bf16", "shape": [2], "data_offsets": [0, 4] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::UnknownDType {
+                name: "a".to_owned(),
+                dtype: "bf16".to_owned(),
+            }),
+            "dtype names are case sensitive"
+        );
+    }
+
+    #[test]
+    fn f16_and_u32_dtypes_are_accepted() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "F16", "shape": [2], "data_offsets": [0, 4] },
+            "b": { "dtype": "U32", "shape": [1], "data_offsets": [4, 8] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..8)
+            .collect();
+        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
+            .expect("the file is valid");
+        assert_eq!(
+            weights.get("a").map(|view| view.dtype),
+            Ok(DType::F16),
+            "dtype of a"
+        );
+        assert_eq!(
+            weights.get("b").map(|view| view.dtype),
+            Ok(DType::U32),
+            "dtype of b"
+        );
+    }
+
+    #[test]
+    fn invalid_tensor_shape_is_rejected() {
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "F32", "shape": [1, 1, 1, 1, 1], "data_offsets": [0, 4] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::InvalidShape {
+                name: "a".to_owned(),
+                error: CoreError::RankTooLarge {
+                    rank: 5,
+                    rank_max: 4,
+                },
+            }),
+            "a rank 5 shape is rejected"
+        );
+    }
+
+    #[test]
+    fn reversed_range_is_rejected() {
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [8, 4] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..8)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::InvalidRange {
+                name: "a".to_owned(),
+                begin: 8,
+                end: 4,
+            }),
+            "a range that begins after its end is rejected"
         );
     }
 
     #[test]
     fn range_outside_the_data_region_is_rejected() {
-        let header = json!({ "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] } });
-        let result = open_single("out-of-region", &header, &data(4));
-        assert!(
-            matches!(
-                result,
-                Err(WeightsError::OutOfDataRegion {
-                    end: 8,
-                    bytes_data: 4,
-                    ..
-                })
-            ),
-            "got {:?}",
-            result.err()
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::OutOfDataRegion {
+                name: "a".to_owned(),
+                end: 8,
+                bytes_data: 4,
+            }),
+            "a range ending after the data is rejected"
         );
     }
 
     #[test]
     fn range_not_matching_shape_and_dtype_is_rejected() {
-        let header = json!({ "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 8] } });
-        let result = open_single("size-mismatch", &header, &data(8));
-        assert!(
-            matches!(
-                result,
-                Err(WeightsError::SizeMismatch {
-                    bytes: 8,
-                    bytes_expected: 12,
-                    ..
-                })
-            ),
-            "got {:?}",
-            result.err()
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 8] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..8)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::SizeMismatch {
+                name: "a".to_owned(),
+                bytes: 8,
+                bytes_expected: 12,
+            }),
+            "8 bytes do not hold six bf16 values"
+        );
+    }
+
+    #[test]
+    fn empty_header_has_no_tensors() {
+        let file: Vec<u8> = 2_u64.to_le_bytes().into_iter().chain(*b"{}").collect();
+        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
+            .expect("an empty header is valid");
+        assert_eq!(weights.names().count(), 0, "no tensors");
+    }
+
+    #[test]
+    fn scalar_and_zero_dim_tensors_are_accepted() {
+        let header = serde_json::to_vec(&json!({
+            "s": { "dtype": "F32", "shape": [], "data_offsets": [0, 4] },
+            "z": { "dtype": "F32", "shape": [0, 3], "data_offsets": [4, 4] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
+            .expect("the file is valid");
+        assert_eq!(
+            weights.get("s"),
+            Ok(WeightView {
+                dtype: DType::F32,
+                shape: Shape::try_from([].as_slice()).expect("the shape is valid"),
+                bytes: &[0, 1, 2, 3],
+            }),
+            "a scalar holds one element"
+        );
+        assert_eq!(
+            weights.get("z"),
+            Ok(WeightView {
+                dtype: DType::F32,
+                shape: Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
+                bytes: &[],
+            }),
+            "a zero dim holds no element"
+        );
+    }
+
+    #[test]
+    fn overlapping_ranges_are_rejected() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] },
+            "b": { "dtype": "F32", "shape": [2], "data_offsets": [4, 12] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..12)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::OverlappingRanges {
+                first: "a".to_owned(),
+                second: "b".to_owned(),
+            }),
+            "ranges [0, 8] and [4, 12] overlap"
+        );
+    }
+
+    #[test]
+    fn ranges_listed_out_of_offset_order_are_checked() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "F32", "shape": [2], "data_offsets": [4, 12] },
+            "b": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..12)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::OverlappingRanges {
+                first: "b".to_owned(),
+                second: "a".to_owned(),
+            }),
+            "ranges are compared in offset order, not in name order"
+        );
+    }
+
+    #[test]
+    fn empty_ranges_at_the_same_offset_are_accepted() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "F32", "shape": [0], "data_offsets": [4, 4] },
+            "b": { "dtype": "F32", "shape": [0], "data_offsets": [4, 4] },
+            "c": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
+            .expect("empty ranges do not overlap");
+        assert_eq!(weights.names().count(), 3, "three tensors");
+    }
+
+    #[test]
+    fn empty_range_inside_another_is_rejected() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] },
+            "b": { "dtype": "F32", "shape": [0], "data_offsets": [4, 4] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..8)
+            .collect();
+        assert_eq!(
+            Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)]).err(),
+            Some(WeightsError::OverlappingRanges {
+                first: "a".to_owned(),
+                second: "b".to_owned(),
+            }),
+            "an empty range that starts inside another range is rejected"
         );
     }
 
     #[test]
     fn missing_tensor_is_not_found() {
-        let header = json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } });
-        let weights = open_single("missing", &header, &data(4)).expect("the file is valid");
-        let result = weights.get("b");
-        assert!(
-            matches!(&result, Err(WeightsError::TensorNotFound { name }) if name == "b"),
-            "got {:?}",
-            result.err()
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
+            .expect("the file is valid");
+        assert_eq!(
+            weights.get("b"),
+            Err(WeightsError::TensorNotFound {
+                name: "b".to_owned(),
+            }),
+            "tensor b is not in the file"
         );
     }
 }

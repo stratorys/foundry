@@ -303,15 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn other_model_type_is_rejected() {
-        let result = parse(&with(instruct_config(), "model_type", json!("mistral")));
-        assert!(
-            matches!(&result, Err(LlamaConfigError::ModelType { model_type }) if model_type == "mistral"),
-            "got {result:?}"
-        );
-    }
-
-    #[test]
     fn other_model_type_is_rejected_before_missing_fields() {
         let result = parse(&json!({ "model_type": "qwen3", "hidden_size": 1024 }));
         assert!(

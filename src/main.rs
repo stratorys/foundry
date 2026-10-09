@@ -43,7 +43,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Command {
     #[command(
         about = "Open a model from the Hugging Face cache and summarize its weights and \
@@ -57,13 +57,13 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelId {
     owner: String,
     name: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("Model id {model:?} is not of the form owner/name.")]
 struct ModelIdError {
     model: String,
@@ -84,6 +84,18 @@ enum CliError {
     #[error(transparent)]
     Config(#[from] LlamaConfigError),
 
+    #[error(transparent)]
+    Summary(#[from] WeightsSummaryError),
+
+    #[error("Writing the report to stdout failed.")]
+    Output(#[from] io::Error),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum WeightsSummaryError {
+    #[error(transparent)]
+    Weights(#[from] WeightsError),
+
     #[error("Total byte count of model {model} overflows usize.")]
     ByteCountOverflow { model: String },
 
@@ -93,11 +105,9 @@ enum CliError {
         bytes: usize,
         bytes_declared: u64,
     },
-
-    #[error("Writing the report to stdout failed.")]
-    Output(#[from] io::Error),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct WeightsSummary {
     shard_count: usize,
     tensor_count: usize,
@@ -106,6 +116,7 @@ struct WeightsSummary {
     dtypes: BTreeSet<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct TensorRow {
     name: String,
     dtype: String,
@@ -199,15 +210,15 @@ fn inspect(
     Ok(())
 }
 
-fn summarize_weights(
+fn summarize_weights<S: AsRef<[u8]>>(
     model: &ModelId,
-    weights: &Weights,
-) -> Result<WeightsSummary, CliError> {
+    weights: &Weights<S>,
+) -> Result<WeightsSummary, WeightsSummaryError> {
     let bytes = weights.names().try_fold(0_usize, |bytes, name| {
         let tensor_bytes = weights.get(name)?.bytes.len();
         bytes
             .checked_add(tensor_bytes)
-            .ok_or_else(|| CliError::ByteCountOverflow {
+            .ok_or_else(|| WeightsSummaryError::ByteCountOverflow {
                 model: model.to_string(),
             })
     })?;
@@ -215,7 +226,7 @@ fn summarize_weights(
     if let Some(bytes_declared) = bytes_declared
         && u64::try_from(bytes).ok() != Some(bytes_declared)
     {
-        return Err(CliError::BytesMismatch {
+        return Err(WeightsSummaryError::BytesMismatch {
             model: model.to_string(),
             bytes,
             bytes_declared,
@@ -255,7 +266,7 @@ fn load_architecture(directory: &Path) -> Result<Option<LlamaConfig>, CliError> 
     }
 }
 
-fn tensor_rows(weights: &Weights) -> Result<Vec<TensorRow>, WeightsError> {
+fn tensor_rows<S: AsRef<[u8]>>(weights: &Weights<S>) -> Result<Vec<TensorRow>, WeightsError> {
     let mut names: Vec<&str> = weights.names().collect();
     names.sort_unstable();
     names
@@ -400,4 +411,338 @@ fn format_gib(bytes: usize) -> Option<String> {
         .checked_mul(100)?
         .checked_div(GIB_BYTES)?;
     Some(format!("{whole}.{hundredths:02}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use clap::error::ErrorKind;
+    use clap::{
+        CommandFactory,
+        Parser,
+    };
+    use foundry::weights::Weights;
+    use serde_json::json;
+
+    use crate::{
+        Cli,
+        Command,
+        GIB_BYTES,
+        ModelId,
+        ModelIdError,
+        TensorRow,
+        WeightsSummary,
+        WeightsSummaryError,
+        format_gib,
+        summarize_weights,
+        tensor_rows,
+        write_tensors,
+        write_weights,
+    };
+
+    #[test]
+    fn model_id_parses_owner_and_name() {
+        let model = "a/b".parse::<ModelId>();
+        assert_eq!(
+            model,
+            Ok(ModelId {
+                owner: "a".to_owned(),
+                name: "b".to_owned(),
+            }),
+            "owner and name"
+        );
+        assert_eq!(
+            model.map(|model| model.to_string()),
+            Ok("a/b".to_owned()),
+            "display gives back owner/name"
+        );
+    }
+
+    #[test]
+    fn model_id_rejects_malformed_values() {
+        ["ab", "/b", "a/", "a/b/c", ""]
+            .into_iter()
+            .for_each(|model| {
+                assert_eq!(
+                    model.parse::<ModelId>(),
+                    Err(ModelIdError {
+                        model: model.to_owned(),
+                    }),
+                    "model id {model:?} is rejected"
+                );
+            });
+    }
+
+    #[test]
+    fn cli_definition_is_consistent() { Cli::command().debug_assert(); }
+
+    #[test]
+    fn inspect_parses_model_and_tensors_flag() {
+        [
+            (vec!["foundry", "inspect", "--model", "a/b"], false),
+            (
+                vec!["foundry", "inspect", "--model", "a/b", "--tensors"],
+                true,
+            ),
+        ]
+        .into_iter()
+        .for_each(|(args, tensors)| {
+            assert_eq!(
+                Cli::try_parse_from(&args)
+                    .map(|cli| cli.command)
+                    .map_err(|error| error.kind()),
+                Ok(Command::Inspect {
+                    model: ModelId {
+                        owner: "a".to_owned(),
+                        name: "b".to_owned(),
+                    },
+                    tensors,
+                }),
+                "args {args:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn inspect_without_model_is_rejected() {
+        assert_eq!(
+            Cli::try_parse_from(["foundry", "inspect"])
+                .map(|cli| cli.command)
+                .map_err(|error| error.kind()),
+            Err(ErrorKind::MissingRequiredArgument),
+            "--model is required"
+        );
+    }
+
+    #[test]
+    fn inspect_with_invalid_model_is_rejected() {
+        assert_eq!(
+            Cli::try_parse_from(["foundry", "inspect", "--model", "ab"])
+                .map(|cli| cli.command)
+                .map_err(|error| error.kind()),
+            Err(ErrorKind::ValueValidation),
+            "a model id without owner is rejected"
+        );
+    }
+
+    #[test]
+    fn missing_subcommand_displays_the_help() {
+        assert_eq!(
+            Cli::try_parse_from(["foundry"])
+                .map(|cli| cli.command)
+                .map_err(|error| error.kind()),
+            Err(ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand),
+            "without a subcommand the help is shown"
+        );
+    }
+
+    #[test]
+    fn unknown_subcommand_is_rejected() {
+        assert_eq!(
+            Cli::try_parse_from(["foundry", "load"])
+                .map(|cli| cli.command)
+                .map_err(|error| error.kind()),
+            Err(ErrorKind::InvalidSubcommand),
+            "load is not a subcommand"
+        );
+    }
+
+    #[test]
+    fn format_gib_truncates_to_two_decimals() {
+        [
+            (0, "0.00"),
+            (GIB_BYTES, "1.00"),
+            (1_610_612_736, "1.50"),
+            (1_127_428_916, "1.05"),
+            (1_073_741_823, "0.99"),
+        ]
+        .into_iter()
+        .for_each(|(bytes, expected)| {
+            assert_eq!(
+                format_gib(bytes),
+                Some(expected.to_owned()),
+                "{bytes} bytes"
+            );
+        });
+    }
+
+    #[test]
+    fn write_weights_prints_declared_size_when_present() {
+        [
+            (Some(16), "  Declared    16 bytes (match)\n"),
+            (None, "  Declared    no index\n"),
+        ]
+        .into_iter()
+        .for_each(|(bytes_declared, declared_line)| {
+            let mut out = Vec::new();
+            write_weights(
+                &mut out,
+                &WeightsSummary {
+                    shard_count: 1,
+                    tensor_count: 2,
+                    bytes: 16,
+                    bytes_declared,
+                    dtypes: BTreeSet::from(["BF16".to_owned(), "F32".to_owned()]),
+                },
+            )
+            .expect("writing to a vector succeeds");
+            assert_eq!(
+                String::from_utf8(out),
+                Ok(format!(
+                    "\nWeights\n  Shards      1\n  Tensors     2\n  Size        16 bytes (0.00 \
+                     GiB)\n{declared_line}  Dtypes      BF16, F32\n"
+                )),
+                "declared size {bytes_declared:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn write_tensors_aligns_columns() {
+        let mut empty = Vec::new();
+        write_tensors(&mut empty, &[]).expect("writing to a vector succeeds");
+        assert_eq!(
+            String::from_utf8(empty),
+            Ok("\nTensors\n".to_owned()),
+            "no tensor"
+        );
+        let mut out = Vec::new();
+        write_tensors(
+            &mut out,
+            &[
+                TensorRow {
+                    name: "a.long".to_owned(),
+                    dtype: "BF16".to_owned(),
+                    shape: "[2, 3]".to_owned(),
+                    bytes: 12,
+                },
+                TensorRow {
+                    name: "b".to_owned(),
+                    dtype: "F32".to_owned(),
+                    shape: "[2]".to_owned(),
+                    bytes: 8,
+                },
+            ],
+        )
+        .expect("writing to a vector succeeds");
+        assert_eq!(
+            String::from_utf8(out),
+            Ok("\nTensors\n  a.long  BF16  [2, 3]  12\n  b       F32   [2]      8\n".to_owned()),
+            "columns are padded to the widest value"
+        );
+    }
+
+    #[test]
+    fn summarize_weights_counts_shards_tensors_bytes_and_dtypes() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] },
+            "b": { "dtype": "F32", "shape": [1], "data_offsets": [4, 8] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..8)
+            .collect();
+        let index = serde_json::to_vec(&json!({
+            "metadata": { "total_size": 8 },
+            "weight_map": { "a": "s1.safetensors", "b": "s1.safetensors" },
+        }))
+        .expect("the index serializes");
+        let weights = Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)])
+            .expect("the shard is valid");
+        assert_eq!(
+            summarize_weights(
+                &ModelId {
+                    owner: "a".to_owned(),
+                    name: "b".to_owned(),
+                },
+                &weights,
+            ),
+            Ok(WeightsSummary {
+                shard_count: 1,
+                tensor_count: 2,
+                bytes: 8,
+                bytes_declared: Some(8),
+                dtypes: BTreeSet::from(["BF16".to_owned(), "F32".to_owned()]),
+            }),
+            "summary of one shard with two tensors"
+        );
+    }
+
+    #[test]
+    fn summarize_weights_rejects_a_declared_size_mismatch() {
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        let index = serde_json::to_vec(&json!({
+            "metadata": { "total_size": 5 },
+            "weight_map": { "a": "s1.safetensors" },
+        }))
+        .expect("the index serializes");
+        let weights = Weights::from_shards(Some(&index), vec![("s1.safetensors".to_owned(), file)])
+            .expect("the shard is valid");
+        assert_eq!(
+            summarize_weights(
+                &ModelId {
+                    owner: "a".to_owned(),
+                    name: "b".to_owned(),
+                },
+                &weights,
+            ),
+            Err(WeightsSummaryError::BytesMismatch {
+                model: "a/b".to_owned(),
+                bytes: 4,
+                bytes_declared: 5,
+            }),
+            "the index declares one byte more than the tensors hold"
+        );
+    }
+
+    #[test]
+    fn tensor_rows_are_sorted_by_name() {
+        let header = serde_json::to_vec(&json!({
+            "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
+            "a": { "dtype": "BF16", "shape": [2, 1], "data_offsets": [4, 8] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..8)
+            .collect();
+        let weights = Weights::from_shards(None, vec![("model.safetensors".to_owned(), file)])
+            .expect("the file is valid");
+        assert_eq!(
+            tensor_rows(&weights),
+            Ok(vec![
+                TensorRow {
+                    name: "a".to_owned(),
+                    dtype: "BF16".to_owned(),
+                    shape: "[2, 1]".to_owned(),
+                    bytes: 4,
+                },
+                TensorRow {
+                    name: "b".to_owned(),
+                    dtype: "F32".to_owned(),
+                    shape: "[1]".to_owned(),
+                    bytes: 4,
+                },
+            ]),
+            "rows in name order"
+        );
+    }
 }

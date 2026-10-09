@@ -4,12 +4,43 @@ use std::path::PathBuf;
 use crate::core::CoreError;
 
 #[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct IoError(#[from] io::Error);
+
+impl PartialEq for IoError {
+    fn eq(
+        &self,
+        other: &Self,
+    ) -> bool {
+        self.0.kind() == other.0.kind()
+    }
+}
+
+impl Eq for IoError {}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct JsonError(#[from] serde_json::Error);
+
+impl PartialEq for JsonError {
+    fn eq(
+        &self,
+        other: &Self,
+    ) -> bool {
+        (self.0.classify(), self.0.line(), self.0.column())
+            == (other.0.classify(), other.0.line(), other.0.column())
+    }
+}
+
+impl Eq for JsonError {}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WeightsError {
     #[error("I/O on {path:?} failed.")]
     Io {
         path: PathBuf,
         #[source]
-        error: io::Error,
+        error: IoError,
     },
 
     #[error("Index file {path:?} of {bytes} bytes exceeds the maximum of {bytes_max} bytes.")]
@@ -23,7 +54,7 @@ pub enum WeightsError {
     IndexJson {
         path: PathBuf,
         #[source]
-        error: serde_json::Error,
+        error: JsonError,
     },
 
     #[error("Shard name {name:?} is not a plain file name.")]
@@ -43,7 +74,7 @@ pub enum WeightsError {
     HeaderJson {
         path: PathBuf,
         #[source]
-        error: serde_json::Error,
+        error: JsonError,
     },
 
     #[error("Header entry of tensor {name} in {path:?} is malformed.")]
@@ -51,7 +82,7 @@ pub enum WeightsError {
         path: PathBuf,
         name: String,
         #[source]
-        error: serde_json::Error,
+        error: JsonError,
     },
 
     #[error("Tensor {name} has unknown dtype {dtype:?}.")]

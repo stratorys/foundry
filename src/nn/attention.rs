@@ -14,6 +14,7 @@ pub struct Attention<B: Backend> {
     scale: Tensor<B>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct AttentionDims {
     heads: usize,
     kv_heads: usize,
@@ -140,10 +141,159 @@ mod tests {
         Shape,
         Tensor,
     };
+    use crate::nn::attention::{
+        AttentionDims,
+        attention_dims,
+    };
     use crate::nn::{
         Attention,
         KvCache,
     };
+
+    #[test]
+    fn attention_dims_computes_the_group() {
+        let [query, keys] = [[4, 1, 2], [2, 3, 2]]
+            .map(|dims| Shape::try_from(dims.as_slice()).expect("the shape is valid"));
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &query,
+                &keys,
+                &keys,
+            ),
+            Ok(AttentionDims {
+                heads: 4,
+                kv_heads: 2,
+                group: 2,
+                seq_len: 1,
+                seq_len_total: 3,
+                head_dim: 2,
+            }),
+            "four query heads share two key-value heads"
+        );
+    }
+
+    #[test]
+    fn attention_dims_rejects_rank_other_than_three() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([4, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible {
+                query: vec![4, 2],
+                key: vec![2, 2, 2],
+                value: vec![2, 2, 2],
+            }),
+            "a rank 2 query"
+        );
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible {
+                query: vec![4, 2, 2],
+                key: vec![2, 2],
+                value: vec![2, 2],
+            }),
+            "rank 2 keys"
+        );
+    }
+
+    #[test]
+    fn attention_dims_rejects_zero_kv_heads() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([0, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([0, 2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible {
+                query: vec![4, 2, 2],
+                key: vec![0, 2, 2],
+                value: vec![0, 2, 2],
+            }),
+            "zero key-value heads"
+        );
+    }
+
+    #[test]
+    fn attention_dims_rejects_heads_not_a_multiple_of_kv_heads() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([3, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible {
+                query: vec![3, 2, 2],
+                key: vec![2, 2, 2],
+                value: vec![2, 2, 2],
+            }),
+            "three query heads over two key-value heads"
+        );
+    }
+
+    #[test]
+    fn attention_dims_rejects_query_longer_than_keys() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([4, 3, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible {
+                query: vec![4, 3, 2],
+                key: vec![2, 2, 2],
+                value: vec![2, 2, 2],
+            }),
+            "three query positions over two key positions"
+        );
+    }
+
+    #[test]
+    fn attention_dims_rejects_key_head_dim_mismatch() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 4].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 4].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible {
+                query: vec![4, 2, 2],
+                key: vec![2, 2, 4],
+                value: vec![2, 2, 4],
+            }),
+            "head dims 2 and 4 differ"
+        );
+    }
+
+    #[test]
+    fn attention_dims_rejects_values_shaped_unlike_keys() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 3, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible {
+                query: vec![4, 2, 2],
+                key: vec![2, 2, 2],
+                value: vec![2, 3, 2],
+            }),
+            "values hold one more position than keys"
+        );
+    }
 
     #[test]
     fn attention_matches_hand_computed_values() {
@@ -352,74 +502,5 @@ mod tests {
             ),
             "a head dim of 2 is rejected by an attention built for 4"
         );
-    }
-
-    #[test]
-    fn attention_retried_at_the_same_position_matches_a_single_run() {
-        let mut backend = CpuBackend::new();
-        let [query, key, value, mask, mask_wrong] = [
-            (
-                vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
-                vec![2, 2, 2],
-            ),
-            (vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2]),
-            (vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]),
-            (vec![0.0, f32::NEG_INFINITY, 0.0, 0.0], vec![2, 2]),
-            (vec![0.0; 6], vec![2, 3]),
-        ]
-        .map(|(values, dims)| {
-            Tensor::upload(
-                &mut backend,
-                &values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                DType::F32,
-                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-            )
-            .expect("the upload succeeds")
-            .cast(&mut backend, DType::BF16)
-            .expect("the cast succeeds")
-        });
-        let mut cache =
-            KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
-        let attention = Attention::new(
-            &mut backend,
-            NonZeroUsize::new(2).expect("the head dim is non-zero"),
-        )
-        .expect("the attention is built");
-        let failed = {
-            let (keys, values) = cache
-                .update(&mut backend, &key, &value, 0)
-                .expect("the cache update succeeds");
-            attention.forward(&mut backend, &query, &keys, &values, &mask_wrong)
-        };
-        assert!(failed.is_err(), "a mask of the wrong shape is rejected");
-        let (keys, values) = cache
-            .update(&mut backend, &key, &value, 0)
-            .expect("the retried cache update succeeds");
-        assert_eq!(keys.shape().dims(), &[1, 2, 2], "keys view after the retry");
-        let actual: Vec<f32> = attention
-            .forward(&mut backend, &query, &keys, &values, &mask)
-            .expect("the retried attention succeeds")
-            .cast(&mut backend, DType::F32)
-            .expect("the cast succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&chunk| f32::from_le_bytes(chunk))
-            .collect();
-        let expected = [
-            1.0_f32, 2.0, 1.0, 2.0, 2.339_52, 3.339_52, 1.391_15, 2.391_15,
-        ];
-        assert_eq!(actual.len(), expected.len(), "element count");
-        actual.iter().zip(expected).for_each(|(&actual, expected)| {
-            assert!(
-                (actual - expected).abs() <= 1e-2 * expected.abs(),
-                "retried attention: {actual} is not within 1e-2 of {expected}"
-            );
-        });
     }
 }

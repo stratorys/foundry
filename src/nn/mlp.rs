@@ -55,25 +55,33 @@ mod tests {
     };
 
     #[test]
-    fn swiglu_mlp_with_identity_projections_gives_silu_of_x_times_x() {
+    fn swiglu_mlp_matches_hand_computed_values() {
         let mut backend = CpuBackend::new();
-        let identity_bytes: Vec<u8> = [1.0_f32, 0.0, 0.0, 1.0]
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let identity_shape = Shape::try_from([2, 2].as_slice()).expect("the shape is valid");
-        let [gate, up, down] = [(); 3].map(|()| {
+        let [gate, up, down] = [
+            [1.0_f32, 0.0, 0.0, -1.0],
+            [2.0, 0.0, 1.0, 1.0],
+            [1.0, 0.0, 1.0, -1.0],
+        ]
+        .map(|values| {
             Linear::new(
-                Tensor::upload(&mut backend, &identity_bytes, DType::F32, identity_shape)
-                    .expect("the upload succeeds")
-                    .cast(&mut backend, DType::BF16)
-                    .expect("the cast succeeds"),
+                Tensor::upload(
+                    &mut backend,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
+                )
+                .expect("the upload succeeds")
+                .cast(&mut backend, DType::BF16)
+                .expect("the cast succeeds"),
             )
         });
         let mlp = SwigluMlp::new(&mut backend, gate, up, down).expect("the mlp is built");
         let x = Tensor::upload(
             &mut backend,
-            &[1.0_f32, 0.0]
+            &[1.0_f32, 2.0]
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
@@ -95,7 +103,7 @@ mod tests {
             .iter()
             .map(|&chunk| f32::from_le_bytes(chunk))
             .collect();
-        let expected = [0.731_058_6_f32, 0.0];
+        let expected = [1.462_117_f32, 2.177_335];
         assert_eq!(actual.len(), expected.len(), "element count");
         actual.iter().zip(expected).for_each(|(&actual, expected)| {
             assert!(

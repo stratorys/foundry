@@ -1,7 +1,7 @@
 use crate::core::DType;
 use crate::core::primitive::ReduceOp;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CoreError {
     #[error("Rank {rank} exceeds the maximum rank {rank_max}.")]
     RankTooLarge { rank: usize, rank_max: usize },

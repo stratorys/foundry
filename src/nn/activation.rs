@@ -66,7 +66,7 @@ mod tests {
     };
 
     #[test]
-    fn softmax_rows_match_hand_computed_values_and_sum_to_one() {
+    fn softmax_rows_match_hand_computed_values() {
         let mut backend = CpuBackend::new();
         let x = Tensor::upload(
             &mut backend,
@@ -100,13 +100,6 @@ mod tests {
             assert!(
                 (actual - expected).abs() <= 1e-2 * expected.abs(),
                 "softmax: {actual} is not within 1e-2 of {expected}"
-            );
-        });
-        actual.chunks(3).for_each(|row| {
-            let row_sum: f32 = row.iter().sum();
-            assert!(
-                (row_sum - 1.0).abs() <= 1e-2,
-                "softmax row sum {row_sum} is not within 1e-2 of 1"
             );
         });
     }

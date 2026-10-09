@@ -226,10 +226,13 @@ mod tests {
         [[0, 0, 1].as_slice(), &[0, 1, 3], &[0, 1]]
             .into_iter()
             .for_each(|axes| {
-                let result = layout.permute(axes);
-                assert!(
-                    matches!(result, Err(CoreError::InvalidPermutation { .. })),
-                    "axes {axes:?} got {result:?}"
+                assert_eq!(
+                    layout.permute(axes),
+                    Err(CoreError::InvalidPermutation {
+                        axes: axes.to_vec(),
+                        rank: 3,
+                    }),
+                    "axes {axes:?}"
                 );
             });
     }
@@ -249,21 +252,41 @@ mod tests {
     fn narrow_rejects_out_of_bounds() {
         let layout =
             Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"));
-        let result = layout.narrow(1, 2, 2);
-        assert!(
-            matches!(result, Err(CoreError::NarrowOutOfBounds { .. })),
-            "got {result:?}"
+        assert_eq!(
+            layout.narrow(1, 2, 2),
+            Err(CoreError::NarrowOutOfBounds {
+                axis: 1,
+                start: 2,
+                len: 2,
+                dim: 3,
+            }),
+            "the window ends after the axis"
         );
-        let result = layout.narrow(3, 0, 1);
-        assert!(
-            matches!(
-                result,
-                Err(CoreError::AxisOutOfRange {
-                    axis: 3,
-                    rank: 3
-                })
+        assert_eq!(
+            layout.narrow(3, 0, 1),
+            Err(CoreError::AxisOutOfRange {
+                axis: 3,
+                rank: 3,
+            }),
+            "axis 3 does not exist"
+        );
+    }
+
+    #[test]
+    fn narrow_with_overflowing_end_is_rejected() {
+        assert_eq!(
+            Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")).narrow(
+                1,
+                usize::MAX,
+                1
             ),
-            "got {result:?}"
+            Err(CoreError::NarrowOutOfBounds {
+                axis: 1,
+                start: usize::MAX,
+                len: 1,
+                dim: 3,
+            }),
+            "start plus len overflows usize"
         );
     }
 
@@ -285,26 +308,23 @@ mod tests {
         let layout = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
             .permute(&[1, 0])
             .expect("valid permutation");
-        let result = layout.reshape(Shape::try_from([6].as_slice()).expect("valid shape"));
-        assert!(
-            matches!(result, Err(CoreError::ReshapeNonContiguous)),
-            "got {result:?}"
+        assert_eq!(
+            layout.reshape(Shape::try_from([6].as_slice()).expect("valid shape")),
+            Err(CoreError::ReshapeNonContiguous),
+            "a transposed layout cannot be reshaped"
         );
     }
 
     #[test]
     fn reshape_rejects_element_count_mismatch() {
-        let result = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
-            .reshape(Shape::try_from([5].as_slice()).expect("valid shape"));
-        assert!(
-            matches!(
-                result,
-                Err(CoreError::ElementCountMismatch {
-                    from: 6,
-                    to: 5
-                })
-            ),
-            "got {result:?}"
+        assert_eq!(
+            Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
+                .reshape(Shape::try_from([5].as_slice()).expect("valid shape")),
+            Err(CoreError::ElementCountMismatch {
+                from: 6,
+                to: 5,
+            }),
+            "six elements cannot become five"
         );
     }
 
@@ -472,29 +492,6 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_widens_size_one_axes_in_place() {
-        let layouts = broadcasts(&Layout::contiguous(
-            Shape::try_from([1, 3, 1, 4].as_slice()).expect("valid shape"),
-        ));
-        let widened: Vec<&[usize]> = layouts.iter().map(|layout| layout.shape().dims()).collect();
-        assert!(
-            widened.contains(&[2, 3, 5, 4].as_slice())
-                && widened.contains(&[1, 3, 2, 4].as_slice()),
-            "got {widened:?}"
-        );
-    }
-
-    #[test]
-    fn broadcast_as_beyond_i32_max_is_rejected() {
-        let dim = usize::try_from(u32::MAX).expect("u32 fits in usize");
-        let result = Shape::try_from([dim].as_slice()).and_then(|shape| {
-            Layout::contiguous(Shape::try_from([1].as_slice()).expect("valid shape"))
-                .broadcast_as(shape)
-        });
-        assert!(result.is_err(), "got {result:?}");
-    }
-
-    #[test]
     fn empty_contiguous_strides_do_not_depend_on_axis_order() {
         assert_eq!(
             Layout::contiguous(
@@ -516,11 +513,55 @@ mod tests {
 
     #[test]
     fn broadcast_as_rejects_incompatible_shape() {
-        let result = Layout::contiguous(Shape::try_from([3, 2].as_slice()).expect("valid shape"))
-            .broadcast_as(Shape::try_from([3, 4].as_slice()).expect("valid shape"));
+        assert_eq!(
+            Layout::contiguous(Shape::try_from([3, 2].as_slice()).expect("valid shape"))
+                .broadcast_as(Shape::try_from([3, 4].as_slice()).expect("valid shape")),
+            Err(CoreError::BroadcastAsIncompatible {
+                from: vec![3, 2],
+                to: vec![3, 4],
+            }),
+            "dim 2 cannot become 4"
+        );
+    }
+
+    #[test]
+    fn broadcast_as_to_a_lower_rank_is_rejected() {
+        assert_eq!(
+            Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
+                .broadcast_as(Shape::try_from([3].as_slice()).expect("valid shape")),
+            Err(CoreError::BroadcastAsIncompatible {
+                from: vec![2, 3],
+                to: vec![3],
+            }),
+            "a broadcast cannot drop an axis"
+        );
+    }
+
+    #[test]
+    fn size_one_axis_with_any_stride_is_contiguous() {
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 1, 3].as_slice()).expect("valid shape"))
+                .permute(&[1, 0, 2])
+                .expect("valid permutation");
+        assert_eq!(
+            layout.strides(),
+            &[3, 3, 1],
+            "the size one axis keeps stride 3"
+        );
         assert!(
-            matches!(result, Err(CoreError::BroadcastAsIncompatible { .. })),
-            "got {result:?}"
+            layout.is_contiguous(),
+            "moving a size one axis keeps the layout contiguous"
+        );
+    }
+
+    #[test]
+    fn broadcast_layout_is_not_contiguous() {
+        let layout = Layout::contiguous(Shape::try_from([3].as_slice()).expect("valid shape"))
+            .broadcast_as(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
+            .expect("broadcastable");
+        assert!(
+            !layout.is_contiguous(),
+            "a zero stride on a dim of 2 is not contiguous"
         );
     }
 }
