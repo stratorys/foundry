@@ -30,8 +30,11 @@ use crate::core::primitive::{
     BinaryOp,
     ReduceOp,
     UnaryOp,
+    concat_rule,
+    gather_rule,
     matmul_rule,
     reduce_rule,
+    slice_update_rule,
 };
 use crate::core::{
     Backend,
@@ -50,6 +53,8 @@ const KERNEL_SOURCES: &[&str] = &[
     include_str!("kernels/binary.metal"),
     include_str!("kernels/reduce.metal"),
     include_str!("kernels/matmul.metal"),
+    include_str!("kernels/gather.metal"),
+    include_str!("kernels/slice_update.metal"),
 ];
 
 const REDUCE_THREADS: usize = 256;
@@ -114,6 +119,17 @@ struct MatmulArgs {
     rhs: MatmulOperand,
 }
 
+#[repr(C)]
+struct GatherArgs {
+    count: u32,
+    rows: u32,
+    cols: u32,
+    table_offset: u32,
+    table_row_stride: u32,
+    table_col_stride: u32,
+    indices: StridedArgs,
+}
+
 impl StridedArgs {
     fn new(input: &Operand<'_, MetalStorage>) -> Result<Self, MetalError> {
         Self::with_shape(input, input.layout.shape())
@@ -130,6 +146,67 @@ impl StridedArgs {
             dims: padded_u32(shape.dims())?,
             strides: padded_u32(input.layout.strides())?,
             offset: index_u32(input.layout.offset())?,
+        })
+    }
+
+    fn window(
+        target: &Operand<'_, MetalStorage>,
+        shape: &Shape,
+        axis: usize,
+        start: usize,
+    ) -> Result<Self, MetalError> {
+        let axis_stride =
+            target
+                .layout
+                .strides()
+                .get(axis)
+                .copied()
+                .ok_or(CoreError::AxisOutOfRange {
+                    axis,
+                    rank: target.layout.shape().rank(),
+                })?;
+        let offset = start
+            .checked_mul(axis_stride)
+            .and_then(|skipped| skipped.checked_add(target.layout.offset()))
+            .ok_or(MetalError::IndexTooLarge {
+                value: start,
+            })?;
+        Ok(Self {
+            offset: index_u32(offset)?,
+            ..Self::with_shape(target, shape)?
+        })
+    }
+}
+
+impl GatherArgs {
+    fn new(
+        table: &Operand<'_, MetalStorage>,
+        indices: &Operand<'_, MetalStorage>,
+    ) -> Result<Self, MetalError> {
+        let incompatible = || CoreError::GatherIncompatible {
+            table: table.layout.shape().dims().to_vec(),
+            indices: indices.layout.shape().dims().to_vec(),
+        };
+        let ([rows, cols], [row_stride, col_stride]) =
+            (table.layout.shape().dims(), table.layout.strides())
+        else {
+            return Err(incompatible().into());
+        };
+        let count = indices
+            .layout
+            .shape()
+            .element_count()
+            .checked_mul(*cols)
+            .ok_or_else(incompatible)?;
+        index_u32(buffer_element_count(table))?;
+        Ok(Self {
+            count: index_u32(count)?,
+            rows: index_u32(*rows)?,
+            cols: index_u32(*cols)?,
+            table_offset: index_u32(table.layout.offset())?,
+            table_row_stride: index_u32(*row_stride)?,
+            table_col_stride: index_u32(*col_stride)?,
+            indices: StridedArgs::new(indices)?,
         })
     }
 }
@@ -470,6 +547,111 @@ impl MetalBackend {
         })
     }
 
+    fn dispatch_gather(
+        &mut self,
+        kernel: &'static str,
+        table: &Operand<'_, MetalStorage>,
+        indices: &Operand<'_, MetalStorage>,
+        args: &GatherArgs,
+        count: usize,
+        output: &MetalStorage,
+    ) -> Result<(), MetalError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let pipeline = self.pipeline(kernel)?;
+        let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
+        self.encode(&pipeline, |encoder| {
+            // SAFETY: both input buffers are alive for the whole call and the
+            // command buffer retains them; `GatherArgs::new` checked that every
+            // index read from either buffer fits in its element count, and the
+            // kernel reads a table row only when its index is below `rows`.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&table.storage.buffer), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&indices.storage.buffer), 0, 1);
+            };
+            // SAFETY: the output buffer holds `count` elements of the kernel's
+            // type, one per dispatched thread.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 2) };
+            // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
+            // layout of `GatherArgs` in `gather.metal`; Metal copies the bytes
+            // before the call returns.
+            unsafe {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(args).cast(),
+                    size_of::<GatherArgs>(),
+                    3,
+                )
+            };
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        })
+    }
+
+    fn dispatch_write(
+        &mut self,
+        kernel: &'static str,
+        input: &Operand<'_, MetalStorage>,
+        window: &StridedArgs,
+        output: &MetalStorage,
+    ) -> Result<(), MetalError> {
+        let count = input.layout.shape().element_count();
+        if count == 0 {
+            return Ok(());
+        }
+        let input_args = StridedArgs::new(input)?;
+        let pipeline = self.pipeline(kernel)?;
+        let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
+        self.encode(&pipeline, |encoder| {
+            // SAFETY: the input buffer is alive for the whole call and the
+            // command buffer retains it; `StridedArgs::new` checked that every
+            // index the kernel reads fits in the buffer's element count.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
+            // SAFETY: the output buffer is alive for the whole call and the
+            // command buffer retains it; `window` addresses a sub-range of a
+            // contiguous layout of that buffer whose shape rule was checked, so
+            // every written index is in bounds and written by one thread only.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 1) };
+            // SAFETY: `input_args` and `window` are `#[repr(C)]` structs of
+            // `u32` that match the layout of `StridedArgs` in `common.metal`;
+            // Metal copies the bytes before the call returns.
+            unsafe {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&input_args).cast(),
+                    size_of::<StridedArgs>(),
+                    2,
+                );
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(window).cast(),
+                    size_of::<StridedArgs>(),
+                    3,
+                );
+            };
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        })
+    }
+
     fn matmul_copy(
         &mut self,
         operand: &Operand<'_, MetalStorage>,
@@ -679,35 +861,88 @@ impl Backend for MetalBackend {
 
     fn gather(
         &mut self,
-        _table: Operand<'_, MetalStorage>,
-        _indices: Operand<'_, MetalStorage>,
+        table: Operand<'_, MetalStorage>,
+        indices: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        Err(MetalError::NotImplemented {
-            primitive: "gather",
-        })
+        let kernel = gather_kernel(table.dtype)?;
+        let (dtype, shape) = gather_rule(
+            table.dtype,
+            table.layout.shape(),
+            indices.dtype,
+            indices.layout.shape(),
+        )?;
+        let args = GatherArgs::new(&table, &indices)?;
+        let output = self.allocate(dtype, &shape)?;
+        self.dispatch_gather(
+            kernel,
+            &table,
+            &indices,
+            &args,
+            shape.element_count(),
+            &output,
+        )?;
+        Ok(output)
     }
 
     fn concat(
         &mut self,
-        _lhs: Operand<'_, MetalStorage>,
-        _rhs: Operand<'_, MetalStorage>,
-        _axis: usize,
+        lhs: Operand<'_, MetalStorage>,
+        rhs: Operand<'_, MetalStorage>,
+        axis: usize,
     ) -> Result<MetalStorage, MetalError> {
-        Err(MetalError::NotImplemented {
-            primitive: "concat",
-        })
+        let kernel = slice_update_kernel("concat", lhs.dtype)?;
+        let (dtype, shape) = concat_rule(
+            lhs.dtype,
+            lhs.layout.shape(),
+            rhs.dtype,
+            rhs.layout.shape(),
+            axis,
+        )?;
+        let lhs_len =
+            lhs.layout
+                .shape()
+                .dims()
+                .get(axis)
+                .copied()
+                .ok_or(CoreError::AxisOutOfRange {
+                    axis,
+                    rank: lhs.layout.shape().rank(),
+                })?;
+        let output = self.allocate(dtype, &shape)?;
+        let layout = Layout::contiguous(shape)?;
+        let target = Operand {
+            storage: &output,
+            layout: &layout,
+            dtype,
+        };
+        let lhs_window = StridedArgs::window(&target, lhs.layout.shape(), axis, 0)?;
+        let rhs_window = StridedArgs::window(&target, rhs.layout.shape(), axis, lhs_len)?;
+        self.dispatch_write(kernel, &lhs, &lhs_window, &output)?;
+        self.dispatch_write(kernel, &rhs, &rhs_window, &output)?;
+        Ok(output)
     }
 
     fn slice_update(
         &mut self,
-        _target: Operand<'_, MetalStorage>,
-        _update: Operand<'_, MetalStorage>,
-        _axis: usize,
-        _start: usize,
+        target: Operand<'_, MetalStorage>,
+        update: Operand<'_, MetalStorage>,
+        axis: usize,
+        start: usize,
     ) -> Result<(), MetalError> {
-        Err(MetalError::NotImplemented {
-            primitive: "slice_update",
-        })
+        let kernel = slice_update_kernel("slice_update", target.dtype)?;
+        slice_update_rule(
+            target.dtype,
+            target.layout.shape(),
+            update.dtype,
+            update.layout.shape(),
+            axis,
+            start,
+        )?;
+        if !target.layout.is_contiguous() {
+            return Err(MetalError::SliceUpdateNonContiguous);
+        }
+        let window = StridedArgs::window(&target, update.layout.shape(), axis, start)?;
+        self.dispatch_write(kernel, &update, &window, target.storage)
     }
 }
 
@@ -831,6 +1066,33 @@ fn matmul_kernel(dtype: DType) -> Result<&'static str, MetalError> {
         DType::BF16 => Ok("matmul_bf16"),
         DType::U32 => Err(MetalError::UnsupportedDType {
             primitive: "matmul",
+            dtype,
+        }),
+    }
+}
+
+fn gather_kernel(dtype: DType) -> Result<&'static str, MetalError> {
+    match dtype {
+        DType::F32 => Ok("gather_f32"),
+        DType::F16 => Ok("gather_f16"),
+        DType::BF16 => Ok("gather_bf16"),
+        DType::U32 => Err(MetalError::UnsupportedDType {
+            primitive: "gather",
+            dtype,
+        }),
+    }
+}
+
+fn slice_update_kernel(
+    primitive: &'static str,
+    dtype: DType,
+) -> Result<&'static str, MetalError> {
+    match dtype {
+        DType::F32 => Ok("slice_update_f32"),
+        DType::F16 => Ok("slice_update_f16"),
+        DType::BF16 => Ok("slice_update_bf16"),
+        DType::U32 => Err(MetalError::UnsupportedDType {
+            primitive,
             dtype,
         }),
     }
@@ -1860,6 +2122,257 @@ mod tests {
         assert!(
             download_f32(&mut backend, &output).is_empty(),
             "an empty matmul downloads no values"
+        );
+    }
+
+    fn upload_u32(
+        backend: &mut MetalBackend,
+        values: &[u32],
+        dims: &[usize],
+    ) -> Tensor<MetalBackend> {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        Tensor::upload(backend, &bytes, DType::U32, shape(dims)).expect("the upload succeeds")
+    }
+
+    fn to_f32(
+        backend: &mut MetalBackend,
+        tensor: &Tensor<MetalBackend>,
+    ) -> Vec<f32> {
+        let output = tensor.cast(backend, DType::F32).expect("the cast succeeds");
+        download_f32(backend, &output)
+    }
+
+    #[test]
+    fn gather_selects_rows_for_each_float_dtype() {
+        let mut backend = backend();
+        let indices = upload_u32(&mut backend, &[2, 0], &[2]);
+        FLOAT_DTYPES.iter().for_each(|&dtype| {
+            let table = upload_as(&mut backend, &iota(12), &[3, 4], dtype);
+            let rows = table
+                .gather(&mut backend, &indices)
+                .expect("the gather succeeds");
+            assert_eq!(
+                rows.shape().dims(),
+                &[2, 4],
+                "output shape is [indices, cols]"
+            );
+            let actual = to_f32(&mut backend, &rows);
+            assert_close(
+                &actual,
+                &[8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0],
+                dtype,
+                "rows [2, 0] of a [3, 4] table",
+            );
+        });
+    }
+
+    #[test]
+    fn gather_with_out_of_range_index_writes_a_zero_row() {
+        let mut backend = backend();
+        let table = upload_f32(&mut backend, &iota(6), &[3, 2]);
+        let indices = upload_u32(&mut backend, &[1, 3], &[2]);
+        let rows = table
+            .gather(&mut backend, &indices)
+            .expect("the gather succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &rows),
+            [2.0, 3.0, 0.0, 0.0],
+            "an index past the table gives zeros"
+        );
+    }
+
+    #[test]
+    fn gather_of_permuted_table_reads_strided_rows() {
+        let mut backend = backend();
+        let table = upload_f32(&mut backend, &iota(6), &[2, 3])
+            .permute(&[1, 0])
+            .expect("the permutation is valid");
+        let indices = upload_u32(&mut backend, &[2, 0], &[2]);
+        let rows = table
+            .gather(&mut backend, &indices)
+            .expect("the gather succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &rows),
+            [2.0, 5.0, 0.0, 3.0],
+            "rows [2, 0] of the transposed table"
+        );
+    }
+
+    #[test]
+    fn concat_on_first_and_last_axis_for_each_float_dtype() {
+        let mut backend = backend();
+        FLOAT_DTYPES.iter().for_each(|&dtype| {
+            let top = upload_as(&mut backend, &[0.0, 1.0, 2.0], &[1, 3], dtype);
+            let bottom = upload_as(
+                &mut backend,
+                &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                &[2, 3],
+                dtype,
+            );
+            let rows = top
+                .concat(&mut backend, &bottom, 0)
+                .expect("the concat succeeds");
+            assert_eq!(rows.shape().dims(), &[3, 3], "axis 0 adds rows");
+            let actual = to_f32(&mut backend, &rows);
+            assert_close(&actual, &iota(9), dtype, "concat on axis 0");
+
+            let left = upload_as(&mut backend, &[10.0, 20.0], &[2, 1], dtype);
+            let right = upload_as(&mut backend, &iota(6), &[2, 3], dtype);
+            let cols = left
+                .concat(&mut backend, &right, 1)
+                .expect("the concat succeeds");
+            assert_eq!(cols.shape().dims(), &[2, 4], "the last axis adds columns");
+            let actual = to_f32(&mut backend, &cols);
+            assert_close(
+                &actual,
+                &[10.0, 0.0, 1.0, 2.0, 20.0, 3.0, 4.0, 5.0],
+                dtype,
+                "concat on the last axis",
+            );
+        });
+    }
+
+    #[test]
+    fn concat_of_permuted_input_reads_strided_values() {
+        let mut backend = backend();
+        let lhs = upload_f32(&mut backend, &iota(6), &[2, 3])
+            .permute(&[1, 0])
+            .expect("the permutation is valid");
+        let rhs = upload_f32(&mut backend, &[10.0, 11.0], &[1, 2]);
+        let output = lhs
+            .concat(&mut backend, &rhs, 0)
+            .expect("the concat succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &output),
+            [0.0, 3.0, 1.0, 4.0, 2.0, 5.0, 10.0, 11.0],
+            "the permuted lhs is read in place"
+        );
+    }
+
+    #[test]
+    fn concat_with_empty_input_keeps_the_other_input() {
+        let mut backend = backend();
+        let empty = upload_f32(&mut backend, &[], &[0, 3]);
+        let rows = upload_f32(&mut backend, &iota(6), &[2, 3]);
+        let output = empty
+            .concat(&mut backend, &rows, 0)
+            .expect("the concat succeeds");
+        assert_eq!(
+            output.shape().dims(),
+            &[2, 3],
+            "the empty input adds no rows"
+        );
+        assert_eq!(
+            download_f32(&mut backend, &output),
+            iota(6),
+            "the output equals the non-empty input"
+        );
+    }
+
+    #[test]
+    fn slice_update_writes_one_position_and_keeps_the_others_for_each_float_dtype() {
+        let mut backend = backend();
+        let (heads, positions, head_dim, position) = (8_usize, 16_usize, 128_usize, 5_usize);
+        let update_values: Vec<f32> = (0_u16..1024)
+            .map(|index| f32::from(index % 64 + 1))
+            .collect();
+        let expected: Vec<f32> = (0..heads)
+            .flat_map(|head| {
+                let update_values = &update_values;
+                (0..positions).flat_map(move |slot| {
+                    (0..head_dim).map(move |dim| {
+                        if slot == position {
+                            update_values
+                                .get(head * head_dim + dim)
+                                .copied()
+                                .expect("the update holds every head and dim")
+                        } else {
+                            0.0
+                        }
+                    })
+                })
+            })
+            .collect();
+        FLOAT_DTYPES.iter().for_each(|&dtype| {
+            let mut cache =
+                Tensor::zeros(&mut backend, dtype, shape(&[heads, positions, head_dim]))
+                    .expect("the zeros succeed");
+            let update = upload_as(&mut backend, &update_values, &[heads, 1, head_dim], dtype);
+            cache
+                .slice_update(&mut backend, &update, 1, position)
+                .expect("the slice update succeeds");
+            let actual = to_f32(&mut backend, &cache);
+            assert_close(
+                &actual,
+                &expected,
+                dtype,
+                "[8, 1, 128] into [8, 16, 128] at 5",
+            );
+        });
+    }
+
+    #[test]
+    fn slice_update_of_permuted_update_reads_strided_values() {
+        let mut backend = backend();
+        let mut target =
+            Tensor::zeros(&mut backend, DType::F32, shape(&[2, 4])).expect("the zeros succeed");
+        let update = upload_f32(&mut backend, &iota(4), &[2, 2])
+            .permute(&[1, 0])
+            .expect("the permutation is valid");
+        target
+            .slice_update(&mut backend, &update, 1, 1)
+            .expect("the slice update succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &target),
+            [0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0, 0.0],
+            "the transposed update lands in columns 1 and 2"
+        );
+    }
+
+    #[test]
+    fn slice_update_of_broadcast_target_is_rejected() {
+        let mut backend = backend();
+        let mut target = Tensor::zeros(&mut backend, DType::F32, shape(&[1, 4]))
+            .expect("the zeros succeed")
+            .broadcast_as(shape(&[3, 4]))
+            .expect("the broadcast is valid");
+        let update = upload_f32(&mut backend, &iota(3), &[3, 1]);
+        assert!(
+            matches!(
+                target.slice_update(&mut backend, &update, 1, 0),
+                Err(MetalError::SliceUpdateNonContiguous)
+            ),
+            "a broadcast target would be written by several threads"
+        );
+    }
+
+    #[test]
+    fn gather_and_concat_on_u32_are_rejected() {
+        let mut backend = backend();
+        let values = upload_u32(&mut backend, &[0, 1, 2, 3], &[2, 2]);
+        let indices = upload_u32(&mut backend, &[0], &[1]);
+        assert!(
+            matches!(
+                values.gather(&mut backend, &indices),
+                Err(MetalError::UnsupportedDType {
+                    primitive: "gather",
+                    dtype: DType::U32
+                })
+            ),
+            "gather rejects a u32 table on Metal"
+        );
+        assert!(
+            matches!(
+                values.concat(&mut backend, &values, 0),
+                Err(MetalError::UnsupportedDType {
+                    primitive: "concat",
+                    dtype: DType::U32
+                })
+            ),
+            "concat rejects u32 on Metal"
         );
     }
 }

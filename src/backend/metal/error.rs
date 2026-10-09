@@ -75,8 +75,8 @@ pub enum MetalError {
         bytes_len: usize,
     },
 
-    #[error("Primitive {primitive} is not implemented on Metal.")]
-    NotImplemented { primitive: &'static str },
+    #[error("Slice update requires a contiguous target layout.")]
+    SliceUpdateNonContiguous,
 
     #[error(transparent)]
     Core(#[from] CoreError),
