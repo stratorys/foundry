@@ -342,7 +342,10 @@ impl MetalBackend {
         }
         let buffer = self
             .device
-            .newBufferWithLength_options(byte_len.max(1), MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(
+                byte_len.max(dtype.size_bytes()),
+                MTLResourceOptions::StorageModeShared,
+            )
             .ok_or(MetalError::BufferAllocation {
                 bytes: byte_len,
             })?;
