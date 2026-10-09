@@ -1,20 +1,15 @@
 mod error;
+mod stream;
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{
-    NSRange,
-    NSString,
-};
+use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlitCommandEncoder,
     MTLBuffer,
     MTLCommandBuffer,
-    MTLCommandBufferStatus,
-    MTLCommandEncoder,
     MTLCommandQueue,
     MTLComputeCommandEncoder,
     MTLComputePipelineState,
@@ -26,6 +21,7 @@ use objc2_metal::{
 };
 
 pub use self::error::MetalError;
+use self::stream::CommandStream;
 use crate::core::primitive::{
     BinaryOp,
     ReduceOp,
@@ -80,10 +76,9 @@ pub struct MetalStorage {
 
 pub struct MetalBackend {
     device: Device,
-    queue: Queue,
     library: Library,
     pipelines: HashMap<&'static str, Pipeline>,
-    pending: Option<CommandBuffer>,
+    stream: CommandStream,
 }
 
 struct BufferView<'buffer> {
@@ -311,10 +306,9 @@ impl MetalBackend {
             })?;
         Ok(Self {
             device,
-            queue,
             library,
             pipelines: HashMap::new(),
-            pending: None,
+            stream: CommandStream::new(queue),
         })
     }
 
@@ -343,7 +337,7 @@ impl MetalBackend {
         Ok(MetalStorage {
             buffer,
             byte_len,
-            queue: self.queue.clone(),
+            queue: self.stream.queue().clone(),
         })
     }
 
@@ -351,7 +345,10 @@ impl MetalBackend {
         &self,
         storage: &MetalStorage,
     ) -> Result<(), MetalError> {
-        if std::ptr::eq::<ProtocolObject<dyn MTLCommandQueue>>(&*storage.queue, &*self.queue) {
+        if std::ptr::eq::<ProtocolObject<dyn MTLCommandQueue>>(
+            &*storage.queue,
+            &**self.stream.queue(),
+        ) {
             Ok(())
         } else {
             Err(MetalError::ForeignStorage)
@@ -399,19 +396,7 @@ impl MetalBackend {
         pipeline: &Pipeline,
         bind: impl FnOnce(&ComputeEncoder),
     ) -> Result<(), MetalError> {
-        let command_buffer = self
-            .queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::ComputeEncoderCreation)?;
-        encoder.setComputePipelineState(pipeline);
-        bind(&encoder);
-        encoder.endEncoding();
-        command_buffer.commit();
-        self.pending = Some(command_buffer);
-        Ok(())
+        self.stream.compute(pipeline, bind)
     }
 
     fn dispatch_strided(
@@ -740,12 +725,6 @@ impl MetalBackend {
         let storage = self.copy_view(operand)?;
         Ok(Some((storage, Layout::contiguous(*operand.layout.shape()))))
     }
-
-    fn wait_pending(&mut self) -> Result<(), MetalError> {
-        self.pending
-            .take()
-            .map_or(Ok(()), |command_buffer| wait(&command_buffer))
-    }
 }
 
 impl Backend for MetalBackend {
@@ -785,21 +764,7 @@ impl Backend for MetalBackend {
         shape: &Shape,
     ) -> Result<MetalStorage, MetalError> {
         let storage = self.allocate(dtype, shape)?;
-        let command_buffer = self
-            .queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .blitCommandEncoder()
-            .ok_or(MetalError::BlitEncoderCreation)?;
-        encoder.fillBuffer_range_value(
-            &storage.buffer,
-            NSRange::new(0, storage.buffer.length()),
-            0,
-        );
-        encoder.endEncoding();
-        command_buffer.commit();
-        self.pending = Some(command_buffer);
+        self.stream.fill_zero(&storage.buffer)?;
         Ok(storage)
     }
 
@@ -830,14 +795,14 @@ impl Backend for MetalBackend {
             Some(end) if end <= bytes_len => {}
             Some(_) | None => return Err(out_of_bounds),
         }
-        self.wait_pending()?;
+        self.stream.synchronize()?;
         let mut output = vec![0_u8; bytes];
         // SAFETY: the buffer uses shared storage, `bytes_offset + bytes <=
         // byte_len` was checked above, `output` holds `bytes` bytes,
         // and every command buffer that writes the buffer has completed:
-        // `view` checked that the storage was produced on `self.queue`,
-        // that queue is serial, and its last committed command buffer was
-        // waited on.
+        // `view` checked that the storage was produced on this backend's
+        // queue, and `synchronize` committed the open command buffer, then
+        // waited on every committed command buffer and saw each complete.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input
@@ -1220,19 +1185,6 @@ fn padded_u32(values: &[usize]) -> Result<[u32; RANK_MAX], MetalError> {
             }
             Ok(padded)
         })
-}
-
-fn wait(command_buffer: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), MetalError> {
-    command_buffer.waitUntilCompleted();
-    match command_buffer.status() {
-        MTLCommandBufferStatus::Completed => Ok(()),
-        status => Err(MetalError::CommandBufferFailed {
-            message: command_buffer.error().map_or_else(
-                || format!("status {status:?}"),
-                |error| error.localizedDescription().to_string(),
-            ),
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -1833,6 +1785,39 @@ mod tests {
                 .expect("the download succeeds")
                 .is_empty(),
             "an empty add downloads no bytes"
+        );
+    }
+
+    #[test]
+    fn long_chain_of_adds_spans_several_command_buffers() {
+        let mut backend = backend();
+        let ones = upload_f32(&mut backend, &[1.0; 4], &[4]);
+        let start = Tensor::zeros(&mut backend, DType::F32, shape(&[4])).expect("zeros succeeds");
+        let sum = (0..300)
+            .try_fold(start, |sum, _| sum.add(&mut backend, &ones))
+            .expect("every add succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &sum),
+            vec![300.0; 4],
+            "three hundred additions of one"
+        );
+    }
+
+    #[test]
+    fn zeros_interleaved_with_adds_keep_submission_order() {
+        let mut backend = backend();
+        let ones = upload_f32(&mut backend, &[1.0; 3], &[3]);
+        let start = upload_f32(&mut backend, &[1.0; 3], &[3]);
+        let sum = (0..100)
+            .try_fold(start, |sum, _| {
+                let zeros = Tensor::zeros(&mut backend, DType::F32, shape(&[3]))?;
+                sum.add(&mut backend, &zeros)?.add(&mut backend, &ones)
+            })
+            .expect("every zeros and add succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &sum),
+            vec![101.0; 3],
+            "one plus one hundred additions of zero then one"
         );
     }
 
