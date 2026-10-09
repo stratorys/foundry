@@ -30,9 +30,11 @@ use crate::core::primitive::{
     BinaryOp,
     ReduceOp,
     UnaryOp,
+    reduce_rule,
 };
 use crate::core::{
     Backend,
+    CoreError,
     DType,
     Operand,
     RANK_MAX,
@@ -44,7 +46,10 @@ const KERNEL_SOURCES: &[&str] = &[
     include_str!("kernels/copy.metal"),
     include_str!("kernels/unary.metal"),
     include_str!("kernels/binary.metal"),
+    include_str!("kernels/reduce.metal"),
 ];
+
+const REDUCE_THREADS: usize = 256;
 
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -52,6 +57,7 @@ type Queue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+type ComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 
 pub struct MetalStorage {
     buffer: Buffer,
@@ -75,21 +81,65 @@ struct StridedArgs {
     offset: u32,
 }
 
+#[repr(C)]
+struct ReduceArgs {
+    rows: StridedArgs,
+    axis_len: u32,
+    axis_stride: u32,
+}
+
 impl StridedArgs {
     fn new(input: &Operand<'_, MetalStorage>) -> Result<Self, MetalError> {
+        Self::with_shape(input, input.layout.shape())
+    }
+
+    fn with_shape(
+        input: &Operand<'_, MetalStorage>,
+        shape: &Shape,
+    ) -> Result<Self, MetalError> {
         let elements_buffer = input
             .storage
             .byte_len
             .checked_div(input.dtype.size_bytes())
             .unwrap_or(0);
         index_u32(elements_buffer)?;
-        let shape = input.layout.shape();
         Ok(Self {
             count: index_u32(shape.element_count())?,
             rank: index_u32(shape.rank())?,
             dims: padded_u32(shape.dims())?,
             strides: padded_u32(input.layout.strides())?,
             offset: index_u32(input.layout.offset())?,
+        })
+    }
+}
+
+impl ReduceArgs {
+    fn new(
+        input: &Operand<'_, MetalStorage>,
+        axis: usize,
+        rows: &Shape,
+    ) -> Result<Self, MetalError> {
+        let axis_out_of_range = || CoreError::AxisOutOfRange {
+            axis,
+            rank: input.layout.shape().rank(),
+        };
+        let axis_len = input
+            .layout
+            .shape()
+            .dims()
+            .get(axis)
+            .copied()
+            .ok_or_else(axis_out_of_range)?;
+        let axis_stride = input
+            .layout
+            .strides()
+            .get(axis)
+            .copied()
+            .ok_or_else(axis_out_of_range)?;
+        Ok(Self {
+            rows: StridedArgs::with_shape(input, rows)?,
+            axis_len: index_u32(axis_len)?,
+            axis_stride: index_u32(axis_stride)?,
         })
     }
 }
@@ -162,6 +212,26 @@ impl MetalBackend {
         Ok(pipeline)
     }
 
+    fn encode(
+        &mut self,
+        pipeline: &Pipeline,
+        bind: impl FnOnce(&ComputeEncoder),
+    ) -> Result<(), MetalError> {
+        let command_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::ComputeEncoderCreation)?;
+        encoder.setComputePipelineState(pipeline);
+        bind(&encoder);
+        encoder.endEncoding();
+        command_buffer.commit();
+        self.pending = Some(command_buffer);
+        Ok(())
+    }
+
     fn dispatch_strided(
         &mut self,
         kernel: &'static str,
@@ -180,54 +250,99 @@ impl MetalBackend {
             .collect::<Result<Vec<_>, _>>()?;
         let output_index = inputs.len();
         let pipeline = self.pipeline(kernel)?;
-        let command_buffer = self
-            .queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::ComputeEncoderCreation)?;
-        encoder.setComputePipelineState(&pipeline);
-        inputs.iter().enumerate().for_each(|(index, input)| {
-            // SAFETY: the input buffer is alive for the whole call and the
-            // command buffer retains it; `StridedArgs::new` checked that every
-            // index the kernel reads fits in the buffer's element count.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, index) };
-        });
-        // SAFETY: the output buffer holds `count` elements of the kernel's
-        // output type, one per dispatched thread.
-        unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, output_index) };
-        args.iter()
-            .zip(output_index.saturating_add(1)..)
-            .for_each(|(input_args, index)| {
-                // SAFETY: `input_args` is a `#[repr(C)]` struct of `u32` that
-                // matches the layout of `StridedArgs` in `common.metal`; Metal
-                // copies the bytes before the call returns.
-                unsafe {
-                    encoder.setBytes_length_atIndex(
-                        NonNull::from(input_args).cast(),
-                        size_of::<StridedArgs>(),
-                        index,
-                    )
-                };
-            });
         let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
-        encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: count,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        encoder.endEncoding();
-        command_buffer.commit();
-        self.pending = Some(command_buffer);
-        Ok(())
+        self.encode(&pipeline, |encoder| {
+            inputs.iter().enumerate().for_each(|(index, input)| {
+                // SAFETY: the input buffer is alive for the whole call and the
+                // command buffer retains it; `StridedArgs::new` checked that
+                // every index the kernel reads fits in the
+                // buffer's element count.
+                unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, index) };
+            });
+            // SAFETY: the output buffer holds `count` elements of the kernel's
+            // output type, one per dispatched thread.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, output_index) };
+            args.iter()
+                .zip(output_index.saturating_add(1)..)
+                .for_each(|(input_args, index)| {
+                    // SAFETY: `input_args` is a `#[repr(C)]` struct of `u32`
+                    // that matches the layout of
+                    // `StridedArgs` in `common.metal`; Metal
+                    // copies the bytes before the call returns.
+                    unsafe {
+                        encoder.setBytes_length_atIndex(
+                            NonNull::from(input_args).cast(),
+                            size_of::<StridedArgs>(),
+                            index,
+                        )
+                    };
+                });
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        })
+    }
+
+    fn dispatch_reduce(
+        &mut self,
+        kernel: &'static str,
+        input: &Operand<'_, MetalStorage>,
+        args: &ReduceArgs,
+        rows: usize,
+        output: &MetalStorage,
+    ) -> Result<(), MetalError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let pipeline = self.pipeline(kernel)?;
+        let threads = pipeline.maxTotalThreadsPerThreadgroup();
+        if threads < REDUCE_THREADS {
+            return Err(MetalError::ThreadgroupTooSmall {
+                name: kernel,
+                threads,
+                threads_required: REDUCE_THREADS,
+            });
+        }
+        self.encode(&pipeline, |encoder| {
+            // SAFETY: the input buffer is alive for the whole call and the
+            // command buffer retains it; `ReduceArgs::new` checked that every
+            // index the kernel reads fits in the buffer's element count.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
+            // SAFETY: the output buffer holds one element of the kernel's
+            // output type per dispatched threadgroup.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 1) };
+            // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
+            // layout of `ReduceArgs` in `reduce.metal`; Metal copies the bytes
+            // before the call returns.
+            unsafe {
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(args).cast(),
+                    size_of::<ReduceArgs>(),
+                    2,
+                )
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: rows,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: REDUCE_THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        })
     }
 
     fn wait_pending(&mut self) -> Result<(), MetalError> {
@@ -366,13 +481,16 @@ impl Backend for MetalBackend {
 
     fn reduce(
         &mut self,
-        _op: ReduceOp,
-        _input: Operand<'_, MetalStorage>,
-        _axis: usize,
+        op: ReduceOp,
+        input: Operand<'_, MetalStorage>,
+        axis: usize,
     ) -> Result<MetalStorage, MetalError> {
-        Err(MetalError::NotImplemented {
-            primitive: "reduce",
-        })
+        let kernel = reduce_kernel(op, input.dtype)?;
+        let (dtype, shape) = reduce_rule(op, input.dtype, input.layout.shape(), axis)?;
+        let args = ReduceArgs::new(&input, axis, &shape)?;
+        let output = self.allocate(dtype, &shape)?;
+        self.dispatch_reduce(kernel, &input, &args, shape.element_count(), &output)?;
+        Ok(output)
     }
 
     fn matmul(
@@ -526,6 +644,27 @@ fn binary_kernel(
         (BinaryOp::Div, DType::BF16) => Ok("binary_div_bf16"),
         (_, DType::U32) => Err(MetalError::UnsupportedDType {
             primitive: "binary",
+            dtype,
+        }),
+    }
+}
+
+fn reduce_kernel(
+    op: ReduceOp,
+    dtype: DType,
+) -> Result<&'static str, MetalError> {
+    match (op, dtype) {
+        (ReduceOp::Sum, DType::F32) => Ok("reduce_sum_f32"),
+        (ReduceOp::Sum, DType::F16) => Ok("reduce_sum_f16"),
+        (ReduceOp::Sum, DType::BF16) => Ok("reduce_sum_bf16"),
+        (ReduceOp::Max, DType::F32) => Ok("reduce_max_f32"),
+        (ReduceOp::Max, DType::F16) => Ok("reduce_max_f16"),
+        (ReduceOp::Max, DType::BF16) => Ok("reduce_max_bf16"),
+        (ReduceOp::Argmax, DType::F32) => Ok("reduce_argmax_f32"),
+        (ReduceOp::Argmax, DType::F16) => Ok("reduce_argmax_f16"),
+        (ReduceOp::Argmax, DType::BF16) => Ok("reduce_argmax_bf16"),
+        (_, DType::U32) => Err(MetalError::UnsupportedDType {
+            primitive: "reduce",
             dtype,
         }),
     }
@@ -963,6 +1102,12 @@ mod tests {
         &Tensor<MetalBackend>,
     ) -> Result<Tensor<MetalBackend>, MetalError>;
 
+    type ReduceFn = fn(
+        &Tensor<MetalBackend>,
+        &mut MetalBackend,
+        usize,
+    ) -> Result<Tensor<MetalBackend>, MetalError>;
+
     const FLOAT_DTYPES: [DType; 3] = [DType::F32, DType::F16, DType::BF16];
 
     fn tolerance_relative(dtype: DType) -> f32 {
@@ -1132,6 +1277,166 @@ mod tests {
                 .expect("the download succeeds")
                 .is_empty(),
             "an empty add downloads no bytes"
+        );
+    }
+
+    fn download_u32(
+        backend: &mut MetalBackend,
+        tensor: &Tensor<MetalBackend>,
+    ) -> Vec<u32> {
+        tensor
+            .download(backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| u32::from_le_bytes(chunk))
+            .collect()
+    }
+
+    type ReduceCase = (
+        &'static str,
+        ReduceFn,
+        usize,
+        &'static [usize],
+        &'static [f32],
+    );
+
+    const REDUCE_INPUT: [f32; 6] = [1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+
+    #[test]
+    fn sum_and_max_over_each_axis_match_hand_computed_values_for_each_float_dtype() {
+        let mut backend = backend();
+        let cases: [ReduceCase; 4] = [
+            ("sum axis 0", Tensor::sum, 0, &[1, 3], &[5.0, 7.0, 9.0]),
+            ("sum axis 1", Tensor::sum, 1, &[2, 1], &[9.0, 12.0]),
+            ("max axis 0", Tensor::max, 0, &[1, 3], &[4.0, 5.0, 6.0]),
+            ("max axis 1", Tensor::max, 1, &[2, 1], &[5.0, 6.0]),
+        ];
+        cases
+            .into_iter()
+            .for_each(|(name, op, axis, dims, expected)| {
+                FLOAT_DTYPES.into_iter().for_each(|dtype| {
+                    let input = upload_f32(&mut backend, &REDUCE_INPUT, &[2, 3])
+                        .cast(&mut backend, dtype)
+                        .expect("the cast succeeds");
+                    let reduced = op(&input, &mut backend, axis).expect("the reduction succeeds");
+                    assert_eq!(reduced.dtype(), dtype, "{name} keeps the dtype");
+                    assert_eq!(reduced.shape().dims(), dims, "{name} keeps the axis");
+                    let values = reduced
+                        .cast(&mut backend, DType::F32)
+                        .expect("the cast succeeds");
+                    assert_close(&download_f32(&mut backend, &values), expected, dtype, name);
+                });
+            });
+    }
+
+    #[test]
+    fn argmax_over_each_axis_matches_hand_computed_indices_for_each_float_dtype() {
+        let mut backend = backend();
+        let cases: [(usize, &[usize], &[u32]); 2] =
+            [(0, &[1, 3], &[1, 0, 1]), (1, &[2, 1], &[1, 2])];
+        cases.into_iter().for_each(|(axis, dims, expected)| {
+            FLOAT_DTYPES.into_iter().for_each(|dtype| {
+                let indices = upload_f32(&mut backend, &REDUCE_INPUT, &[2, 3])
+                    .cast(&mut backend, dtype)
+                    .expect("the cast succeeds")
+                    .argmax(&mut backend, axis)
+                    .expect("the argmax succeeds");
+                assert_eq!(indices.dtype(), DType::U32, "argmax outputs u32");
+                assert_eq!(indices.shape().dims(), dims, "argmax keeps the axis");
+                assert_eq!(
+                    download_u32(&mut backend, &indices),
+                    expected,
+                    "argmax over axis {axis} for {dtype:?}"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn sum_of_4096_bf16_ones_equals_4096() {
+        let mut backend = backend();
+        let sum = upload_f32(&mut backend, &[1.0; 4096], &[4096])
+            .cast(&mut backend, DType::BF16)
+            .expect("the cast succeeds")
+            .sum(&mut backend, 0)
+            .expect("the sum succeeds")
+            .cast(&mut backend, DType::F32)
+            .expect("the cast succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &sum),
+            vec![4096.0],
+            "bf16 sum of ones"
+        );
+    }
+
+    #[test]
+    fn argmax_returns_the_first_index_on_ties() {
+        let mut backend = backend();
+        let indices = upload_f32(&mut backend, &[3.0, 7.0, 7.0, 1.0], &[4])
+            .argmax(&mut backend, 0)
+            .expect("the argmax succeeds");
+        assert_eq!(
+            download_u32(&mut backend, &indices),
+            vec![1],
+            "first of two maxima"
+        );
+    }
+
+    #[test]
+    fn argmax_returns_the_first_index_on_ties_across_threads() {
+        let mut backend = backend();
+        let values: Vec<f32> = (0_u16..600)
+            .map(|index| {
+                if index == 10 || index == 300 {
+                    9.0
+                } else {
+                    f32::from(index % 7)
+                }
+            })
+            .collect();
+        let indices = upload_f32(&mut backend, &values, &[600])
+            .argmax(&mut backend, 0)
+            .expect("the argmax succeeds");
+        assert_eq!(
+            download_u32(&mut backend, &indices),
+            vec![10],
+            "maxima at 10 and 300 read by different threads"
+        );
+    }
+
+    #[test]
+    fn sum_of_permuted_tensor_reads_strided_input() {
+        let mut backend = backend();
+        let sum = upload_f32(&mut backend, &iota(6), &[2, 3])
+            .permute(&[1, 0])
+            .expect("the permutation is valid")
+            .sum(&mut backend, 1)
+            .expect("the sum succeeds");
+        assert_eq!(sum.shape().dims(), &[3, 1], "transposed rows");
+        assert_eq!(
+            download_f32(&mut backend, &sum),
+            vec![3.0, 5.0, 7.0],
+            "row sums of [[0, 3], [1, 4], [2, 5]]"
+        );
+    }
+
+    #[test]
+    fn reduce_on_u32_is_rejected() {
+        let mut backend = backend();
+        let bytes: Vec<u8> = (0_u32..3).flat_map(u32::to_le_bytes).collect();
+        let indices = Tensor::upload(&mut backend, &bytes, DType::U32, shape(&[3]))
+            .expect("the upload succeeds");
+        assert!(
+            matches!(
+                indices.sum(&mut backend, 0),
+                Err(MetalError::UnsupportedDType {
+                    primitive: "reduce",
+                    dtype: DType::U32
+                })
+            ),
+            "reductions reject u32 on Metal"
         );
     }
 }

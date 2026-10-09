@@ -50,6 +50,15 @@ pub enum MetalError {
         dtype: DType,
     },
 
+    #[error(
+        "Kernel {name} allows {threads} threads per threadgroup; {threads_required} are required."
+    )]
+    ThreadgroupTooSmall {
+        name: &'static str,
+        threads: usize,
+        threads_required: usize,
+    },
+
     #[error("Metal command buffer failed: {message}")]
     CommandBufferFailed { message: String },
 
