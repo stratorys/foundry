@@ -32,6 +32,7 @@ const INDEX_BYTES_MAX: u64 = 100 * 1024 * 1024;
 pub struct Weights {
     shards: Vec<Mmap>,
     tensors: HashMap<String, TensorEntry>,
+    bytes_declared: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,7 +58,15 @@ struct ShardTensor {
 
 #[derive(Deserialize)]
 struct IndexFile {
+    #[serde(default)]
+    metadata: Option<IndexMetadata>,
     weight_map: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct IndexMetadata {
+    #[serde(default)]
+    total_size: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -70,13 +79,14 @@ struct TensorHeader {
 impl Weights {
     pub fn open(directory: &Path) -> Result<Self, WeightsError> {
         let index_path = directory.join(INDEX_FILE);
-        let weight_map = if index_path.is_file() {
+        let index = if index_path.is_file() {
             Some(read_index(&index_path)?)
         } else {
             None
         };
-        let shard_names: Vec<String> = match &weight_map {
-            Some(weight_map) => weight_map
+        let shard_names: Vec<String> = match &index {
+            Some(index) => index
+                .weight_map
                 .values()
                 .cloned()
                 .collect::<BTreeSet<String>>()
@@ -113,12 +123,16 @@ impl Weights {
                 );
                 Ok(tensors)
             })?;
-        if let Some(weight_map) = weight_map {
-            check_index(&weight_map, &shard_names, &tensors)?;
+        if let Some(index) = &index {
+            check_index(&index.weight_map, &shard_names, &tensors)?;
         }
+        let bytes_declared = index
+            .and_then(|index| index.metadata)
+            .and_then(|metadata| metadata.total_size);
         Ok(Self {
             shards,
             tensors,
+            bytes_declared,
         })
     }
 
@@ -143,9 +157,13 @@ impl Weights {
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> { self.tensors.keys().map(String::as_str) }
+
+    pub fn shard_count(&self) -> usize { self.shards.len() }
+
+    pub fn bytes_declared(&self) -> Option<u64> { self.bytes_declared }
 }
 
-fn read_index(path: &Path) -> Result<BTreeMap<String, String>, WeightsError> {
+fn read_index(path: &Path) -> Result<IndexFile, WeightsError> {
     let io_error = |error| WeightsError::Io {
         path: path.to_path_buf(),
         error,
@@ -159,12 +177,10 @@ fn read_index(path: &Path) -> Result<BTreeMap<String, String>, WeightsError> {
         });
     }
     let contents = fs::read(path).map_err(io_error)?;
-    let index: IndexFile =
-        serde_json::from_slice(&contents).map_err(|error| WeightsError::IndexJson {
-            path: path.to_path_buf(),
-            error,
-        })?;
-    Ok(index.weight_map)
+    serde_json::from_slice(&contents).map_err(|error| WeightsError::IndexJson {
+        path: path.to_path_buf(),
+        error,
+    })
 }
 
 fn open_shard(
@@ -435,6 +451,8 @@ mod tests {
         assert_eq!(Some(b.bytes), bytes.get(12..28), "bytes of b");
 
         assert_eq!(weights.names().count(), 2, "metadata is not a tensor");
+        assert_eq!(weights.shard_count(), 1, "single file is one shard");
+        assert_eq!(weights.bytes_declared(), None, "no index, no declared size");
     }
 
     #[test]
@@ -471,6 +489,8 @@ mod tests {
             &[9, 8, 7, 6],
             "bytes of b"
         );
+        assert_eq!(weights.shard_count(), 2, "two shards");
+        assert_eq!(weights.bytes_declared(), Some(8), "declared total size");
     }
 
     #[test]

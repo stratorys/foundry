@@ -35,6 +35,11 @@ pub struct Llama3RopeScaling {
 }
 
 #[derive(Deserialize)]
+struct ModelTypeFile {
+    model_type: String,
+}
+
+#[derive(Deserialize)]
 struct ConfigFile {
     model_type: String,
     hidden_size: usize,
@@ -97,6 +102,14 @@ impl LlamaConfig {
     }
 
     pub fn parse(json: &[u8]) -> Result<Self, LlamaConfigError> {
+        let ModelTypeFile {
+            model_type,
+        } = serde_json::from_slice(json).map_err(LlamaConfigError::Json)?;
+        if model_type != MODEL_TYPE {
+            return Err(LlamaConfigError::ModelType {
+                model_type,
+            });
+        }
         let file: ConfigFile = serde_json::from_slice(json).map_err(LlamaConfigError::Json)?;
         Self::try_from(file)
     }
@@ -294,6 +307,15 @@ mod tests {
         let result = parse(&with(instruct_config(), "model_type", json!("mistral")));
         assert!(
             matches!(&result, Err(LlamaConfigError::ModelType { model_type }) if model_type == "mistral"),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn other_model_type_is_rejected_before_missing_fields() {
+        let result = parse(&json!({ "model_type": "qwen3", "hidden_size": 1024 }));
+        assert!(
+            matches!(&result, Err(LlamaConfigError::ModelType { model_type }) if model_type == "qwen3"),
             "got {result:?}"
         );
     }
