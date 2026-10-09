@@ -42,6 +42,8 @@ use crate::core::{
 const KERNEL_SOURCES: &[&str] = &[
     include_str!("kernels/common.metal"),
     include_str!("kernels/copy.metal"),
+    include_str!("kernels/unary.metal"),
+    include_str!("kernels/binary.metal"),
 ];
 
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -163,14 +165,20 @@ impl MetalBackend {
     fn dispatch_strided(
         &mut self,
         kernel: &'static str,
-        input: &Operand<'_, MetalStorage>,
+        inputs: &[&Operand<'_, MetalStorage>],
         output: &MetalStorage,
     ) -> Result<(), MetalError> {
-        let count = input.layout.shape().element_count();
+        let count = inputs
+            .first()
+            .map_or(0, |input| input.layout.shape().element_count());
         if count == 0 {
             return Ok(());
         }
-        let args = StridedArgs::new(input)?;
+        let args = inputs
+            .iter()
+            .map(|input| StridedArgs::new(input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_index = inputs.len();
         let pipeline = self.pipeline(kernel)?;
         let command_buffer = self
             .queue
@@ -180,23 +188,29 @@ impl MetalBackend {
             .computeCommandEncoder()
             .ok_or(MetalError::ComputeEncoderCreation)?;
         encoder.setComputePipelineState(&pipeline);
-        // SAFETY: the input buffer is alive for the whole call and the
-        // command buffer retains it; `StridedArgs::new` checked that every
-        // index the kernel reads fits in the buffer's element count.
-        unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
+        inputs.iter().enumerate().for_each(|(index, input)| {
+            // SAFETY: the input buffer is alive for the whole call and the
+            // command buffer retains it; `StridedArgs::new` checked that every
+            // index the kernel reads fits in the buffer's element count.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, index) };
+        });
         // SAFETY: the output buffer holds `count` elements of the kernel's
         // output type, one per dispatched thread.
-        unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 1) };
-        // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
-        // layout of `StridedArgs` in `common.metal`; Metal copies the bytes
-        // before the call returns.
-        unsafe {
-            encoder.setBytes_length_atIndex(
-                NonNull::from(&args).cast(),
-                size_of::<StridedArgs>(),
-                2,
-            )
-        };
+        unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, output_index) };
+        args.iter()
+            .zip(output_index.saturating_add(1)..)
+            .for_each(|(input_args, index)| {
+                // SAFETY: `input_args` is a `#[repr(C)]` struct of `u32` that
+                // matches the layout of `StridedArgs` in `common.metal`; Metal
+                // copies the bytes before the call returns.
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        NonNull::from(input_args).cast(),
+                        size_of::<StridedArgs>(),
+                        index,
+                    )
+                };
+            });
         let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
         encoder.dispatchThreads_threadsPerThreadgroup(
             MTLSize {
@@ -329,23 +343,25 @@ impl Backend for MetalBackend {
 
     fn unary(
         &mut self,
-        _op: UnaryOp,
-        _input: Operand<'_, MetalStorage>,
+        op: UnaryOp,
+        input: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        Err(MetalError::NotImplemented {
-            primitive: "unary",
-        })
+        let kernel = unary_kernel(op, input.dtype)?;
+        let output = self.allocate(input.dtype, input.layout.shape())?;
+        self.dispatch_strided(kernel, &[&input], &output)?;
+        Ok(output)
     }
 
     fn binary(
         &mut self,
-        _op: BinaryOp,
-        _lhs: Operand<'_, MetalStorage>,
-        _rhs: Operand<'_, MetalStorage>,
+        op: BinaryOp,
+        lhs: Operand<'_, MetalStorage>,
+        rhs: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        Err(MetalError::NotImplemented {
-            primitive: "binary",
-        })
+        let kernel = binary_kernel(op, lhs.dtype)?;
+        let output = self.allocate(lhs.dtype, lhs.layout.shape())?;
+        self.dispatch_strided(kernel, &[&lhs, &rhs], &output)?;
+        Ok(output)
     }
 
     fn reduce(
@@ -374,7 +390,7 @@ impl Backend for MetalBackend {
         input: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(input.dtype, input.layout.shape())?;
-        self.dispatch_strided(copy_kernel(input.dtype), &input, &output)?;
+        self.dispatch_strided(copy_kernel(input.dtype), &[&input], &output)?;
         Ok(output)
     }
 
@@ -385,7 +401,7 @@ impl Backend for MetalBackend {
     ) -> Result<MetalStorage, MetalError> {
         let kernel = cast_kernel(input.dtype, dtype)?;
         let output = self.allocate(dtype, input.layout.shape())?;
-        self.dispatch_strided(kernel, &input, &output)?;
+        self.dispatch_strided(kernel, &[&input], &output)?;
         Ok(output)
     }
 
@@ -464,6 +480,54 @@ fn cast_kernel(
         (DType::BF16, DType::BF16) => Ok("cast_bf16_bf16"),
         (DType::U32, _) => Err(unsupported(DType::U32)),
         (_, DType::U32) => Err(unsupported(DType::U32)),
+    }
+}
+
+fn unary_kernel(
+    op: UnaryOp,
+    dtype: DType,
+) -> Result<&'static str, MetalError> {
+    match (op, dtype) {
+        (UnaryOp::Neg, DType::F32) => Ok("unary_neg_f32"),
+        (UnaryOp::Neg, DType::F16) => Ok("unary_neg_f16"),
+        (UnaryOp::Neg, DType::BF16) => Ok("unary_neg_bf16"),
+        (UnaryOp::Exp, DType::F32) => Ok("unary_exp_f32"),
+        (UnaryOp::Exp, DType::F16) => Ok("unary_exp_f16"),
+        (UnaryOp::Exp, DType::BF16) => Ok("unary_exp_bf16"),
+        (UnaryOp::Sqrt, DType::F32) => Ok("unary_sqrt_f32"),
+        (UnaryOp::Sqrt, DType::F16) => Ok("unary_sqrt_f16"),
+        (UnaryOp::Sqrt, DType::BF16) => Ok("unary_sqrt_bf16"),
+        (UnaryOp::Recip, DType::F32) => Ok("unary_recip_f32"),
+        (UnaryOp::Recip, DType::F16) => Ok("unary_recip_f16"),
+        (UnaryOp::Recip, DType::BF16) => Ok("unary_recip_bf16"),
+        (_, DType::U32) => Err(MetalError::UnsupportedDType {
+            primitive: "unary",
+            dtype,
+        }),
+    }
+}
+
+fn binary_kernel(
+    op: BinaryOp,
+    dtype: DType,
+) -> Result<&'static str, MetalError> {
+    match (op, dtype) {
+        (BinaryOp::Add, DType::F32) => Ok("binary_add_f32"),
+        (BinaryOp::Add, DType::F16) => Ok("binary_add_f16"),
+        (BinaryOp::Add, DType::BF16) => Ok("binary_add_bf16"),
+        (BinaryOp::Sub, DType::F32) => Ok("binary_sub_f32"),
+        (BinaryOp::Sub, DType::F16) => Ok("binary_sub_f16"),
+        (BinaryOp::Sub, DType::BF16) => Ok("binary_sub_bf16"),
+        (BinaryOp::Mul, DType::F32) => Ok("binary_mul_f32"),
+        (BinaryOp::Mul, DType::F16) => Ok("binary_mul_f16"),
+        (BinaryOp::Mul, DType::BF16) => Ok("binary_mul_bf16"),
+        (BinaryOp::Div, DType::F32) => Ok("binary_div_f32"),
+        (BinaryOp::Div, DType::F16) => Ok("binary_div_f16"),
+        (BinaryOp::Div, DType::BF16) => Ok("binary_div_bf16"),
+        (_, DType::U32) => Err(MetalError::UnsupportedDType {
+            primitive: "binary",
+            dtype,
+        }),
     }
 }
 
@@ -887,6 +951,187 @@ mod tests {
             download_u16(&mut backend, &cast),
             vec![0x3F80, 0x4080, 0x4000, 0x40A0, 0x4040, 0x40C0],
             "transposed bf16 bits of 1, 4, 2, 5, 3, 6"
+        );
+    }
+
+    type UnaryFn =
+        fn(&Tensor<MetalBackend>, &mut MetalBackend) -> Result<Tensor<MetalBackend>, MetalError>;
+
+    type BinaryFn = fn(
+        &Tensor<MetalBackend>,
+        &mut MetalBackend,
+        &Tensor<MetalBackend>,
+    ) -> Result<Tensor<MetalBackend>, MetalError>;
+
+    const FLOAT_DTYPES: [DType; 3] = [DType::F32, DType::F16, DType::BF16];
+
+    fn tolerance_relative(dtype: DType) -> f32 {
+        match dtype {
+            DType::F32 => 1e-5,
+            DType::F16 | DType::BF16 | DType::U32 => 1e-2,
+        }
+    }
+
+    fn assert_close(
+        actual: &[f32],
+        expected: &[f32],
+        dtype: DType,
+        context: &str,
+    ) {
+        assert_eq!(actual.len(), expected.len(), "{context}: element count");
+        let tolerance = tolerance_relative(dtype);
+        actual
+            .iter()
+            .zip(expected)
+            .for_each(|(&actual, &expected)| {
+                assert!(
+                    (actual - expected).abs() <= tolerance * expected.abs().max(f32::MIN_POSITIVE),
+                    "{context} for {dtype:?}: {actual} is not within {tolerance} of {expected}"
+                );
+            });
+    }
+
+    fn unary_in(
+        backend: &mut MetalBackend,
+        op: UnaryFn,
+        values: &[f32],
+        dtype: DType,
+    ) -> Vec<f32> {
+        let input = upload_f32(backend, values, &[values.len()])
+            .cast(backend, dtype)
+            .expect("the cast succeeds");
+        let output = op(&input, backend)
+            .expect("the op succeeds")
+            .cast(backend, DType::F32)
+            .expect("the cast succeeds");
+        download_f32(backend, &output)
+    }
+
+    #[test]
+    fn unary_ops_match_hand_computed_values_for_each_float_dtype() {
+        let mut backend = backend();
+        let cases: [(&str, UnaryFn, [f32; 3], [f32; 3]); 4] = [
+            ("neg", Tensor::neg, [1.0, -2.5, 0.0], [-1.0, 2.5, 0.0]),
+            (
+                "exp",
+                Tensor::exp,
+                [0.0, 1.0, -1.0],
+                [1.0, std::f32::consts::E, 1.0 / std::f32::consts::E],
+            ),
+            ("sqrt", Tensor::sqrt, [4.0, 2.25, 0.0], [2.0, 1.5, 0.0]),
+            ("recip", Tensor::recip, [2.0, -4.0, 0.5], [0.5, -0.25, 2.0]),
+        ];
+        cases.into_iter().for_each(|(name, op, values, expected)| {
+            FLOAT_DTYPES.into_iter().for_each(|dtype| {
+                let actual = unary_in(&mut backend, op, &values, dtype);
+                assert_close(&actual, &expected, dtype, name);
+            });
+        });
+    }
+
+    #[test]
+    fn binary_ops_match_hand_computed_values_for_each_float_dtype() {
+        let mut backend = backend();
+        let lhs_values = [1.0_f32, 2.0, 3.0, 4.0];
+        let rhs_values = [2.0_f32, 4.0, 0.5, -1.0];
+        let cases: [(&str, BinaryFn, [f32; 4]); 4] = [
+            ("add", Tensor::add, [3.0, 6.0, 3.5, 3.0]),
+            ("sub", Tensor::sub, [-1.0, -2.0, 2.5, 5.0]),
+            ("mul", Tensor::mul, [2.0, 8.0, 1.5, -4.0]),
+            ("div", Tensor::div, [0.5, 0.5, 6.0, -4.0]),
+        ];
+        cases.into_iter().for_each(|(name, op, expected)| {
+            FLOAT_DTYPES.into_iter().for_each(|dtype| {
+                let lhs = upload_f32(&mut backend, &lhs_values, &[4])
+                    .cast(&mut backend, dtype)
+                    .expect("the cast succeeds");
+                let rhs = upload_f32(&mut backend, &rhs_values, &[4])
+                    .cast(&mut backend, dtype)
+                    .expect("the cast succeeds");
+                let output = op(&lhs, &mut backend, &rhs)
+                    .expect("the op succeeds")
+                    .cast(&mut backend, DType::F32)
+                    .expect("the cast succeeds");
+                assert_close(&download_f32(&mut backend, &output), &expected, dtype, name);
+            });
+        });
+    }
+
+    #[test]
+    fn add_broadcasts_a_row_over_a_matrix() {
+        let mut backend = backend();
+        let matrix = upload_f32(&mut backend, &iota(6), &[2, 3]);
+        let row = upload_f32(&mut backend, &[10.0, 20.0, 30.0], &[3]);
+        let sum = matrix.add(&mut backend, &row).expect("the add succeeds");
+        assert_eq!(sum.shape().dims(), &[2, 3], "broadcast dims");
+        assert_eq!(
+            download_f32(&mut backend, &sum),
+            vec![10.0, 21.0, 32.0, 13.0, 24.0, 35.0],
+            "row added to each matrix row"
+        );
+    }
+
+    #[test]
+    fn neg_of_permuted_tensor_reads_strided_input() {
+        let mut backend = backend();
+        let negated = upload_f32(&mut backend, &iota(6), &[2, 3])
+            .permute(&[1, 0])
+            .expect("the permutation is valid")
+            .neg(&mut backend)
+            .expect("the neg succeeds");
+        assert_eq!(negated.shape().dims(), &[3, 2], "transposed dims");
+        assert_eq!(
+            download_f32(&mut backend, &negated),
+            vec![-0.0, -3.0, -1.0, -4.0, -2.0, -5.0],
+            "negated transposed values"
+        );
+    }
+
+    #[test]
+    fn mul_of_permuted_and_contiguous_operands_reads_both_layouts() {
+        let mut backend = backend();
+        let transposed = upload_f32(&mut backend, &iota(6), &[3, 2])
+            .permute(&[1, 0])
+            .expect("the permutation is valid");
+        let contiguous = upload_f32(&mut backend, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let product = transposed
+            .mul(&mut backend, &contiguous)
+            .expect("the mul succeeds");
+        assert_eq!(
+            download_f32(&mut backend, &product),
+            vec![0.0, 4.0, 12.0, 4.0, 15.0, 30.0],
+            "products of [[0, 2, 4], [1, 3, 5]] and [[1, 2, 3], [4, 5, 6]]"
+        );
+    }
+
+    #[test]
+    fn binary_on_u32_is_rejected() {
+        let mut backend = backend();
+        let bytes: Vec<u8> = (0_u32..3).flat_map(u32::to_le_bytes).collect();
+        let indices = Tensor::upload(&mut backend, &bytes, DType::U32, shape(&[3]))
+            .expect("the upload succeeds");
+        assert!(
+            matches!(
+                indices.add(&mut backend, &indices),
+                Err(MetalError::UnsupportedDType {
+                    primitive: "binary",
+                    dtype: DType::U32
+                })
+            ),
+            "binary ops reject u32 on Metal"
+        );
+    }
+
+    #[test]
+    fn add_of_empty_tensors_downloads_no_bytes() {
+        let mut backend = backend();
+        let empty = upload_f32(&mut backend, &[], &[0, 3]);
+        let sum = empty.add(&mut backend, &empty).expect("the add succeeds");
+        assert!(
+            sum.download(&mut backend)
+                .expect("the download succeeds")
+                .is_empty(),
+            "an empty add downloads no bytes"
         );
     }
 }
