@@ -62,6 +62,9 @@ pub enum MetalError {
     #[error("Metal command buffer failed: {message}")]
     CommandBufferFailed { message: String },
 
+    #[error("Storage was produced by another Metal backend instance.")]
+    ForeignStorage,
+
     #[error("Download requires a contiguous layout.")]
     DownloadNonContiguous,
 

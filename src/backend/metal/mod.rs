@@ -75,6 +75,7 @@ type ComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 pub struct MetalStorage {
     buffer: Buffer,
     byte_len: usize,
+    queue: Queue,
 }
 
 pub struct MetalBackend {
@@ -135,16 +136,6 @@ struct GatherArgs {
     table_row_stride: u32,
     table_col_stride: u32,
     indices: StridedArgs,
-}
-
-impl<'buffer> From<&Operand<'buffer, MetalStorage>> for BufferView<'buffer> {
-    fn from(operand: &Operand<'buffer, MetalStorage>) -> Self {
-        Self {
-            storage: operand.storage(),
-            layout: operand.layout(),
-            dtype: operand.dtype(),
-        }
-    }
 }
 
 impl StridedArgs {
@@ -352,6 +343,30 @@ impl MetalBackend {
         Ok(MetalStorage {
             buffer,
             byte_len,
+            queue: self.queue.clone(),
+        })
+    }
+
+    fn owns(
+        &self,
+        storage: &MetalStorage,
+    ) -> Result<(), MetalError> {
+        if std::ptr::eq::<ProtocolObject<dyn MTLCommandQueue>>(&*storage.queue, &*self.queue) {
+            Ok(())
+        } else {
+            Err(MetalError::ForeignStorage)
+        }
+    }
+
+    fn view<'buffer>(
+        &self,
+        operand: &Operand<'buffer, MetalStorage>,
+    ) -> Result<BufferView<'buffer>, MetalError> {
+        self.owns(operand.storage())?;
+        Ok(BufferView {
+            storage: operand.storage(),
+            layout: operand.layout(),
+            dtype: operand.dtype(),
         })
     }
 
@@ -432,7 +447,9 @@ impl MetalBackend {
                 // element count, and `Tensor` broadcasts both binary operands
                 // to the same shape before calling the backend, so the kernel
                 // reads each input, `rhs` included, only for `gid < count`
-                // inside its layout.
+                // inside its layout. The storage was produced on this serial
+                // queue, so every earlier write to it is ordered before this
+                // dispatch.
                 unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, index) };
             });
             // SAFETY: the output buffer holds `count` elements of the kernel's
@@ -494,7 +511,9 @@ impl MetalBackend {
             // operand, which only `crate::core` can build, so every index its
             // layout addresses stays inside its storage. Every `Shape` has at
             // most `i32::MAX` non-zero elements, so addresses and the loop
-            // counter `k += 256` stay below `u32::MAX` and do not wrap.
+            // counter `k += 256` stay below `u32::MAX` and do not wrap. The
+            // storage was produced on this serial queue, so every earlier
+            // write to it is ordered before this dispatch.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
             // SAFETY: the output buffer holds one element of the kernel's
             // output type per dispatched threadgroup.
@@ -549,7 +568,8 @@ impl MetalBackend {
             // index its layout addresses stays inside its storage. Every
             // `Shape` has at most `i32::MAX` non-zero elements, so addresses
             // and the loop counter `k_start += 16` stay below `u32::MAX` and do
-            // not wrap.
+            // not wrap. Both storages were produced on this serial queue, so
+            // every earlier write to them is ordered before this dispatch.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&lhs.storage.buffer), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&rhs.storage.buffer), 0, 1);
@@ -600,7 +620,9 @@ impl MetalBackend {
             // their layouts address stays inside their storage. Every `Shape`
             // has at most `i32::MAX` non-zero elements, so addresses stay below
             // `u32::MAX` and do not wrap, and the kernel reads a table row only
-            // when its index is below `rows`.
+            // when its index is below `rows`. Both storages were produced on
+            // this serial queue, so every earlier write to them is ordered
+            // before this dispatch.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&table.storage.buffer), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&indices.storage.buffer), 0, 1);
@@ -653,12 +675,16 @@ impl MetalBackend {
             // operand, which only `crate::core` can build, so every index its
             // layout addresses stays inside its storage. Every `Shape` has at
             // most `i32::MAX` non-zero elements, so addresses stay below
-            // `u32::MAX` and do not wrap.
+            // `u32::MAX` and do not wrap. The storage was produced on this
+            // serial queue, so every earlier write to it is ordered before
+            // this dispatch.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
             // SAFETY: the output buffer is alive for the whole call and the
-            // command buffer retains it. It is borrowed mutably, so no other
-            // reference to it is live during encoding: either a slice update
-            // target, which `Tensor::slice_update` checked to be contiguous
+            // command buffer retains it. It was produced on this serial queue,
+            // so this write is ordered after every earlier access to it. It is
+            // borrowed mutably, so no other reference to it is live
+            // during encoding: either a slice update target, which
+            // `Tensor::slice_update` checked to be contiguous
             // and owned by no other tensor before building its `OperandMut`,
             // or a fresh concat output with a contiguous layout. The shape rule
             // bounds `window` inside that layout, so every written
@@ -781,7 +807,7 @@ impl Backend for MetalBackend {
         &mut self,
         input: Operand<'_, MetalStorage>,
     ) -> Result<Vec<u8>, MetalError> {
-        let input = BufferView::from(&input);
+        let input = self.view(&input)?;
         if !input.layout.is_contiguous() {
             return Err(MetalError::DownloadNonContiguous);
         }
@@ -808,8 +834,9 @@ impl Backend for MetalBackend {
         let mut output = vec![0_u8; bytes];
         // SAFETY: the buffer uses shared storage, `bytes_offset + bytes <=
         // byte_len` was checked above, `output` holds `bytes` bytes,
-        // and every command buffer that writes the buffer has completed
-        // because the queue is serial and the last committed one was
+        // and every command buffer that writes the buffer has completed:
+        // `view` checked that the storage was produced on `self.queue`,
+        // that queue is serial, and its last committed command buffer was
         // waited on.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -833,7 +860,7 @@ impl Backend for MetalBackend {
         op: UnaryOp,
         input: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        let input = BufferView::from(&input);
+        let input = self.view(&input)?;
         let kernel = unary_kernel(op, input.dtype)?;
         let output = self.allocate(input.dtype, input.layout.shape())?;
         self.dispatch_strided(kernel, &[&input], &output)?;
@@ -846,8 +873,8 @@ impl Backend for MetalBackend {
         lhs: Operand<'_, MetalStorage>,
         rhs: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        let lhs = BufferView::from(&lhs);
-        let rhs = BufferView::from(&rhs);
+        let lhs = self.view(&lhs)?;
+        let rhs = self.view(&rhs)?;
         let kernel = binary_kernel(op, lhs.dtype)?;
         let output = self.allocate(lhs.dtype, lhs.layout.shape())?;
         self.dispatch_strided(kernel, &[&lhs, &rhs], &output)?;
@@ -860,7 +887,7 @@ impl Backend for MetalBackend {
         input: Operand<'_, MetalStorage>,
         axis: usize,
     ) -> Result<MetalStorage, MetalError> {
-        let input = BufferView::from(&input);
+        let input = self.view(&input)?;
         let kernel = reduce_kernel(op, input.dtype)?;
         let (dtype, shape) = reduce_rule(op, input.dtype, input.layout.shape(), axis)?;
         let args = ReduceArgs::new(&input, axis, &shape)?;
@@ -874,8 +901,8 @@ impl Backend for MetalBackend {
         lhs: Operand<'_, MetalStorage>,
         rhs: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        let lhs = BufferView::from(&lhs);
-        let rhs = BufferView::from(&rhs);
+        let lhs = self.view(&lhs)?;
+        let rhs = self.view(&rhs)?;
         let kernel = matmul_kernel(lhs.dtype)?;
         let (dtype, shape) =
             matmul_rule(lhs.dtype, lhs.layout.shape(), rhs.dtype, rhs.layout.shape())?;
@@ -895,7 +922,7 @@ impl Backend for MetalBackend {
         &mut self,
         input: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        self.copy_view(&BufferView::from(&input))
+        self.copy_view(&self.view(&input)?)
     }
 
     fn cast(
@@ -903,7 +930,7 @@ impl Backend for MetalBackend {
         input: Operand<'_, MetalStorage>,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let input = BufferView::from(&input);
+        let input = self.view(&input)?;
         let kernel = cast_kernel(input.dtype, dtype)?;
         let output = self.allocate(dtype, input.layout.shape())?;
         self.dispatch_strided(kernel, &[&input], &output)?;
@@ -915,8 +942,8 @@ impl Backend for MetalBackend {
         table: Operand<'_, MetalStorage>,
         indices: Operand<'_, MetalStorage>,
     ) -> Result<MetalStorage, MetalError> {
-        let table = BufferView::from(&table);
-        let indices = BufferView::from(&indices);
+        let table = self.view(&table)?;
+        let indices = self.view(&indices)?;
         let kernel = gather_kernel(table.dtype)?;
         let (dtype, shape) = gather_rule(
             table.dtype,
@@ -943,8 +970,8 @@ impl Backend for MetalBackend {
         rhs: Operand<'_, MetalStorage>,
         axis: usize,
     ) -> Result<MetalStorage, MetalError> {
-        let lhs = BufferView::from(&lhs);
-        let rhs = BufferView::from(&rhs);
+        let lhs = self.view(&lhs)?;
+        let rhs = self.view(&rhs)?;
         let kernel = slice_update_kernel("concat", lhs.dtype)?;
         let (dtype, shape) = concat_rule(
             lhs.dtype,
@@ -979,9 +1006,10 @@ impl Backend for MetalBackend {
         axis: usize,
         start: usize,
     ) -> Result<(), MetalError> {
+        self.owns(target.storage_mut())?;
         let layout = target.layout();
         let dtype = target.dtype();
-        let update = BufferView::from(&update);
+        let update = self.view(&update)?;
         let kernel = slice_update_kernel("slice_update", dtype)?;
         slice_update_rule(
             dtype,
@@ -2464,6 +2492,60 @@ mod tests {
             download_f32(&mut backend, &target),
             [0.0, 1.0, 2.0, 100.0, 4.0, 5.0, 6.0, 101.0],
             "the update lands in the last column"
+        );
+    }
+
+    #[test]
+    fn download_of_storage_from_another_backend_is_rejected() {
+        let mut producer = MetalBackend::new().expect("a Metal device is available");
+        let mut consumer = MetalBackend::new().expect("a Metal device is available");
+        let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
+        let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
+            .expect("the upload succeeds");
+        assert!(
+            matches!(
+                tensor.download(&mut consumer),
+                Err(MetalError::ForeignStorage)
+            ),
+            "a storage from another backend cannot be downloaded"
+        );
+    }
+
+    #[test]
+    fn unary_of_storage_from_another_backend_is_rejected() {
+        let mut producer = MetalBackend::new().expect("a Metal device is available");
+        let mut consumer = MetalBackend::new().expect("a Metal device is available");
+        let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
+        let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
+            .expect("the upload succeeds");
+        assert!(
+            matches!(tensor.neg(&mut consumer), Err(MetalError::ForeignStorage)),
+            "a storage from another backend cannot be read by a kernel"
+        );
+    }
+
+    #[test]
+    fn slice_update_of_target_from_another_backend_is_rejected() {
+        let mut producer = MetalBackend::new().expect("a Metal device is available");
+        let mut consumer = MetalBackend::new().expect("a Metal device is available");
+        let mut target = Tensor::zeros(
+            &mut producer,
+            DType::F32,
+            Shape::try_from(&[2_usize, 2][..]).expect("the shape is valid"),
+        )
+        .expect("the zeros succeed");
+        let update = Tensor::zeros(
+            &mut consumer,
+            DType::F32,
+            Shape::try_from(&[2_usize, 1][..]).expect("the shape is valid"),
+        )
+        .expect("the zeros succeed");
+        assert!(
+            matches!(
+                target.slice_update(&mut consumer, &update, 1, 0),
+                Err(MetalError::ForeignStorage)
+            ),
+            "a target from another backend cannot be written"
         );
     }
 
