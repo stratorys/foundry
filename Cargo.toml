@@ -31,3 +31,8 @@ panic = "deny"
 arithmetic_side_effects = "deny"
 as_conversions = "deny"
 undocumented_unsafe_blocks = "deny"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLBuffer", "MTLResource", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLBlitCommandEncoder", "MTLLibrary", "MTLAllocation"] }
