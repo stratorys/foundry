@@ -1,5 +1,11 @@
 use foundry::backend::cpu::CpuBackend;
+use foundry::core::{
+    DType,
+    Shape,
+    Tensor,
+};
 use foundry::models::llama::{
+    Llama,
     LlamaConfig,
     LlamaError,
     LlamaWeights,
@@ -8,6 +14,7 @@ use foundry::weights::{
     Shard,
     Weights,
 };
+use half::bf16;
 use hf_hub::HFClientSync;
 use serde_json::json;
 
@@ -32,6 +39,162 @@ fn llama_weights_load_the_official_snapshot() {
         weights.bytes_declared(),
         "the uploaded bytes equal the total size declared by the index"
     );
+}
+
+#[test]
+#[ignore = "needs meta-llama/Llama-3.2-3B-Instruct in the Hugging Face cache"]
+fn llama_logprobs_match_mlx_after_the_system_header() {
+    const PROMPT_IDS: [u32; 13] = [
+        128000, 128006, 9125, 128007, 271, 334, 32298, 220, 16, 25, 1035, 32, 220,
+    ];
+    const ABSOLUTE_TOLERANCE: f32 = 0.125;
+    const RELATIVE_TOLERANCE: f32 = 1e-2;
+
+    #[derive(Debug, PartialEq)]
+    struct MlxLogprob {
+        id: usize,
+        logprob: f32,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct LogprobMismatch {
+        id: usize,
+        mlx: f32,
+        foundry: Option<f32>,
+    }
+
+    let mlx_top_logprobs = [
+        MlxLogprob {
+            id: 605,
+            logprob: -2.25,
+        },
+        MlxLogprob {
+            id: 20,
+            logprob: -2.375,
+        },
+        MlxLogprob {
+            id: 17,
+            logprob: -2.875,
+        },
+        MlxLogprob {
+            id: 1135,
+            logprob: -2.875,
+        },
+        MlxLogprob {
+            id: 18,
+            logprob: -3.0,
+        },
+        MlxLogprob {
+            id: 508,
+            logprob: -3.0,
+        },
+        MlxLogprob {
+            id: 966,
+            logprob: -3.0,
+        },
+        MlxLogprob {
+            id: 1041,
+            logprob: -3.25,
+        },
+        MlxLogprob {
+            id: 914,
+            logprob: -3.375,
+        },
+        MlxLogprob {
+            id: 19,
+            logprob: -3.5,
+        },
+    ];
+
+    let directory = HFClientSync::new()
+        .expect("the Hugging Face client is created")
+        .model("meta-llama", "Llama-3.2-3B-Instruct")
+        .snapshot_download()
+        .local_files_only(true)
+        .send()
+        .expect("meta-llama/Llama-3.2-3B-Instruct is in the Hugging Face cache");
+    let config = LlamaConfig::open(&directory).expect("the config is valid");
+    let weights = Weights::open(&directory).expect("the safetensors files are valid");
+    let backend = &mut CpuBackend::new();
+    let seq_len = PROMPT_IDS.len();
+    let llama_weights = LlamaWeights::load(backend, &config, &weights).expect("the weights load");
+    let model = Llama::new(backend, &config, llama_weights, seq_len).expect("the model is built");
+    let mut cache = model.cache(backend).expect("the cache is allocated");
+    let shape = |dims: &[usize]| Shape::try_from(dims).expect("the shape is valid");
+
+    let token_ids = Tensor::upload(
+        backend,
+        &PROMPT_IDS
+            .iter()
+            .flat_map(|id| id.to_le_bytes())
+            .collect::<Vec<u8>>(),
+        DType::U32,
+        shape(&[seq_len]),
+    )
+    .expect("the token ids upload");
+    let positions = Tensor::upload(
+        backend,
+        &(0..seq_len)
+            .map(|position| u32::try_from(position).expect("the position fits in u32"))
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<u8>>(),
+        DType::U32,
+        shape(&[seq_len]),
+    )
+    .expect("the positions upload");
+    let mask = Tensor::upload(
+        backend,
+        &(0..seq_len)
+            .flat_map(|row| {
+                (0..seq_len).map(move |col| {
+                    if col <= row {
+                        bf16::ZERO
+                    } else {
+                        bf16::NEG_INFINITY
+                    }
+                })
+            })
+            .flat_map(bf16::to_le_bytes)
+            .collect::<Vec<u8>>(),
+        DType::BF16,
+        shape(&[seq_len, seq_len]),
+    )
+    .expect("the causal mask uploads");
+
+    let logits: Vec<f32> = model
+        .forward(backend, &token_ids, &positions, &mask, &mut cache, 0)
+        .expect("the forward pass runs")
+        .download(backend)
+        .expect("the logits download")
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| bf16::from_le_bytes(*bytes).to_f32())
+        .collect();
+    let logit_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let log_sum_exp = logit_max
+        + logits
+            .iter()
+            .map(|logit| (logit - logit_max).exp())
+            .sum::<f32>()
+            .ln();
+    let mismatches: Vec<LogprobMismatch> = mlx_top_logprobs
+        .iter()
+        .map(|mlx| LogprobMismatch {
+            id: mlx.id,
+            mlx: mlx.logprob,
+            foundry: logits.get(mlx.id).map(|logit| logit - log_sum_exp),
+        })
+        .filter(|mismatch| {
+            mismatch.foundry.is_none_or(|foundry| {
+                (foundry - mismatch.mlx).abs()
+                    > ABSOLUTE_TOLERANCE
+                        + RELATIVE_TOLERANCE * foundry.abs().max(mismatch.mlx.abs())
+            })
+        })
+        .collect();
+
+    assert_eq!(mismatches, Vec::new());
 }
 
 #[test]
