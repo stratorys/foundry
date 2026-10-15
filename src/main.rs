@@ -474,7 +474,19 @@ fn write_architecture(
     out: &mut impl Write,
     config: &LlamaConfig,
 ) -> io::Result<()> {
-    let rope = config.rope_scaling();
+    let rope = config.rope_scaling().map_or_else(
+        || format!("theta {}, no scaling", config.rope_theta()),
+        |scaling| {
+            format!(
+                "theta {}, llama3 factor {}, low {}, high {}, original {}",
+                config.rope_theta(),
+                scaling.factor,
+                scaling.low_freq_factor,
+                scaling.high_freq_factor,
+                scaling.original_max_position_embeddings
+            )
+        },
+    );
     let eos_token_ids = config
         .eos_token_ids()
         .iter()
@@ -499,18 +511,7 @@ fn write_architecture(
     write_field(out, "Vocab", config.vocab_size())?;
     write_field(out, "Positions", config.max_position_embeddings())?;
     write_field(out, "RMS eps", config.rms_norm_eps())?;
-    write_field(
-        out,
-        "RoPE",
-        format_args!(
-            "theta {}, llama3 factor {}, low {}, high {}, original {}",
-            config.rope_theta(),
-            rope.factor,
-            rope.low_freq_factor,
-            rope.high_freq_factor,
-            rope.original_max_position_embeddings
-        ),
-    )?;
+    write_field(out, "RoPE", rope)?;
     write_field(out, "EOS", eos_token_ids)
 }
 

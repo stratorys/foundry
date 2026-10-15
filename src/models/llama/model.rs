@@ -10,7 +10,7 @@ use crate::core::{
     TensorError,
 };
 use crate::models::llama::rope::{
-    Llama3Rope,
+    LlamaRope,
     RopeAngles,
 };
 use crate::models::llama::{
@@ -30,7 +30,7 @@ const HEAD_MAJOR: [usize; 3] = [1, 0, 2];
 
 pub struct Llama<B: Backend> {
     weights: LlamaWeights<B>,
-    rope: Llama3Rope<B>,
+    rope: LlamaRope<B>,
     attention: Attention<B>,
     heads: usize,
     kv_heads: usize,
@@ -54,7 +54,7 @@ impl<B: Backend> Llama<B> {
         seq_len_max: usize,
     ) -> Result<Self, LlamaError<B::Error>> {
         let head_dim = config.head_dim();
-        let rope = Llama3Rope::new(backend, config, seq_len_max)?;
+        let rope = LlamaRope::new(backend, config, seq_len_max)?;
         let head_dim_non_zero = NonZeroUsize::new(head_dim).ok_or_else(|| {
             error!(
                 message = "Head dim is not a positive even number.",

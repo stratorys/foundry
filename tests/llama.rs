@@ -19,34 +19,35 @@ use hf_hub::HFClientSync;
 use serde_json::json;
 
 #[test]
-#[ignore = "needs meta-llama/Llama-3.2-3B-Instruct in the Hugging Face cache"]
-fn llama_weights_load_the_official_snapshot() {
+#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
+fn llama_weights_load_the_smollm2_snapshot() {
     let directory = HFClientSync::new()
         .expect("the Hugging Face client is created")
-        .model("meta-llama", "Llama-3.2-3B-Instruct")
+        .model("HuggingFaceTB", "SmolLM2-135M-Instruct")
         .snapshot_download()
         .local_files_only(true)
         .send()
-        .expect("meta-llama/Llama-3.2-3B-Instruct is in the Hugging Face cache");
+        .expect("HuggingFaceTB/SmolLM2-135M-Instruct is in the Hugging Face cache");
     let config = LlamaConfig::open(&directory).expect("the config is valid");
     let weights = Weights::open(&directory).expect("the safetensors files are valid");
 
     let llama =
         LlamaWeights::load(&mut CpuBackend::new(), &config, &weights).expect("the weights load");
-    assert_eq!(llama.layers().len(), 28, "one entry per layer");
+    assert_eq!(llama.layers().len(), 30, "one entry per layer");
     assert_eq!(
-        u64::try_from(llama.bytes_uploaded()).ok(),
-        weights.bytes_declared(),
-        "the uploaded bytes equal the total size declared by the index"
+        llama.bytes_uploaded(),
+        weights
+            .tensors()
+            .map(|tensor| tensor.bytes.len())
+            .sum::<usize>(),
+        "every tensor of the snapshot is uploaded once"
     );
 }
 
 #[test]
-#[ignore = "needs meta-llama/Llama-3.2-3B-Instruct in the Hugging Face cache"]
-fn llama_logprobs_match_mlx_after_the_system_header() {
-    const PROMPT_IDS: [u32; 13] = [
-        128000, 128006, 9125, 128007, 271, 334, 32298, 220, 16, 25, 1035, 32, 220,
-    ];
+#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
+fn llama_logprobs_match_mlx_on_smollm2() {
+    const PROMPT_IDS: [u32; 5] = [504, 3575, 282, 4649, 314];
     const ABSOLUTE_TOLERANCE: f32 = 0.125;
     const RELATIVE_TOLERANCE: f32 = 1e-2;
 
@@ -65,54 +66,54 @@ fn llama_logprobs_match_mlx_after_the_system_header() {
 
     let mlx_top_logprobs = [
         MlxLogprob {
-            id: 605,
-            logprob: -2.25,
+            id: 7042,
+            logprob: -0.7742,
         },
         MlxLogprob {
-            id: 20,
-            logprob: -2.375,
+            id: 260,
+            logprob: -1.3367,
         },
         MlxLogprob {
-            id: 17,
-            logprob: -2.875,
+            id: 3807,
+            logprob: -2.4617,
         },
         MlxLogprob {
-            id: 1135,
-            logprob: -2.875,
+            id: 1217,
+            logprob: -3.9617,
         },
         MlxLogprob {
-            id: 18,
-            logprob: -3.0,
+            id: 2250,
+            logprob: -4.2117,
         },
         MlxLogprob {
-            id: 508,
-            logprob: -3.0,
+            id: 253,
+            logprob: -4.7117,
         },
         MlxLogprob {
-            id: 966,
-            logprob: -3.0,
+            id: 1343,
+            logprob: -4.9617,
         },
         MlxLogprob {
-            id: 1041,
-            logprob: -3.25,
+            id: 5145,
+            logprob: -5.1492,
         },
         MlxLogprob {
-            id: 914,
-            logprob: -3.375,
+            id: 13010,
+            logprob: -5.1492,
         },
         MlxLogprob {
-            id: 19,
-            logprob: -3.5,
+            id: 3692,
+            logprob: -5.2117,
         },
     ];
 
     let directory = HFClientSync::new()
         .expect("the Hugging Face client is created")
-        .model("meta-llama", "Llama-3.2-3B-Instruct")
+        .model("HuggingFaceTB", "SmolLM2-135M-Instruct")
         .snapshot_download()
         .local_files_only(true)
         .send()
-        .expect("meta-llama/Llama-3.2-3B-Instruct is in the Hugging Face cache");
+        .expect("HuggingFaceTB/SmolLM2-135M-Instruct is in the Hugging Face cache");
     let config = LlamaConfig::open(&directory).expect("the config is valid");
     let weights = Weights::open(&directory).expect("the safetensors files are valid");
     let backend = &mut CpuBackend::new();

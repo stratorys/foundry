@@ -21,7 +21,7 @@ pub struct LlamaConfig {
     head_dim: usize,
     rms_norm_eps: f32,
     rope_theta: f32,
-    rope_scaling: Llama3RopeScaling,
+    rope_scaling: Option<Llama3RopeScaling>,
     max_position_embeddings: usize,
     vocab_size: usize,
     eos_token_ids: Vec<u32>,
@@ -48,10 +48,10 @@ struct ConfigFile {
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
-    head_dim: usize,
+    head_dim: Option<usize>,
     rms_norm_eps: f32,
     rope_theta: f32,
-    rope_scaling: RopeScalingFile,
+    rope_scaling: Option<RopeScalingFile>,
     max_position_embeddings: usize,
     vocab_size: usize,
     tie_word_embeddings: bool,
@@ -133,7 +133,7 @@ impl LlamaConfig {
 
     pub const fn rope_theta(&self) -> f32 { self.rope_theta }
 
-    pub const fn rope_scaling(&self) -> &Llama3RopeScaling { &self.rope_scaling }
+    pub const fn rope_scaling(&self) -> Option<&Llama3RopeScaling> { self.rope_scaling.as_ref() }
 
     pub const fn max_position_embeddings(&self) -> usize { self.max_position_embeddings }
 
@@ -147,15 +147,21 @@ impl TryFrom<ConfigFile> for LlamaConfig {
 
     fn try_from(file: ConfigFile) -> Result<Self, Self::Error> {
         check_model_type(&file.model_type)?;
-        if file.num_attention_heads.checked_mul(file.head_dim) != Some(file.hidden_size) {
-            error!(
-                message = "Hidden size does not equal attention heads times head dim.",
-                hidden_size = file.hidden_size,
-                num_attention_heads = file.num_attention_heads,
-                head_dim = file.head_dim,
-            );
-            return Err(LlamaConfigError::HiddenSizeMismatch);
-        }
+        let head_dim = file
+            .head_dim
+            .or_else(|| file.hidden_size.checked_div(file.num_attention_heads))
+            .filter(|&head_dim| {
+                file.num_attention_heads.checked_mul(head_dim) == Some(file.hidden_size)
+            })
+            .ok_or_else(|| {
+                error!(
+                    message = "Hidden size does not equal attention heads times head dim.",
+                    hidden_size = file.hidden_size,
+                    num_attention_heads = file.num_attention_heads,
+                    head_dim = file.head_dim,
+                );
+                LlamaConfigError::HiddenSizeMismatch
+            })?;
         if file
             .num_attention_heads
             .checked_rem(file.num_key_value_heads)
@@ -168,10 +174,12 @@ impl TryFrom<ConfigFile> for LlamaConfig {
             );
             return Err(LlamaConfigError::HeadRatio);
         }
-        if file.rope_scaling.rope_type != ROPE_TYPE {
+        if let Some(rope_scaling) = &file.rope_scaling
+            && rope_scaling.rope_type != ROPE_TYPE
+        {
             error!(
                 message = "RoPE type is not llama3.",
-                rope_type = file.rope_scaling.rope_type,
+                rope_type = rope_scaling.rope_type,
             );
             return Err(LlamaConfigError::RopeType);
         }
@@ -185,17 +193,15 @@ impl TryFrom<ConfigFile> for LlamaConfig {
             num_hidden_layers: file.num_hidden_layers,
             num_attention_heads: file.num_attention_heads,
             num_key_value_heads: file.num_key_value_heads,
-            head_dim: file.head_dim,
+            head_dim,
             rms_norm_eps: file.rms_norm_eps,
             rope_theta: file.rope_theta,
-            rope_scaling: Llama3RopeScaling {
-                factor: file.rope_scaling.factor,
-                low_freq_factor: file.rope_scaling.low_freq_factor,
-                high_freq_factor: file.rope_scaling.high_freq_factor,
-                original_max_position_embeddings: file
-                    .rope_scaling
-                    .original_max_position_embeddings,
-            },
+            rope_scaling: file.rope_scaling.map(|rope_scaling| Llama3RopeScaling {
+                factor: rope_scaling.factor,
+                low_freq_factor: rope_scaling.low_freq_factor,
+                high_freq_factor: rope_scaling.high_freq_factor,
+                original_max_position_embeddings: rope_scaling.original_max_position_embeddings,
+            }),
             max_position_embeddings: file.max_position_embeddings,
             vocab_size: file.vocab_size,
             eos_token_ids: file.eos_token_id.into(),
@@ -296,12 +302,12 @@ mod tests {
         assert_eq!(config.rope_theta(), 500_000.0, "rope theta");
         assert_eq!(
             config.rope_scaling(),
-            &Llama3RopeScaling {
+            Some(&Llama3RopeScaling {
                 factor: 32.0,
                 low_freq_factor: 1.0,
                 high_freq_factor: 4.0,
                 original_max_position_embeddings: 8192,
-            },
+            }),
             "rope scaling"
         );
         assert_eq!(config.max_position_embeddings(), 131_072, "max positions");
@@ -392,16 +398,63 @@ mod tests {
     }
 
     #[test]
-    fn missing_rope_scaling_is_rejected() {
-        let mut config = instruct_config();
+    fn null_rope_scaling_gives_an_unscaled_rope() {
+        let result = parse(&with(instruct_config(), "rope_scaling", json!(null)));
+        assert_eq!(
+            result.map(|config| config.rope_scaling),
+            Ok(None),
+            "the rope is not scaled"
+        );
+    }
+
+    #[test]
+    fn missing_rope_scaling_and_head_dim_are_derived() {
+        let result = parse(&json!({
+            "architectures": ["LlamaForCausalLM"],
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "hidden_size": 576,
+            "intermediate_size": 1536,
+            "max_position_embeddings": 8192,
+            "model_type": "llama",
+            "num_attention_heads": 9,
+            "num_hidden_layers": 30,
+            "num_key_value_heads": 3,
+            "rms_norm_eps": 1e-05,
+            "rope_theta": 100000,
+            "tie_word_embeddings": true,
+            "vocab_size": 49152
+        }));
+        assert_eq!(
+            result,
+            Ok(LlamaConfig {
+                hidden_size: 576,
+                intermediate_size: 1536,
+                num_hidden_layers: 30,
+                num_attention_heads: 9,
+                num_key_value_heads: 3,
+                head_dim: 64,
+                rms_norm_eps: 1e-5,
+                rope_theta: 100_000.0,
+                rope_scaling: None,
+                max_position_embeddings: 8192,
+                vocab_size: 49_152,
+                eos_token_ids: vec![2],
+            }),
+            "head dim is hidden size over attention heads"
+        );
+    }
+
+    #[test]
+    fn missing_head_dim_with_hidden_size_not_divisible_by_heads_is_rejected() {
+        let mut config = with(instruct_config(), "hidden_size", json!(3001));
         config
             .as_object_mut()
             .expect("the config is an object")
-            .remove("rope_scaling");
-        let result = parse(&config);
+            .remove("head_dim");
         assert_eq!(
-            result,
-            Err(LlamaConfigError::ConfigJson),
+            parse(&config),
+            Err(LlamaConfigError::HiddenSizeMismatch),
             "the config is rejected"
         );
     }
