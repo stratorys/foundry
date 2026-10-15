@@ -13,7 +13,10 @@ use std::time::{
 };
 
 use serde::Serialize;
-use tracing::error;
+use tracing::{
+    error,
+    info,
+};
 
 pub use self::error::BenchError;
 pub use self::metrics::{
@@ -29,16 +32,22 @@ pub use self::metrics::{
 };
 use self::metrics::{
     metrics,
+    run_ts,
     sum_ns,
 };
 use self::rng::SplitMix64;
 pub use self::stats::Summary;
-use self::stats::ns_to_f64;
+use self::stats::{
+    mean,
+    ns_to_f64,
+};
 use crate::core::Backend;
 use crate::generate::{
     CausalLm,
     Decoder,
 };
+
+const NS_PER_MS: f64 = 1e6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BenchConfig {
@@ -129,28 +138,59 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
 ) -> Result<Report, BenchError> {
     let mode = Mode::try_from(config)?;
     let inputs = draw_inputs(config, mode, vocab_size)?;
+    let counts = TokenCounts {
+        prompt_count: config.prompt_token_count,
+        gen_count: config.gen_token_count,
+        depth_count: config.depth_token_count,
+    };
+    info!(
+        message = "Starting the benchmark.",
+        ?mode,
+        prompt_tokens = config.prompt_token_count,
+        gen_tokens = config.gen_token_count,
+        depth = config.depth_token_count,
+        warmup_runs = config.warmup_run_count,
+        warmup_ms = config.warmup_ms,
+        runs = config.run_count.get(),
+        seed = config.seed,
+    );
     let warmup_start = Instant::now();
     let warmup = Duration::from_millis(config.warmup_ms);
     let mut warmup_run_count = 0_u32;
     while warmup_run_count < config.warmup_run_count || warmup_start.elapsed() < warmup {
-        run(backend, model, &inputs)?;
+        let warmup_run = run(backend, model, &inputs)?;
         warmup_run_count = warmup_run_count.checked_add(1).ok_or_else(|| {
             error!(message = "Run count overflows u32.", warmup_run_count);
             BenchError::RunCountOverflow
         })?;
+        info!(
+            message = "Finished a warmup run.",
+            warmup_run = warmup_run_count,
+            run_ms = ns_to_ms(warmup_run.total_ns()),
+        );
     }
-    let runs = (0..config.run_count.get())
-        .map(|_| run(backend, model, &inputs))
+    let runs = (1..=config.run_count.get())
+        .map(|run_number| {
+            let measured_run = run(backend, model, &inputs)?;
+            let decode_ms = measured_run
+                .decode_ns
+                .iter()
+                .copied()
+                .map(ns_to_ms)
+                .collect::<Vec<f64>>();
+            info!(
+                message = "Finished a measured run.",
+                run = run_number,
+                runs = config.run_count.get(),
+                prefill_ms = ?measured_run.prefill_ns.map(ns_to_ms),
+                decode_ms_mean = ?mean(&decode_ms),
+                ts = run_ts(&measured_run, counts),
+            );
+            Ok(measured_run)
+        })
         .collect::<Result<Vec<RunSamples>, BenchError>>()?;
     let stats = stats(&runs)?;
-    let metrics = metrics(
-        &runs,
-        TokenCounts {
-            prompt_count: config.prompt_token_count,
-            gen_count: config.gen_token_count,
-            depth_count: config.depth_token_count,
-        },
-    )?;
+    let metrics = metrics(&runs, counts)?;
     Ok(Report {
         config: *config,
         mode,
@@ -268,6 +308,8 @@ fn step<B: Backend, M: CausalLm<B>>(
         BenchError::Step
     })
 }
+
+fn ns_to_ms(ns: u64) -> f64 { ns_to_f64(ns) / NS_PER_MS }
 
 fn advance(
     position: usize,

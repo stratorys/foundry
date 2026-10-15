@@ -12,7 +12,10 @@ use std::path::{
 };
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use clap::{
     Args,
@@ -509,14 +512,23 @@ fn load_llama<B: Backend>(
     weights: &Weights,
     seq_len_max: usize,
 ) -> Result<Llama<B>, CliError> {
+    info!(message = "Loading the model.", %model);
+    let load_start = Instant::now();
     let llama_weights = LlamaWeights::load(backend, config, weights).map_err(|error| {
         error!(message = "Loading the model weights failed.", %model, %error);
         CliError::Load
     })?;
-    Llama::new(backend, config, llama_weights, seq_len_max).map_err(|error| {
+    let llama = Llama::new(backend, config, llama_weights, seq_len_max).map_err(|error| {
         error!(message = "Building the model failed.", %model, seq_len_max, %error);
         CliError::Model
-    })
+    })?;
+    info!(
+        message = "Loaded the model.",
+        %model,
+        seq_len_max,
+        load_ms = %load_start.elapsed().as_millis(),
+    );
+    Ok(llama)
 }
 
 fn generate_on<B: Backend>(

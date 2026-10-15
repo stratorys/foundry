@@ -122,10 +122,9 @@ fn llama_cpp(
     counts: TokenCounts,
 ) -> Result<LlamaCpp, BenchError> {
     let samples_ns = runs.iter().map(RunSamples::total_ns).collect::<Vec<u64>>();
-    let token_count = f64::from(counts.prompt_count) + f64::from(counts.gen_count);
-    let samples_ts = samples_ns
+    let samples_ts = runs
         .iter()
-        .map(|&sample_ns| NS_PER_S * token_count / ns_to_f64(sample_ns))
+        .map(|run| run_ts(run, counts))
         .collect::<Vec<f64>>();
     let run_count = u64::try_from(samples_ns.len()).map_err(|_| BenchError::SampleCountOverflow)?;
     let avg_ns = sum_ns(&samples_ns)
@@ -147,6 +146,14 @@ fn llama_cpp(
         samples_ns,
         samples_ts,
     })
+}
+
+pub fn run_ts(
+    run: &RunSamples,
+    counts: TokenCounts,
+) -> f64 {
+    let token_count = f64::from(counts.prompt_count) + f64::from(counts.gen_count);
+    NS_PER_S * token_count / ns_to_f64(run.total_ns())
 }
 
 fn stdev_llama_cpp(samples: &[f64]) -> f64 {
@@ -287,7 +294,28 @@ mod tests {
         TokenCounts,
         Vllm,
         metrics,
+        run_ts,
     };
+
+    #[test]
+    fn run_ts_divides_every_token_by_the_run_time() {
+        assert_eq!(
+            run_ts(
+                &RunSamples {
+                    prefill_ns: Some(1_500_000_000),
+                    decode_ns: vec![250_000_000, 250_000_000],
+                    token_ids: vec![1, 2, 3],
+                },
+                TokenCounts {
+                    prompt_count: 5,
+                    gen_count: 2,
+                    depth_count: 0,
+                },
+            ),
+            3.5,
+            "seven tokens in two seconds"
+        );
+    }
 
     #[test]
     fn pg_runs_give_every_engine_metric() {
