@@ -45,7 +45,7 @@ pub struct Generation {
     pub decode_steps: Vec<Duration>,
 }
 
-struct Decoder<'run, B: Backend, M: CausalLm<B>> {
+pub struct Decoder<'run, B: Backend, M: CausalLm<B>> {
     backend: &'run mut B,
     model: &'run M,
     cache: M::Cache,
@@ -69,15 +69,7 @@ pub fn generate<B: Backend, M: CausalLm<B>>(
             decode_steps: Vec::new(),
         });
     }
-    let cache = model.cache(backend).map_err(|error| {
-        error!(message = "Creating the key-value cache failed.", %error);
-        GenerateError::Cache
-    })?;
-    let mut decoder = Decoder {
-        backend,
-        model,
-        cache,
-    };
+    let mut decoder = Decoder::new(backend, model)?;
     let prefill_start = Instant::now();
     let first_token = decoder.step(prompt_ids, 0)?;
     let mut generation = Generation {
@@ -103,8 +95,23 @@ pub fn generate<B: Backend, M: CausalLm<B>>(
     Ok(generation)
 }
 
-impl<B: Backend, M: CausalLm<B>> Decoder<'_, B, M> {
-    fn step(
+impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
+    pub fn new(
+        backend: &'run mut B,
+        model: &'run M,
+    ) -> Result<Self, GenerateError> {
+        let cache = model.cache(backend).map_err(|error| {
+            error!(message = "Creating the key-value cache failed.", %error);
+            GenerateError::Cache
+        })?;
+        Ok(Self {
+            backend,
+            model,
+            cache,
+        })
+    }
+
+    pub fn step(
         &mut self,
         token_ids: &[u32],
         position: usize,
