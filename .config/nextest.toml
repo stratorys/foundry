@@ -1,0 +1,5 @@
+[profile.default]
+default-filter = 'not test(/_metal$/) and not test(/^backend::metal::/)'
+
+[profile.metal]
+default-filter = 'not test(/_cpu$/) and not test(/^backend::cpu::/)'

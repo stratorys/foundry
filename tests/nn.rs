@@ -1,7 +1,10 @@
 use std::num::NonZeroUsize;
 
 use foundry::backend::cpu::CpuBackend;
+#[cfg(target_os = "macos")]
+use foundry::backend::metal::MetalBackend;
 use foundry::core::{
+    Backend,
     CoreError,
     DType,
     Shape,
@@ -19,9 +22,7 @@ use foundry::nn::{
     softmax_last_axis,
 };
 
-#[test]
-fn softmax_rows_match_hand_computed_values() {
-    let mut backend = CpuBackend::new();
+fn softmax_rows_match_hand_computed_values<B: Backend>(mut backend: B) {
     let x = Tensor::upload(
         &mut backend,
         &[1.0_f32, 2.0, 3.0, 0.0, 0.0, 0.0]
@@ -59,8 +60,19 @@ fn softmax_rows_match_hand_computed_values() {
 }
 
 #[test]
-fn silu_matches_hand_computed_values() {
-    let mut backend = CpuBackend::new();
+fn softmax_rows_match_hand_computed_values_cpu() {
+    softmax_rows_match_hand_computed_values(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn softmax_rows_match_hand_computed_values_metal() {
+    softmax_rows_match_hand_computed_values(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn silu_matches_hand_computed_values<B: Backend>(mut backend: B) {
     let silu = Silu::new(&mut backend).expect("the silu is built");
     let x = Tensor::upload(
         &mut backend,
@@ -97,8 +109,15 @@ fn silu_matches_hand_computed_values() {
 }
 
 #[test]
-fn rms_norm_matches_hand_computed_values() {
-    let mut backend = CpuBackend::new();
+fn silu_matches_hand_computed_values_cpu() { silu_matches_hand_computed_values(CpuBackend::new()); }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn silu_matches_hand_computed_values_metal() {
+    silu_matches_hand_computed_values(MetalBackend::new().expect("the Metal backend is created"));
+}
+
+fn rms_norm_matches_hand_computed_values<B: Backend>(mut backend: B) {
     let weight = Tensor::upload(
         &mut backend,
         &[1.0_f32, 2.0, 0.5, -1.0]
@@ -157,8 +176,19 @@ fn rms_norm_matches_hand_computed_values() {
 }
 
 #[test]
-fn rms_norm_rejects_a_dimension_beyond_u16() {
-    let mut backend = CpuBackend::new();
+fn rms_norm_matches_hand_computed_values_cpu() {
+    rms_norm_matches_hand_computed_values(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rms_norm_matches_hand_computed_values_metal() {
+    rms_norm_matches_hand_computed_values(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn rms_norm_rejects_a_dimension_beyond_u16<B: Backend>(mut backend: B) {
     let weight = Tensor::zeros(
         &mut backend,
         DType::BF16,
@@ -175,8 +205,19 @@ fn rms_norm_rejects_a_dimension_beyond_u16() {
 }
 
 #[test]
-fn linear_multiplies_by_the_transposed_weight() {
-    let mut backend = CpuBackend::new();
+fn rms_norm_rejects_a_dimension_beyond_u16_cpu() {
+    rms_norm_rejects_a_dimension_beyond_u16(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rms_norm_rejects_a_dimension_beyond_u16_metal() {
+    rms_norm_rejects_a_dimension_beyond_u16(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn linear_multiplies_by_the_transposed_weight<B: Backend>(mut backend: B) {
     let weight = Tensor::upload(
         &mut backend,
         &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -224,8 +265,19 @@ fn linear_multiplies_by_the_transposed_weight() {
 }
 
 #[test]
-fn embedding_gathers_the_rows_of_the_token_ids() {
-    let mut backend = CpuBackend::new();
+fn linear_multiplies_by_the_transposed_weight_cpu() {
+    linear_multiplies_by_the_transposed_weight(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn linear_multiplies_by_the_transposed_weight_metal() {
+    linear_multiplies_by_the_transposed_weight(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn embedding_gathers_the_rows_of_the_token_ids<B: Backend>(mut backend: B) {
     let table = Tensor::upload(
         &mut backend,
         &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -267,8 +319,19 @@ fn embedding_gathers_the_rows_of_the_token_ids() {
 }
 
 #[test]
-fn swiglu_mlp_matches_hand_computed_values() {
-    let mut backend = CpuBackend::new();
+fn embedding_gathers_the_rows_of_the_token_ids_cpu() {
+    embedding_gathers_the_rows_of_the_token_ids(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn embedding_gathers_the_rows_of_the_token_ids_metal() {
+    embedding_gathers_the_rows_of_the_token_ids(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn swiglu_mlp_matches_hand_computed_values<B: Backend>(mut backend: B) {
     let [gate, up, down] = [
         [1.0_f32, 0.0, 0.0, -1.0],
         [2.0, 0.0, 1.0, 1.0],
@@ -326,8 +389,19 @@ fn swiglu_mlp_matches_hand_computed_values() {
 }
 
 #[test]
-fn kv_cache_update_beyond_capacity_is_rejected() {
-    let mut backend = CpuBackend::new();
+fn swiglu_mlp_matches_hand_computed_values_cpu() {
+    swiglu_mlp_matches_hand_computed_values(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn swiglu_mlp_matches_hand_computed_values_metal() {
+    swiglu_mlp_matches_hand_computed_values(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn kv_cache_update_beyond_capacity_is_rejected<B: Backend>(mut backend: B) {
     let [key, value] = [[1, 3, 2], [1, 3, 2]].map(|dims| {
         Tensor::zeros(
             &mut backend,
@@ -347,8 +421,19 @@ fn kv_cache_update_beyond_capacity_is_rejected() {
 }
 
 #[test]
-fn kv_cache_update_rejects_keys_and_values_of_different_shapes() {
-    let mut backend = CpuBackend::new();
+fn kv_cache_update_beyond_capacity_is_rejected_cpu() {
+    kv_cache_update_beyond_capacity_is_rejected(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kv_cache_update_beyond_capacity_is_rejected_metal() {
+    kv_cache_update_beyond_capacity_is_rejected(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn kv_cache_update_rejects_keys_and_values_of_different_shapes<B: Backend>(mut backend: B) {
     let [key, value] = [[1, 2, 2], [1, 1, 2]].map(|dims| {
         Tensor::zeros(
             &mut backend,
@@ -368,13 +453,24 @@ fn kv_cache_update_rejects_keys_and_values_of_different_shapes() {
 }
 
 #[test]
-fn kv_cache_keeps_earlier_positions_across_updates() {
+fn kv_cache_update_rejects_keys_and_values_of_different_shapes_cpu() {
+    kv_cache_update_rejects_keys_and_values_of_different_shapes(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kv_cache_update_rejects_keys_and_values_of_different_shapes_metal() {
+    kv_cache_update_rejects_keys_and_values_of_different_shapes(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn kv_cache_keeps_earlier_positions_across_updates<B: Backend>(mut backend: B) {
     struct PositionKeyValueCase<T0, T1, T2> {
         position: T0,
         key: T1,
         value: T2,
     }
-    let mut backend = CpuBackend::new();
     let mut cache = KvCache::new(&mut backend, DType::F32, 1, 3, 2).expect("the cache is built");
     [
         PositionKeyValueCase {
@@ -435,12 +531,23 @@ fn kv_cache_keeps_earlier_positions_across_updates() {
 }
 
 #[test]
-fn attention_matches_hand_computed_values() {
+fn kv_cache_keeps_earlier_positions_across_updates_cpu() {
+    kv_cache_keeps_earlier_positions_across_updates(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kv_cache_keeps_earlier_positions_across_updates_metal() {
+    kv_cache_keeps_earlier_positions_across_updates(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn attention_matches_hand_computed_values<B: Backend>(mut backend: B) {
     struct ValuesDimsCase<T0, T1> {
         values: T0,
         dims: T1,
     }
-    let mut backend = CpuBackend::new();
     let [query, key, value, mask] = [
         ValuesDimsCase {
             values: vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
@@ -515,12 +622,23 @@ fn attention_matches_hand_computed_values() {
 }
 
 #[test]
-fn attention_decode_after_prefill_matches_full_prefill() {
+fn attention_matches_hand_computed_values_cpu() {
+    attention_matches_hand_computed_values(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn attention_matches_hand_computed_values_metal() {
+    attention_matches_hand_computed_values(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn attention_decode_after_prefill_matches_full_prefill<B: Backend>(mut backend: B) {
     struct ValuesDimsCase<T0, T1> {
         values: T0,
         dims: T1,
     }
-    let mut backend = CpuBackend::new();
     let [query, key, value, causal_mask] = [
         ValuesDimsCase {
             values: vec![
@@ -594,12 +712,15 @@ fn attention_decode_after_prefill_matches_full_prefill() {
         .collect();
     let mut step_cache =
         KvCache::new(&mut backend, DType::BF16, 1, 3, 2).expect("the cache is built");
-    let steps: Vec<f32> = (0..3)
+    let steps: Vec<f32> = (0_usize..3)
         .flat_map(|position| {
+            let seq_len_total = position
+                .checked_add(1)
+                .expect("the sequence length fits in usize");
             let mask = Tensor::zeros(
                 &mut backend,
                 DType::BF16,
-                Shape::try_from([1, position + 1].as_slice()).expect("the shape is valid"),
+                Shape::try_from([1, seq_len_total].as_slice()).expect("the shape is valid"),
             )
             .expect("the zeros succeed");
             let [query, key, value] = [&query, &key, &value]
@@ -608,7 +729,7 @@ fn attention_decode_after_prefill_matches_full_prefill() {
                 .update(&mut backend, &key, &value, position)
                 .expect("the cache update succeeds");
             attention
-                .forward(&mut backend, &query, &step_cache, position + 1, &mask)
+                .forward(&mut backend, &query, &step_cache, seq_len_total, &mask)
                 .expect("the step succeeds")
                 .cast(&mut backend, DType::F32)
                 .expect("the cast succeeds")
@@ -631,8 +752,19 @@ fn attention_decode_after_prefill_matches_full_prefill() {
 }
 
 #[test]
-fn attention_rejects_a_head_dim_other_than_its_own() {
-    let mut backend = CpuBackend::new();
+fn attention_decode_after_prefill_matches_full_prefill_cpu() {
+    attention_decode_after_prefill_matches_full_prefill(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn attention_decode_after_prefill_matches_full_prefill_metal() {
+    attention_decode_after_prefill_matches_full_prefill(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn attention_rejects_a_head_dim_other_than_its_own<B: Backend>(mut backend: B) {
     let [query, mask] = [&[2, 2, 2][..], &[2, 2]].map(|dims| {
         Tensor::zeros(
             &mut backend,
@@ -655,5 +787,18 @@ fn attention_rejects_a_head_dim_other_than_its_own() {
             Some(TensorError::Validation(CoreError::AttentionHeadDimMismatch))
         ),
         "a head dim of 2 is rejected by an attention built for 4"
+    );
+}
+
+#[test]
+fn attention_rejects_a_head_dim_other_than_its_own_cpu() {
+    attention_rejects_a_head_dim_other_than_its_own(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn attention_rejects_a_head_dim_other_than_its_own_metal() {
+    attention_rejects_a_head_dim_other_than_its_own(
+        MetalBackend::new().expect("the Metal backend is created"),
     );
 }

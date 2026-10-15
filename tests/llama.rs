@@ -1,5 +1,8 @@
 use foundry::backend::cpu::CpuBackend;
+#[cfg(target_os = "macos")]
+use foundry::backend::metal::MetalBackend;
 use foundry::core::{
+    Backend,
     DType,
     Shape,
     Tensor,
@@ -19,9 +22,7 @@ use half::bf16;
 use hf_hub::HFClientSync;
 use serde_json::json;
 
-#[test]
-#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
-fn llama_weights_load_the_smollm2_snapshot() {
+fn llama_weights_load_the_smollm2_snapshot<B: Backend>(mut backend: B) {
     let directory = HFClientSync::new()
         .expect("the Hugging Face client is created")
         .model("HuggingFaceTB", "SmolLM2-135M-Instruct")
@@ -32,8 +33,7 @@ fn llama_weights_load_the_smollm2_snapshot() {
     let config = LlamaConfig::open(&directory).expect("the config is valid");
     let weights = Weights::open(&directory).expect("the safetensors files are valid");
 
-    let llama =
-        LlamaWeights::load(&mut CpuBackend::new(), &config, &weights).expect("the weights load");
+    let llama = LlamaWeights::load(&mut backend, &config, &weights).expect("the weights load");
     assert_eq!(llama.layers().len(), 30, "one entry per layer");
     assert_eq!(
         llama.bytes_uploaded(),
@@ -47,7 +47,20 @@ fn llama_weights_load_the_smollm2_snapshot() {
 
 #[test]
 #[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
-fn llama_logprobs_match_mlx_on_smollm2() {
+fn llama_weights_load_the_smollm2_snapshot_cpu() {
+    llama_weights_load_the_smollm2_snapshot(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
+fn llama_weights_load_the_smollm2_snapshot_metal() {
+    llama_weights_load_the_smollm2_snapshot(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn llama_logprobs_match_mlx_on_smollm2<B: Backend>(mut backend: B) {
     const PROMPT_IDS: [u32; 5] = [504, 3575, 282, 4649, 314];
     const ABSOLUTE_TOLERANCE: f32 = 0.125;
     const RELATIVE_TOLERANCE: f32 = 1e-2;
@@ -117,7 +130,7 @@ fn llama_logprobs_match_mlx_on_smollm2() {
         .expect("HuggingFaceTB/SmolLM2-135M-Instruct is in the Hugging Face cache");
     let config = LlamaConfig::open(&directory).expect("the config is valid");
     let weights = Weights::open(&directory).expect("the safetensors files are valid");
-    let backend = &mut CpuBackend::new();
+    let backend = &mut backend;
     let seq_len = PROMPT_IDS.len();
     let llama_weights = LlamaWeights::load(backend, &config, &weights).expect("the weights load");
     let model = Llama::new(backend, &config, llama_weights, seq_len).expect("the model is built");
@@ -200,7 +213,19 @@ fn llama_logprobs_match_mlx_on_smollm2() {
 }
 
 #[test]
-fn llama_weights_load_every_tensor_once() {
+#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
+fn llama_logprobs_match_mlx_on_smollm2_cpu() {
+    llama_logprobs_match_mlx_on_smollm2(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
+fn llama_logprobs_match_mlx_on_smollm2_metal() {
+    llama_logprobs_match_mlx_on_smollm2(MetalBackend::new().expect("the Metal backend is created"));
+}
+
+fn llama_weights_load_every_tensor_once<B: Backend>(mut backend: B) {
     let config = json!({
         "model_type": "llama",
         "hidden_size": 4,
@@ -338,8 +363,7 @@ fn llama_weights_load_every_tensor_once() {
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 
-    let llama =
-        LlamaWeights::load(&mut CpuBackend::new(), &config, &weights).expect("the weights load");
+    let llama = LlamaWeights::load(&mut backend, &config, &weights).expect("the weights load");
     assert_eq!(llama.layers().len(), 2, "one entry per layer");
     assert_eq!(
         llama.bytes_uploaded(),
@@ -349,7 +373,19 @@ fn llama_weights_load_every_tensor_once() {
 }
 
 #[test]
-fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
+fn llama_weights_load_every_tensor_once_cpu() {
+    llama_weights_load_every_tensor_once(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn llama_weights_load_every_tensor_once_metal() {
+    llama_weights_load_every_tensor_once(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn llama_weights_reject_a_tensor_with_the_wrong_shape<B: Backend>(mut backend: B) {
     let config = json!({
         "model_type": "llama",
         "hidden_size": 4,
@@ -497,7 +533,7 @@ fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 
-    let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
+    let result = LlamaWeights::load(&mut backend, &config, &weights);
     assert!(
         matches!(result.err(), Some(LlamaError::TensorShapeMismatch)),
         "k_proj of shape [4, 4] where the config expects [2, 4] is rejected"
@@ -505,7 +541,19 @@ fn llama_weights_reject_a_tensor_with_the_wrong_shape() {
 }
 
 #[test]
-fn llama_weights_reject_a_non_bf16_tensor() {
+fn llama_weights_reject_a_tensor_with_the_wrong_shape_cpu() {
+    llama_weights_reject_a_tensor_with_the_wrong_shape(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn llama_weights_reject_a_tensor_with_the_wrong_shape_metal() {
+    llama_weights_reject_a_tensor_with_the_wrong_shape(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn llama_weights_reject_a_non_bf16_tensor<B: Backend>(mut backend: B) {
     let config = json!({
         "model_type": "llama",
         "hidden_size": 4,
@@ -653,7 +701,7 @@ fn llama_weights_reject_a_non_bf16_tensor() {
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 
-    let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
+    let result = LlamaWeights::load(&mut backend, &config, &weights);
     assert!(
         matches!(result.err(), Some(LlamaError::TensorDTypeMismatch)),
         "an f32 model.norm.weight is rejected"
@@ -661,7 +709,19 @@ fn llama_weights_reject_a_non_bf16_tensor() {
 }
 
 #[test]
-fn llama_weights_reject_a_missing_tensor() {
+fn llama_weights_reject_a_non_bf16_tensor_cpu() {
+    llama_weights_reject_a_non_bf16_tensor(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn llama_weights_reject_a_non_bf16_tensor_metal() {
+    llama_weights_reject_a_non_bf16_tensor(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn llama_weights_reject_a_missing_tensor<B: Backend>(mut backend: B) {
     let config = json!({
         "model_type": "llama",
         "hidden_size": 4,
@@ -800,9 +860,22 @@ fn llama_weights_reject_a_missing_tensor() {
     let config = LlamaConfig::parse(&serde_json::to_vec(&config).expect("the config serializes"))
         .expect("the config is valid");
 
-    let result = LlamaWeights::load(&mut CpuBackend::new(), &config, &weights);
+    let result = LlamaWeights::load(&mut backend, &config, &weights);
     assert!(
         matches!(result.err(), Some(LlamaError::TensorNotFound)),
         "a missing model.norm.weight is rejected"
+    );
+}
+
+#[test]
+fn llama_weights_reject_a_missing_tensor_cpu() {
+    llama_weights_reject_a_missing_tensor(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn llama_weights_reject_a_missing_tensor_metal() {
+    llama_weights_reject_a_missing_tensor(
+        MetalBackend::new().expect("the Metal backend is created"),
     );
 }
