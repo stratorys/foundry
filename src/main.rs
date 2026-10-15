@@ -1,41 +1,38 @@
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{
-    self,
-    Write,
-};
+use std::io::Write;
 use std::path::{
     Path,
     PathBuf,
 };
 use std::process::ExitCode;
 use std::str::FromStr;
-#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use clap::{
     Parser,
     Subcommand,
+    ValueEnum,
 };
+use foundry::backend::cpu::CpuBackend;
 #[cfg(target_os = "macos")]
 use foundry::backend::metal::MetalBackend;
-#[cfg(target_os = "macos")]
-use foundry::generate::generate;
-#[cfg(target_os = "macos")]
-use foundry::models::llama::{
-    Llama,
-    LlamaWeights,
+use foundry::core::Backend;
+use foundry::generate::{
+    Generation,
+    generate,
 };
 use foundry::models::llama::{
+    Llama,
     LlamaConfig,
     LlamaConfigError,
+    LlamaWeights,
 };
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
-#[cfg(target_os = "macos")]
-use tracing::info;
 use tracing::{
     error,
+    info,
     warn,
 };
 
@@ -62,14 +59,20 @@ enum Command {
         #[arg(long, help = "List every tensor with its dtype, shape and size.")]
         tensors: bool,
     },
-    #[cfg(target_os = "macos")]
     #[command(
-        about = "Generate token IDs greedily from prompt token IDs on Metal and print them as \
-                 JSON."
+        about = "Generate token IDs greedily from prompt token IDs on the selected backend and \
+                 print them as JSON."
     )]
     Run {
         #[arg(long, help = "Hugging Face repository id, as owner/name.")]
         model: ModelId,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = BackendKind::Cpu,
+            help = "Backend that runs the model."
+        )]
+        backend: BackendKind,
         #[arg(
             long,
             value_delimiter = ',',
@@ -80,6 +83,13 @@ enum Command {
         #[arg(long, help = "Maximum number of generated tokens.")]
         max_new_tokens: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BackendKind {
+    Cpu,
+    #[cfg(target_os = "macos")]
+    Metal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,19 +126,15 @@ enum CliError {
     #[error("Creating the Metal backend failed.")]
     Backend,
 
-    #[cfg(target_os = "macos")]
     #[error("Loading the model weights failed.")]
     Load,
 
-    #[cfg(target_os = "macos")]
     #[error("Building the model failed.")]
     Model,
 
-    #[cfg(target_os = "macos")]
     #[error("Prompt and generated token counts overflow usize.")]
     SeqLenOverflow,
 
-    #[cfg(target_os = "macos")]
     #[error("Generation failed.")]
     Generate,
 }
@@ -180,7 +186,7 @@ impl fmt::Display for ModelId {
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_writer(io::stderr)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
     let result = match Cli::parse().command {
@@ -188,12 +194,12 @@ fn main() -> ExitCode {
             model,
             tensors,
         } => inspect(&model, tensors),
-        #[cfg(target_os = "macos")]
         Command::Run {
             model,
+            backend,
             prompt_ids,
             max_new_tokens,
-        } => run(&model, &prompt_ids, max_new_tokens),
+        } => run(&model, backend, &prompt_ids, max_new_tokens),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -232,7 +238,7 @@ fn inspect(
     let config = load_architecture(&directory)?;
     let tensor_rows = tensors.then(|| tensor_rows(&weights));
     write_report(
-        &mut io::stdout().lock(),
+        &mut std::io::stdout().lock(),
         model,
         &directory,
         &summary,
@@ -256,9 +262,9 @@ fn open_weights(directory: &Path) -> Result<Weights, CliError> {
     })
 }
 
-#[cfg(target_os = "macos")]
 fn run(
     model: &ModelId,
+    backend: BackendKind,
     prompt_ids: &[u32],
     max_new_tokens: usize,
 ) -> Result<(), CliError> {
@@ -272,11 +278,52 @@ fn run(
         CliError::Config
     })?;
     let weights = open_weights(&directory)?;
-    let mut backend = MetalBackend::new().map_err(|error| {
-        error!(message = "Creating the Metal backend failed.", %error);
-        CliError::Backend
-    })?;
-    let llama_weights = LlamaWeights::load(&mut backend, &config, &weights).map_err(|error| {
+    let generation = match backend {
+        BackendKind::Cpu => generate_on(
+            &mut CpuBackend::new(),
+            model,
+            &config,
+            &weights,
+            prompt_ids,
+            max_new_tokens,
+        ),
+        #[cfg(target_os = "macos")]
+        BackendKind::Metal => generate_on(
+            &mut MetalBackend::new().map_err(|error| {
+                error!(message = "Creating the Metal backend failed.", %error);
+                CliError::Backend
+            })?,
+            model,
+            &config,
+            &weights,
+            prompt_ids,
+            max_new_tokens,
+        ),
+    }?;
+    info!(
+        message = "Generated tokens.",
+        ?backend,
+        prompt_tokens = prompt_ids.len(),
+        generated_tokens = generation.token_ids.len(),
+        prefill_ms = %generation.prefill.as_millis(),
+        decode_steps = generation.decode_steps.len(),
+        decode_ms_total = %generation.decode_steps.iter().sum::<Duration>().as_millis(),
+    );
+    write_token_ids(&mut std::io::stdout().lock(), &generation.token_ids).map_err(|error| {
+        error!(message = "Writing the token IDs to stdout failed.", %error);
+        CliError::Output
+    })
+}
+
+fn generate_on<B: Backend>(
+    backend: &mut B,
+    model: &ModelId,
+    config: &LlamaConfig,
+    weights: &Weights,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+) -> Result<Generation, CliError> {
+    let llama_weights = LlamaWeights::load(backend, config, weights).map_err(|error| {
         error!(message = "Loading the model weights failed.", %model, %error);
         CliError::Load
     })?;
@@ -291,12 +338,12 @@ fn run(
             );
             CliError::SeqLenOverflow
         })?;
-    let llama = Llama::new(&mut backend, &config, llama_weights, seq_len_max).map_err(|error| {
+    let llama = Llama::new(backend, config, llama_weights, seq_len_max).map_err(|error| {
         error!(message = "Building the model failed.", %model, seq_len_max, %error);
         CliError::Model
     })?;
-    let generation = generate(
-        &mut backend,
+    generate(
+        backend,
         &llama,
         prompt_ids,
         max_new_tokens,
@@ -305,26 +352,13 @@ fn run(
     .map_err(|error| {
         error!(message = "Generation failed.", %model, %error);
         CliError::Generate
-    })?;
-    info!(
-        message = "Generated tokens.",
-        prompt_tokens = prompt_ids.len(),
-        generated_tokens = generation.token_ids.len(),
-        prefill_ms = %generation.prefill.as_millis(),
-        decode_steps = generation.decode_steps.len(),
-        decode_ms_total = %generation.decode_steps.iter().sum::<Duration>().as_millis(),
-    );
-    write_token_ids(&mut io::stdout().lock(), &generation.token_ids).map_err(|error| {
-        error!(message = "Writing the token IDs to stdout failed.", %error);
-        CliError::Output
     })
 }
 
-#[cfg(target_os = "macos")]
 fn write_token_ids(
     out: &mut impl Write,
     token_ids: &[u32],
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     let token_ids = token_ids
         .iter()
         .map(u32::to_string)
@@ -340,7 +374,7 @@ fn write_report(
     summary: &WeightsSummary,
     config: Option<&LlamaConfig>,
     tensor_rows: Option<&[TensorRow]>,
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     write_header(out, model, directory)?;
     write_weights(out, summary)?;
     if let Some(config) = config {
@@ -430,7 +464,7 @@ fn write_header(
     out: &mut impl Write,
     model: &ModelId,
     directory: &Path,
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     writeln!(out, "{:<LABEL_WIDTH$}{model}", "Model")?;
     writeln!(out, "{:<LABEL_WIDTH$}{}", "Snapshot", directory.display())
 }
@@ -438,7 +472,7 @@ fn write_header(
 fn write_weights(
     out: &mut impl Write,
     summary: &WeightsSummary,
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     let size_gib = format_gib(summary.bytes);
     let dtypes = summary
         .dtypes
@@ -473,7 +507,7 @@ fn write_weights(
 fn write_architecture(
     out: &mut impl Write,
     config: &LlamaConfig,
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     let rope = config.rope_scaling().map_or_else(
         || format!("theta {}, no scaling", config.rope_theta()),
         |scaling| {
@@ -518,7 +552,7 @@ fn write_architecture(
 fn write_tensors(
     out: &mut impl Write,
     rows: &[TensorRow],
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
     let dtype_width = rows.iter().map(|row| row.dtype.len()).max().unwrap_or(0);
     let shape_width = rows.iter().map(|row| row.shape.len()).max().unwrap_or(0);
@@ -542,7 +576,7 @@ fn write_field(
     out: &mut impl Write,
     label: &str,
     value: impl fmt::Display,
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     writeln!(out, "  {label:<FIELD_WIDTH$}{value}")
 }
 
@@ -570,9 +604,8 @@ mod tests {
     };
     use serde_json::json;
 
-    #[cfg(target_os = "macos")]
-    use crate::write_token_ids;
     use crate::{
+        BackendKind,
         Cli,
         CliError,
         Command,
@@ -585,6 +618,7 @@ mod tests {
         summarize_weights,
         tensor_rows,
         write_tensors,
+        write_token_ids,
         write_weights,
     };
 
@@ -705,7 +739,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn run_parses_model_prompt_ids_and_max_new_tokens() {
         assert_eq!(
@@ -726,14 +759,66 @@ mod tests {
                     owner: "a".to_owned(),
                     name: "b".to_owned(),
                 },
+                backend: BackendKind::Cpu,
                 prompt_ids: vec![1, 2, 3],
                 max_new_tokens: 4,
             }),
-            "comma-separated prompt IDs"
+            "comma-separated prompt IDs on the default cpu backend"
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_parses_the_cpu_backend() {
+        assert_eq!(
+            Cli::try_parse_from([
+                "foundry",
+                "run",
+                "--model",
+                "a/b",
+                "--backend",
+                "cpu",
+                "--prompt-ids",
+                "1",
+                "--max-new-tokens",
+                "1",
+            ])
+            .map(|cli| cli.command)
+            .map_err(|error| error.kind()),
+            Ok(Command::Run {
+                model: ModelId {
+                    owner: "a".to_owned(),
+                    name: "b".to_owned(),
+                },
+                backend: BackendKind::Cpu,
+                prompt_ids: vec![1],
+                max_new_tokens: 1,
+            }),
+            "explicit cpu backend"
+        );
+    }
+
+    #[test]
+    fn run_rejects_an_unknown_backend() {
+        assert_eq!(
+            Cli::try_parse_from([
+                "foundry",
+                "run",
+                "--model",
+                "a/b",
+                "--backend",
+                "gpu",
+                "--prompt-ids",
+                "1",
+                "--max-new-tokens",
+                "1",
+            ])
+            .map(|cli| cli.command)
+            .map_err(|error| error.kind()),
+            Err(ErrorKind::InvalidValue),
+            "gpu is not a backend"
+        );
+    }
+
     #[test]
     fn run_rejects_missing_or_malformed_prompt_ids() {
         struct ArgsKindCase<T0, T1> {
@@ -776,7 +861,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn write_token_ids_prints_a_json_array() {
         let mut out = Vec::new();
