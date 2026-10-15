@@ -1,5 +1,6 @@
 mod error;
 
+use std::num::NonZeroUsize;
 use std::time::{
     Duration,
     Instant,
@@ -16,7 +17,8 @@ use crate::core::{
     Tensor,
 };
 
-const VOCAB_AXIS: usize = 0;
+const VOCAB_AXIS: usize = 1;
+const TOKEN_ID_BYTES: usize = 4;
 
 pub trait CausalLm<B: Backend> {
     type Cache;
@@ -25,6 +27,7 @@ pub trait CausalLm<B: Backend> {
     fn cache(
         &self,
         backend: &mut B,
+        batch_size: NonZeroUsize,
     ) -> Result<Self::Cache, Self::Error>;
 
     fn forward(
@@ -40,7 +43,7 @@ pub trait CausalLm<B: Backend> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generation {
-    pub token_ids: Vec<u32>,
+    pub token_ids: Vec<Vec<u32>>,
     pub prefill: Duration,
     pub decode_steps: Vec<Duration>,
 }
@@ -49,44 +52,62 @@ pub struct Decoder<'run, B: Backend, M: CausalLm<B>> {
     backend: &'run mut B,
     model: &'run M,
     cache: M::Cache,
+    batch_size: NonZeroUsize,
 }
 
 pub fn generate<B: Backend, M: CausalLm<B>>(
     backend: &mut B,
     model: &M,
-    prompt_ids: &[u32],
+    prompts: &[&[u32]],
     max_new_tokens: usize,
     stop_ids: &[u32],
 ) -> Result<Generation, GenerateError> {
-    if prompt_ids.is_empty() {
+    let Some(batch_size) = NonZeroUsize::new(prompts.len()) else {
+        error!(message = "Batch holds no prompt.");
+        return Err(GenerateError::EmptyBatch);
+    };
+    let prompt_len = prompts.first().map_or(0, |prompt| prompt.len());
+    if prompt_len == 0 {
         error!(message = "Prompt holds no token.");
         return Err(GenerateError::EmptyPrompt);
     }
+    if prompts.iter().any(|prompt| prompt.len() != prompt_len) {
+        error!(
+            message = "Prompts do not have the same length.",
+            prompt_lens = ?prompts.iter().map(|prompt| prompt.len()).collect::<Vec<usize>>(),
+        );
+        return Err(GenerateError::RaggedBatch);
+    }
     if max_new_tokens == 0 {
         return Ok(Generation {
-            token_ids: Vec::new(),
+            token_ids: vec![Vec::new(); batch_size.get()],
             prefill: Duration::ZERO,
             decode_steps: Vec::new(),
         });
     }
-    let mut decoder = Decoder::new(backend, model)?;
+    let is_stopped = |row: &Vec<u32>| row.last().is_some_and(|token| stop_ids.contains(token));
+    let mut decoder = Decoder::new(backend, model, batch_size)?;
     let prefill_start = Instant::now();
-    let first_token = decoder.step(prompt_ids, 0)?;
+    let mut tokens = decoder.step(&prompts.concat(), 0)?;
     let mut generation = Generation {
-        token_ids: vec![first_token],
+        token_ids: tokens.iter().map(|&token| vec![token]).collect(),
         prefill: prefill_start.elapsed(),
         decode_steps: Vec::new(),
     };
-    let mut token = first_token;
-    let mut position = prompt_ids.len();
+    let mut position = prompt_len;
     for _ in 1..max_new_tokens {
-        if stop_ids.contains(&token) {
+        if generation.token_ids.iter().all(is_stopped) {
             break;
         }
         let step_start = Instant::now();
-        token = decoder.step(&[token], position)?;
+        tokens = decoder.step(&tokens, position)?;
         generation.decode_steps.push(step_start.elapsed());
-        generation.token_ids.push(token);
+        generation
+            .token_ids
+            .iter_mut()
+            .zip(&tokens)
+            .filter(|(row, _)| !is_stopped(row))
+            .for_each(|(row, &token)| row.push(token));
         position = position.checked_add(1).ok_or_else(|| {
             error!(message = "Token position overflows usize.", position);
             GenerateError::PositionOverflow
@@ -99,8 +120,9 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
     pub fn new(
         backend: &'run mut B,
         model: &'run M,
+        batch_size: NonZeroUsize,
     ) -> Result<Self, GenerateError> {
-        let cache = model.cache(backend).map_err(|error| {
+        let cache = model.cache(backend, batch_size).map_err(|error| {
             error!(message = "Creating the key-value cache failed.", %error);
             GenerateError::Cache
         })?;
@@ -108,6 +130,7 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
             backend,
             model,
             cache,
+            batch_size,
         })
     }
 
@@ -115,8 +138,19 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
         &mut self,
         token_ids: &[u32],
         position: usize,
-    ) -> Result<u32, GenerateError> {
-        let seq_len = token_ids.len();
+    ) -> Result<Vec<u32>, GenerateError> {
+        let token_count = token_ids.len();
+        let batch_size = self.batch_size.get();
+        let Some(seq_len) = token_count
+            .checked_div(batch_size)
+            .filter(|seq_len| seq_len.checked_mul(batch_size) == Some(token_count))
+        else {
+            error!(
+                message = "Token count is not a multiple of the batch size.",
+                token_count, batch_size
+            );
+            return Err(GenerateError::BatchMismatch);
+        };
         let seq_len_total = position.checked_add(seq_len).ok_or_else(|| {
             error!(
                 message = "Token position overflows usize.",
@@ -128,7 +162,7 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
             .iter()
             .flat_map(|token_id| token_id.to_le_bytes())
             .collect::<Vec<u8>>();
-        let tokens = self.upload(&token_bytes, DType::U32, &[seq_len])?;
+        let tokens = self.upload(&token_bytes, DType::U32, &[token_count])?;
         let positions =
             self.upload(&positions(position, seq_len_total)?, DType::U32, &[seq_len])?;
         let mask = self.upload(
@@ -150,7 +184,7 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
                 error!(message = "Model forward failed.", position, seq_len, %error);
                 GenerateError::Forward
             })?;
-        self.next_token(&logits)
+        self.next_tokens(&logits)
     }
 
     fn upload(
@@ -167,10 +201,10 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
         Tensor::upload(self.backend, bytes, dtype, shape).map_err(|error| upload_error(&error))
     }
 
-    fn next_token(
+    fn next_tokens(
         &mut self,
         logits: &Tensor<B>,
-    ) -> Result<u32, GenerateError> {
+    ) -> Result<Vec<u32>, GenerateError> {
         let bytes = logits
             .argmax(self.backend, VOCAB_AXIS)
             .and_then(|token| token.download(self.backend))
@@ -178,14 +212,16 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
                 error!(message = "Selecting the next token failed.", %error);
                 GenerateError::NextToken
             })?;
-        let token_bytes = <[u8; 4]>::try_from(bytes.as_slice()).map_err(|_| {
+        let (tokens, remainder) = bytes.as_chunks::<TOKEN_ID_BYTES>();
+        if tokens.len() != self.batch_size.get() || !remainder.is_empty() {
             error!(
-                message = "Next token download does not hold one u32.",
-                bytes = bytes.len()
+                message = "Next token download does not hold one u32 per sequence.",
+                bytes = bytes.len(),
+                batch_size = self.batch_size.get(),
             );
-            GenerateError::TokenBytes
-        })?;
-        Ok(u32::from_le_bytes(token_bytes))
+            return Err(GenerateError::TokenBytes);
+        }
+        Ok(tokens.iter().copied().map(u32::from_le_bytes).collect())
     }
 }
 
@@ -229,13 +265,121 @@ fn causal_mask(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use half::bf16;
 
+    use crate::backend::cpu::{
+        CpuBackend,
+        CpuError,
+    };
+    use crate::core::{
+        DType,
+        Shape,
+        Tensor,
+        TensorError,
+    };
     use crate::generate::{
+        CausalLm,
+        Decoder,
         GenerateError,
         causal_mask,
+        generate,
         positions,
     };
+
+    const VOCAB_SIZE: usize = 16;
+
+    struct PositionModel;
+
+    impl CausalLm<CpuBackend> for PositionModel {
+        type Cache = ();
+        type Error = TensorError<CpuError>;
+
+        fn cache(
+            &self,
+            _backend: &mut CpuBackend,
+            _batch_size: NonZeroUsize,
+        ) -> Result<Self::Cache, Self::Error> {
+            Ok(())
+        }
+
+        fn forward(
+            &self,
+            backend: &mut CpuBackend,
+            token_ids: &Tensor<CpuBackend>,
+            positions: &Tensor<CpuBackend>,
+            _mask: &Tensor<CpuBackend>,
+            _cache: &mut Self::Cache,
+            position: usize,
+        ) -> Result<Tensor<CpuBackend>, Self::Error> {
+            let seq_len = positions.shape().element_count();
+            let batch_size = token_ids
+                .shape()
+                .element_count()
+                .checked_div(seq_len)
+                .expect("the step holds at least one position");
+            let seq_len_total = position.saturating_add(seq_len);
+            let logits = (0..batch_size)
+                .flat_map(|sequence| {
+                    (0..VOCAB_SIZE).map(move |token_id| {
+                        f32::from(u8::from(token_id == seq_len_total.saturating_add(sequence)))
+                    })
+                })
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<u8>>();
+            let shape = Shape::try_from([batch_size, VOCAB_SIZE].as_slice())?;
+            Tensor::upload(backend, &logits, DType::F32, shape)
+        }
+    }
+
+    #[test]
+    fn generate_stops_each_sequence_at_its_own_stop_id() {
+        let generation = generate(
+            &mut CpuBackend::new(),
+            &PositionModel,
+            &[&[1, 2], &[3, 4]],
+            4,
+            &[3],
+        )
+        .expect("the generation runs");
+        assert_eq!(
+            (generation.token_ids, generation.decode_steps.len()),
+            (vec![vec![2, 3], vec![3]], 1),
+            "sequence 1 stops at the prefill, sequence 0 after one decode step"
+        );
+    }
+
+    #[test]
+    fn generate_rejects_an_empty_or_ragged_batch() {
+        let empty: [&[u32]; 0] = [];
+        assert_eq!(
+            [&empty[..], &[&[1, 2], &[3]]].map(|prompts| {
+                generate(&mut CpuBackend::new(), &PositionModel, prompts, 2, &[])
+            }),
+            [
+                Err(GenerateError::EmptyBatch),
+                Err(GenerateError::RaggedBatch)
+            ],
+            "no prompt, then prompts of two and one tokens"
+        );
+    }
+
+    #[test]
+    fn step_rejects_tokens_not_divisible_by_the_batch_size() {
+        let mut backend = CpuBackend::new();
+        let mut decoder = Decoder::new(
+            &mut backend,
+            &PositionModel,
+            NonZeroUsize::new(2).expect("2 is not zero"),
+        )
+        .expect("the decoder is created");
+        assert_eq!(
+            decoder.step(&[1, 2, 3], 0),
+            Err(GenerateError::BatchMismatch),
+            "three tokens cannot be split over two sequences"
+        );
+    }
 
     #[test]
     fn causal_mask_of_a_prefill_hides_later_keys() {

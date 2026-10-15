@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use foundry::backend::cpu::CpuBackend;
 #[cfg(target_os = "macos")]
 use foundry::backend::metal::MetalBackend;
@@ -7,7 +9,10 @@ use foundry::core::{
     Shape,
     Tensor,
 };
-use foundry::generate::CausalLm;
+use foundry::generate::{
+    CausalLm,
+    generate,
+};
 use foundry::models::llama::{
     Llama,
     LlamaConfig,
@@ -134,7 +139,9 @@ fn llama_logprobs_match_mlx_on_smollm2<B: Backend>(mut backend: B) {
     let seq_len = PROMPT_IDS.len();
     let llama_weights = LlamaWeights::load(backend, &config, &weights).expect("the weights load");
     let model = Llama::new(backend, &config, llama_weights, seq_len).expect("the model is built");
-    let mut cache = model.cache(backend).expect("the cache is allocated");
+    let mut cache = model
+        .cache(backend, NonZeroUsize::MIN)
+        .expect("the cache is allocated");
     let shape = |dims: &[usize]| Shape::try_from(dims).expect("the shape is valid");
 
     let token_ids = Tensor::upload(
@@ -223,6 +230,63 @@ fn llama_logprobs_match_mlx_on_smollm2_cpu() {
 #[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
 fn llama_logprobs_match_mlx_on_smollm2_metal() {
     llama_logprobs_match_mlx_on_smollm2(MetalBackend::new().expect("the Metal backend is created"));
+}
+
+fn llama_batch_generates_what_each_prompt_generates_alone<B: Backend>(mut backend: B) {
+    const PROMPTS: [[u32; 5]; 2] = [[504, 3575, 282, 4649, 314], [1, 9690, 198, 2683, 359]];
+    const MAX_NEW_TOKENS: usize = 4;
+
+    let directory = HFClientSync::new()
+        .expect("the Hugging Face client is created")
+        .model("HuggingFaceTB", "SmolLM2-135M-Instruct")
+        .snapshot_download()
+        .local_files_only(true)
+        .send()
+        .expect("HuggingFaceTB/SmolLM2-135M-Instruct is in the Hugging Face cache");
+    let config = LlamaConfig::open(&directory).expect("the config is valid");
+    let weights = Weights::open(&directory).expect("the safetensors files are valid");
+    let backend = &mut backend;
+    let llama_weights = LlamaWeights::load(backend, &config, &weights).expect("the weights load");
+    let model = Llama::new(backend, &config, llama_weights, 9).expect("the model is built");
+
+    let batch = generate(
+        backend,
+        &model,
+        &PROMPTS.each_ref().map(|prompt| prompt.as_slice()),
+        MAX_NEW_TOKENS,
+        &[],
+    )
+    .expect("the batch generates")
+    .token_ids;
+    let alone: Vec<Vec<u32>> = PROMPTS
+        .iter()
+        .flat_map(|prompt| {
+            generate(backend, &model, &[prompt.as_slice()], MAX_NEW_TOKENS, &[])
+                .expect("the prompt generates")
+                .token_ids
+        })
+        .collect();
+
+    assert_eq!(batch.len(), 2, "one row per prompt");
+    assert_eq!(
+        batch, alone,
+        "each row of the batch equals its prompt alone"
+    );
+}
+
+#[test]
+#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
+fn llama_batch_generates_what_each_prompt_generates_alone_cpu() {
+    llama_batch_generates_what_each_prompt_generates_alone(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs HuggingFaceTB/SmolLM2-135M-Instruct in the Hugging Face cache"]
+fn llama_batch_generates_what_each_prompt_generates_alone_metal() {
+    llama_batch_generates_what_each_prompt_generates_alone(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
 }
 
 fn llama_weights_load_every_tensor_once<B: Backend>(mut backend: B) {

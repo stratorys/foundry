@@ -17,6 +17,7 @@ const VLLM_PERCENTS: [u32; 6] = [10, 25, 50, 75, 90, 99];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenCounts {
+    pub batch_size: u32,
     pub prompt_count: u32,
     pub gen_count: u32,
     pub depth_count: u32,
@@ -158,7 +159,7 @@ pub fn run_ts(
     counts: TokenCounts,
 ) -> f64 {
     let token_count = f64::from(counts.prompt_count) + f64::from(counts.gen_count);
-    NS_PER_S * token_count / ns_to_f64(run.total_ns())
+    NS_PER_S * f64::from(counts.batch_size) * token_count / ns_to_f64(run.total_ns())
 }
 
 fn stdev_llama_cpp(samples: &[f64]) -> f64 {
@@ -178,12 +179,14 @@ fn mlx(
     prefills_ns: &[(u64, &RunSamples)],
     counts: TokenCounts,
 ) -> Result<Mlx, BenchError> {
+    let batch_size = f64::from(counts.batch_size);
     let trials = prefills_ns
         .iter()
         .map(|&(prefill_ns, run)| MlxTrial {
-            prompt_tps: f64::from(counts.prompt_count) / seconds(prefill_ns),
-            generation_tps: (counts.gen_count >= 2)
-                .then(|| f64::from(counts.gen_count) / seconds(sum_ns(after_first_token(run)))),
+            prompt_tps: batch_size * f64::from(counts.prompt_count) / seconds(prefill_ns),
+            generation_tps: (counts.gen_count >= 2).then(|| {
+                batch_size * f64::from(counts.gen_count) / seconds(sum_ns(after_first_token(run)))
+            }),
             peak_memory: run.peak_memory_bytes.map(gigabytes),
         })
         .collect::<Vec<MlxTrial>>();
@@ -211,6 +214,7 @@ fn sglang(
     prefills_ns: &[(u64, &RunSamples)],
     counts: TokenCounts,
 ) -> Sglang {
+    let batch_size = f64::from(counts.batch_size);
     let runs = prefills_ns
         .iter()
         .map(|&(prefill_ns, run)| {
@@ -224,11 +228,12 @@ fn sglang(
             let total_latency = prefill_latency + decode_latencies.iter().sum::<f64>();
             SglangRun {
                 prefill_latency,
-                prefill_throughput: f64::from(counts.prompt_count) / prefill_latency,
+                prefill_throughput: batch_size * f64::from(counts.prompt_count) / prefill_latency,
                 median_decode_latency,
-                median_decode_throughput: median_decode_latency.map(|latency| 1.0 / latency),
+                median_decode_throughput: median_decode_latency.map(|latency| batch_size / latency),
                 total_latency,
-                overall_throughput: (f64::from(counts.prompt_count) + f64::from(counts.gen_count))
+                overall_throughput: batch_size
+                    * (f64::from(counts.prompt_count) + f64::from(counts.gen_count))
                     / total_latency,
             }
         })
@@ -266,7 +271,7 @@ fn candle(
     prefills_ns: &[(u64, &RunSamples)],
     counts: TokenCounts,
 ) -> Candle {
-    let generated_after_first = f64::from(counts.gen_count) - 1.0;
+    let generated_after_first = f64::from(counts.batch_size) * (f64::from(counts.gen_count) - 1.0);
     Candle {
         tokens_per_s: prefills_ns
             .iter()
@@ -317,10 +322,11 @@ mod tests {
                 &RunSamples {
                     prefill_ns: Some(1_500_000_000),
                     decode_ns: vec![250_000_000, 250_000_000],
-                    token_ids: vec![1, 2, 3],
+                    token_ids: vec![vec![1, 2, 3]],
                     peak_memory_bytes: None,
                 },
                 TokenCounts {
+                    batch_size: 1,
                     prompt_count: 5,
                     gen_count: 2,
                     depth_count: 0,
@@ -337,13 +343,13 @@ mod tests {
             RunSamples {
                 prefill_ns: Some(1_000_000_000),
                 decode_ns: vec![250_000_000, 250_000_000, 500_000_000],
-                token_ids: vec![1, 2, 3, 4],
+                token_ids: vec![vec![1, 2, 3, 4]],
                 peak_memory_bytes: Some(2_000_000_000),
             },
             RunSamples {
                 prefill_ns: Some(500_000_000),
                 decode_ns: vec![125_000_000, 375_000_000, 1_000_000_000],
-                token_ids: vec![1, 2, 3, 4],
+                token_ids: vec![vec![1, 2, 3, 4]],
                 peak_memory_bytes: Some(4_000_000_000),
             },
         ];
@@ -351,6 +357,7 @@ mod tests {
             metrics(
                 &runs,
                 TokenCounts {
+                    batch_size: 1,
                     prompt_count: 4,
                     gen_count: 3,
                     depth_count: 0,
@@ -431,13 +438,14 @@ mod tests {
         let runs = [RunSamples {
             prefill_ns: Some(250_000_000),
             decode_ns: Vec::new(),
-            token_ids: vec![9],
+            token_ids: vec![vec![9]],
             peak_memory_bytes: None,
         }];
         assert_eq!(
             metrics(
                 &runs,
                 TokenCounts {
+                    batch_size: 1,
                     prompt_count: 2,
                     gen_count: 0,
                     depth_count: 3,
@@ -495,13 +503,13 @@ mod tests {
             RunSamples {
                 prefill_ns: None,
                 decode_ns: vec![500_000_000, 500_000_000],
-                token_ids: vec![1, 2],
+                token_ids: vec![vec![1, 2]],
                 peak_memory_bytes: None,
             },
             RunSamples {
                 prefill_ns: None,
                 decode_ns: vec![250_000_000, 250_000_000],
-                token_ids: vec![1, 2],
+                token_ids: vec![vec![1, 2]],
                 peak_memory_bytes: None,
             },
         ];
@@ -509,6 +517,7 @@ mod tests {
             metrics(
                 &runs,
                 TokenCounts {
+                    batch_size: 1,
                     prompt_count: 0,
                     gen_count: 2,
                     depth_count: 0,
@@ -532,6 +541,61 @@ mod tests {
                 candle: None,
             }),
             "no prefill, so only llama.cpp t/s applies"
+        );
+    }
+
+    #[test]
+    fn batch_multiplies_throughputs_and_keeps_latencies() {
+        let runs = [RunSamples {
+            prefill_ns: Some(1_000_000_000),
+            decode_ns: vec![250_000_000, 250_000_000, 500_000_000],
+            token_ids: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
+            peak_memory_bytes: None,
+        }];
+        let metrics = metrics(
+            &runs,
+            TokenCounts {
+                batch_size: 2,
+                prompt_count: 4,
+                gen_count: 3,
+                depth_count: 0,
+            },
+        )
+        .expect("the metrics are computed");
+        let mlx = metrics.mlx.expect("a prefill gives MLX metrics");
+        let sglang = metrics.sglang.expect("a prefill gives SGLang metrics");
+        let sglang_run = sglang.runs.first().expect("one SGLang run");
+        assert_eq!(
+            (
+                metrics.llama_cpp.avg_ts,
+                mlx.prompt_tps,
+                mlx.generation_tps,
+                sglang_run.prefill_throughput,
+                sglang_run.median_decode_throughput,
+                sglang_run.overall_throughput,
+                metrics.candle.map(|candle| candle.tokens_per_s),
+            ),
+            (
+                7.0,
+                8.0,
+                Some(12.0),
+                8.0,
+                Some(8.0),
+                14.0 / 1.5,
+                Some(vec![8.0]),
+            ),
+            "two sequences double every token throughput"
+        );
+        assert_eq!(
+            (
+                metrics.llama_cpp.avg_ns,
+                sglang_run.prefill_latency,
+                sglang_run.median_decode_latency,
+                sglang_run.total_latency,
+                metrics.vllm.map(|vllm| vllm.avg_latency),
+            ),
+            (2_000_000_000, 1.0, Some(0.25), 1.5, Some(1.5)),
+            "latencies are per batch step"
         );
     }
 }

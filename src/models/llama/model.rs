@@ -26,8 +26,8 @@ use crate::nn::{
 };
 
 const CACHE_DTYPE: DType = DType::BF16;
-const TOKEN_AXIS: usize = 0;
-const HEAD_MAJOR: [usize; 3] = [1, 0, 2];
+const SEQ_AXIS: usize = 1;
+const HEAD_MAJOR: [usize; 4] = [0, 2, 1, 3];
 
 pub struct Llama<B: Backend> {
     weights: LlamaWeights<B>,
@@ -43,6 +43,7 @@ struct ForwardStep<'input, B: Backend> {
     angles: RopeAngles<B>,
     mask: &'input Tensor<B>,
     position: usize,
+    batch_size: usize,
     seq_len: usize,
     seq_len_total: usize,
 }
@@ -82,6 +83,7 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
     fn cache(
         &self,
         backend: &mut B,
+        batch_size: NonZeroUsize,
     ) -> Result<Self::Cache, Self::Error> {
         self.weights
             .layers()
@@ -90,6 +92,7 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
                 KvCache::new(
                     backend,
                     CACHE_DTYPE,
+                    batch_size.get(),
                     self.kv_heads,
                     self.seq_len_max,
                     self.head_dim,
@@ -108,11 +111,22 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
         cache: &mut Self::Cache,
         position: usize,
     ) -> Result<Tensor<B>, Self::Error> {
-        let seq_len = token_ids.shape().element_count();
-        if seq_len == 0 {
+        let token_count = token_ids.shape().element_count();
+        if token_count == 0 {
             error!(message = "Forward input holds no token.");
             return Err(LlamaError::EmptyInput);
         }
+        let seq_len = positions.shape().element_count();
+        let Some(batch_size) = token_count
+            .checked_div(seq_len)
+            .filter(|batch_size| batch_size.checked_mul(seq_len) == Some(token_count))
+        else {
+            error!(
+                message = "Token count is not a multiple of the position count.",
+                token_count, seq_len,
+            );
+            return Err(LlamaError::BatchMismatch);
+        };
         let seq_len_total = position
             .checked_add(seq_len)
             .filter(|&seq_len_total| seq_len_total <= self.seq_len_max)
@@ -138,6 +152,7 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
             angles: self.rope.at(backend, positions)?,
             mask,
             position,
+            batch_size,
             seq_len,
             seq_len_total,
         };
@@ -161,11 +176,16 @@ impl<B: Backend> Llama<B> {
                 self.decoder_layer(backend, layer, layer_cache, &hidden, step)
             },
         )?;
-        let last = hidden.narrow(TOKEN_AXIS, step.seq_len.saturating_sub(1), 1)?;
+        let hidden_size = hidden.shape().dim(hidden.shape().last_axis()?)?;
+        let last = hidden
+            .reshape(Shape::try_from(
+                [step.batch_size, step.seq_len, hidden_size].as_slice(),
+            )?)?
+            .narrow(SEQ_AXIS, step.seq_len.saturating_sub(1), 1)?
+            .contiguous(backend)?
+            .reshape(Shape::try_from([step.batch_size, hidden_size].as_slice())?)?;
         let normed = self.weights.norm().forward(backend, &last)?;
-        let logits = self.weights.lm_head().forward(backend, &normed)?;
-        let vocab_size = logits.shape().element_count();
-        Ok(logits.reshape(Shape::try_from([vocab_size].as_slice())?)?)
+        self.weights.lm_head().forward(backend, &normed)
     }
 
     fn decoder_layer(
@@ -177,8 +197,11 @@ impl<B: Backend> Llama<B> {
         step: &ForwardStep<'_, B>,
     ) -> Result<Tensor<B>, TensorError<B::Error>> {
         let normed = layer.input_norm().forward(backend, hidden)?;
-        let query_shape = Shape::try_from([step.seq_len, self.heads, self.head_dim].as_slice())?;
-        let kv_shape = Shape::try_from([step.seq_len, self.kv_heads, self.head_dim].as_slice())?;
+        let query_shape =
+            Shape::try_from([step.batch_size, step.seq_len, self.heads, self.head_dim].as_slice())?;
+        let kv_shape = Shape::try_from(
+            [step.batch_size, step.seq_len, self.kv_heads, self.head_dim].as_slice(),
+        )?;
         let query_projected = layer
             .q_proj()
             .forward(backend, &normed)?

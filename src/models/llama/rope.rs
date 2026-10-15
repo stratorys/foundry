@@ -18,7 +18,7 @@ use crate::models::llama::{
 };
 
 const POSITION_COUNT_MAX: usize = 1 << f32::MANTISSA_DIGITS;
-const DIM_AXIS: usize = 2;
+const DIM_AXIS: usize = 3;
 
 pub struct LlamaRope<B: Backend> {
     cos: Tensor<B>,

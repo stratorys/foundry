@@ -62,6 +62,9 @@ pub enum LlamaError<E: std::error::Error + 'static> {
     #[error("Layer cache count does not match the layer count.")]
     CacheLayerCount,
 
+    #[error("Token count is not a multiple of the position count.")]
+    BatchMismatch,
+
     #[error("Tensor operation failed.")]
     Tensor(#[from] TensorError<E>),
 

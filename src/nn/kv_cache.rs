@@ -9,7 +9,7 @@ use crate::core::{
     TensorError,
 };
 
-const SEQ_AXIS: usize = 1;
+const SEQ_AXIS: usize = 2;
 
 pub struct KvCache<B: Backend> {
     keys: Tensor<B>,
@@ -20,11 +20,12 @@ impl<B: Backend> KvCache<B> {
     pub fn new(
         backend: &mut B,
         dtype: DType,
+        batch_size: usize,
         kv_heads: usize,
         seq_len_max: usize,
         head_dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        let shape = Shape::try_from([kv_heads, seq_len_max, head_dim].as_slice())?;
+        let shape = Shape::try_from([batch_size, kv_heads, seq_len_max, head_dim].as_slice())?;
         Ok(Self {
             keys: Tensor::zeros(backend, dtype, shape)?,
             values: Tensor::zeros(backend, dtype, shape)?,

@@ -12,6 +12,9 @@ pub enum BenchError {
     #[error("Benchmark step failed.")]
     Step,
 
+    #[error("Batch size does not fit in usize.")]
+    BatchSizeOverflow,
+
     #[error("Token position overflows usize.")]
     PositionOverflow,
 

@@ -16,7 +16,7 @@ use crate::nn::{
     softmax_last_axis,
 };
 
-const SEQ_AXIS: usize = 1;
+const SEQ_AXIS: usize = 2;
 
 pub struct Attention<B: Backend> {
     head_dim: NonZeroUsize,
@@ -25,6 +25,7 @@ pub struct Attention<B: Backend> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct AttentionDims {
+    batch: usize,
     heads: usize,
     kv_heads: usize,
     group: usize,
@@ -61,6 +62,7 @@ impl<B: Backend> Attention<B> {
         let keys = &cache.keys().narrow(SEQ_AXIS, 0, seq_len_total)?;
         let values = &cache.values().narrow(SEQ_AXIS, 0, seq_len_total)?;
         let AttentionDims {
+            batch,
             heads,
             kv_heads,
             group,
@@ -69,27 +71,43 @@ impl<B: Backend> Attention<B> {
             head_dim,
         } = attention_dims(self.head_dim, query.shape(), keys.shape(), values.shape())?;
         let rows = group.saturating_mul(seq_len);
-        let keys_t = keys.permute(&[0, 2, 1])?;
+        let keys_t = keys.permute(&[0, 1, 3, 2])?;
         let mask_f32 = mask.cast(backend, DType::F32)?;
         let scores = query
             .contiguous(backend)?
-            .reshape(Shape::try_from([kv_heads, rows, head_dim].as_slice())?)?
+            .reshape(Shape::try_from(
+                [batch, kv_heads, rows, head_dim].as_slice(),
+            )?)?
             .matmul(backend, &keys_t)?
             .reshape(Shape::try_from(
-                [kv_heads, group, seq_len, seq_len_total].as_slice(),
+                [
+                    batch.saturating_mul(kv_heads),
+                    group,
+                    seq_len,
+                    seq_len_total,
+                ]
+                .as_slice(),
             )?)?
             .cast(backend, DType::F32)?
             .mul(backend, &self.scale)?
             .add(backend, &mask_f32)?;
         Ok(softmax_last_axis(backend, &scores)?
             .cast(backend, query.dtype())?
-            .reshape(Shape::try_from([kv_heads, rows, seq_len_total].as_slice())?)?
+            .reshape(Shape::try_from(
+                [batch, kv_heads, rows, seq_len_total].as_slice(),
+            )?)?
             .matmul(backend, values)?
-            .reshape(Shape::try_from([heads, seq_len, head_dim].as_slice())?)?
-            .permute(&[1, 0, 2])?
+            .reshape(Shape::try_from(
+                [batch, heads, seq_len, head_dim].as_slice(),
+            )?)?
+            .permute(&[0, 2, 1, 3])?
             .contiguous(backend)?
             .reshape(Shape::try_from(
-                [seq_len, heads.saturating_mul(head_dim)].as_slice(),
+                [
+                    batch.saturating_mul(seq_len),
+                    heads.saturating_mul(head_dim),
+                ]
+                .as_slice(),
             )?)?)
     }
 }
@@ -109,15 +127,18 @@ fn attention_dims(
         );
         CoreError::AttentionIncompatible
     };
-    let &[heads, seq_len, head_dim] = query.dims() else {
+    let &[batch, heads, seq_len, head_dim] = query.dims() else {
         return Err(incompatible());
     };
-    let &[kv_heads, seq_len_total, key_head_dim] = keys.dims() else {
+    let &[key_batch, kv_heads, seq_len_total, key_head_dim] = keys.dims() else {
         return Err(incompatible());
     };
     let is_grouped = heads.checked_rem(kv_heads) == Some(0);
-    let is_compatible =
-        is_grouped && seq_len <= seq_len_total && head_dim == key_head_dim && keys == values;
+    let is_compatible = batch == key_batch
+        && is_grouped
+        && seq_len <= seq_len_total
+        && head_dim == key_head_dim
+        && keys == values;
     if !is_compatible {
         return Err(incompatible());
     }
@@ -130,6 +151,7 @@ fn attention_dims(
         return Err(CoreError::AttentionHeadDimMismatch);
     }
     Ok(AttentionDims {
+        batch,
         heads,
         kv_heads,
         group: heads.checked_div(kv_heads).ok_or_else(incompatible)?,
@@ -154,7 +176,7 @@ mod tests {
 
     #[test]
     fn attention_dims_computes_the_group() {
-        let [query, keys] = [[4, 1, 2], [2, 3, 2]]
+        let [query, keys] = [[2, 4, 1, 2], [2, 2, 3, 2]]
             .map(|dims| Shape::try_from(dims.as_slice()).expect("the shape is valid"));
         assert_eq!(
             attention_dims(
@@ -164,6 +186,7 @@ mod tests {
                 &keys,
             ),
             Ok(AttentionDims {
+                batch: 2,
                 heads: 4,
                 kv_heads: 2,
                 group: 2,
@@ -171,31 +194,31 @@ mod tests {
                 seq_len_total: 3,
                 head_dim: 2,
             }),
-            "four query heads share two key-value heads"
+            "in each of two sequences, four query heads share two key-value heads"
         );
     }
 
     #[test]
-    fn attention_dims_rejects_rank_other_than_three() {
-        assert_eq!(
-            attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
-                &Shape::try_from([4, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
-            ),
-            Err(CoreError::AttentionIncompatible),
-            "a rank 2 query"
-        );
+    fn attention_dims_rejects_rank_other_than_four() {
         assert_eq!(
             attention_dims(
                 NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
             ),
             Err(CoreError::AttentionIncompatible),
-            "rank 2 keys"
+            "a rank 3 query"
+        );
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible),
+            "rank 3 keys"
         );
     }
 
@@ -204,9 +227,9 @@ mod tests {
         assert_eq!(
             attention_dims(
                 NonZeroUsize::new(2).expect("the head dim is non-zero"),
-                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([0, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([0, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 0, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 0, 2, 2].as_slice()).expect("the shape is valid"),
             ),
             Err(CoreError::AttentionIncompatible),
             "zero key-value heads"
@@ -218,9 +241,9 @@ mod tests {
         assert_eq!(
             attention_dims(
                 NonZeroUsize::new(2).expect("the head dim is non-zero"),
-                &Shape::try_from([3, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 3, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
             ),
             Err(CoreError::AttentionIncompatible),
             "three query heads over two key-value heads"
@@ -232,9 +255,9 @@ mod tests {
         assert_eq!(
             attention_dims(
                 NonZeroUsize::new(2).expect("the head dim is non-zero"),
-                &Shape::try_from([4, 3, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 3, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
             ),
             Err(CoreError::AttentionIncompatible),
             "three query positions over two key positions"
@@ -246,9 +269,9 @@ mod tests {
         assert_eq!(
             attention_dims(
                 NonZeroUsize::new(2).expect("the head dim is non-zero"),
-                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 4].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 4].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 4].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 4].as_slice()).expect("the shape is valid"),
             ),
             Err(CoreError::AttentionIncompatible),
             "head dims 2 and 4 differ"
@@ -260,12 +283,26 @@ mod tests {
         assert_eq!(
             attention_dims(
                 NonZeroUsize::new(2).expect("the head dim is non-zero"),
-                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 3, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 3, 2].as_slice()).expect("the shape is valid"),
             ),
             Err(CoreError::AttentionIncompatible),
             "values hold one more position than keys"
+        );
+    }
+
+    #[test]
+    fn attention_dims_rejects_query_and_keys_of_different_batches() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(2).expect("the head dim is non-zero"),
+                &Shape::try_from([2, 4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionIncompatible),
+            "a query of two sequences over keys of one sequence"
         );
     }
 }

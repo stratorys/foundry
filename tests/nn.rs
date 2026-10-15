@@ -402,7 +402,7 @@ fn swiglu_mlp_matches_hand_computed_values_metal() {
 }
 
 fn kv_cache_update_beyond_capacity_is_rejected<B: Backend>(mut backend: B) {
-    let [key, value] = [[1, 3, 2], [1, 3, 2]].map(|dims| {
+    let [key, value] = [[1, 1, 3, 2], [1, 1, 3, 2]].map(|dims| {
         Tensor::zeros(
             &mut backend,
             DType::BF16,
@@ -410,7 +410,8 @@ fn kv_cache_update_beyond_capacity_is_rejected<B: Backend>(mut backend: B) {
         )
         .expect("the zeros succeed")
     });
-    let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 2, 2).expect("the cache is built");
+    let mut cache =
+        KvCache::new(&mut backend, DType::BF16, 1, 1, 2, 2).expect("the cache is built");
     assert!(
         matches!(
             cache.update(&mut backend, &key, &value, 0),
@@ -434,7 +435,7 @@ fn kv_cache_update_beyond_capacity_is_rejected_metal() {
 }
 
 fn kv_cache_update_rejects_keys_and_values_of_different_shapes<B: Backend>(mut backend: B) {
-    let [key, value] = [[1, 2, 2], [1, 1, 2]].map(|dims| {
+    let [key, value] = [[1, 1, 2, 2], [1, 1, 1, 2]].map(|dims| {
         Tensor::zeros(
             &mut backend,
             DType::BF16,
@@ -442,7 +443,8 @@ fn kv_cache_update_rejects_keys_and_values_of_different_shapes<B: Backend>(mut b
         )
         .expect("the zeros succeed")
     });
-    let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
+    let mut cache =
+        KvCache::new(&mut backend, DType::BF16, 1, 1, 4, 2).expect("the cache is built");
     assert!(
         matches!(
             cache.update(&mut backend, &key, &value, 0),
@@ -471,7 +473,7 @@ fn kv_cache_keeps_earlier_positions_across_updates<B: Backend>(mut backend: B) {
         key: T1,
         value: T2,
     }
-    let mut cache = KvCache::new(&mut backend, DType::F32, 1, 3, 2).expect("the cache is built");
+    let mut cache = KvCache::new(&mut backend, DType::F32, 1, 1, 3, 2).expect("the cache is built");
     [
         PositionKeyValueCase {
             position: 0,
@@ -499,7 +501,7 @@ fn kv_cache_keeps_earlier_positions_across_updates<B: Backend>(mut backend: B) {
                         .flat_map(|value| value.to_le_bytes())
                         .collect::<Vec<u8>>(),
                     DType::F32,
-                    Shape::try_from([1, 1, 2].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([1, 1, 1, 2].as_slice()).expect("the shape is valid"),
                 )
                 .expect("the upload succeeds")
             });
@@ -551,15 +553,15 @@ fn attention_matches_hand_computed_values<B: Backend>(mut backend: B) {
     let [query, key, value, mask] = [
         ValuesDimsCase {
             values: vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
-            dims: vec![2, 2, 2],
+            dims: vec![1, 2, 2, 2],
         },
         ValuesDimsCase {
             values: vec![1.0, 0.0, 0.0, 1.0],
-            dims: vec![1, 2, 2],
+            dims: vec![1, 1, 2, 2],
         },
         ValuesDimsCase {
             values: vec![1.0, 2.0, 3.0, 4.0],
-            dims: vec![1, 2, 2],
+            dims: vec![1, 1, 2, 2],
         },
         ValuesDimsCase {
             values: vec![0.0, f32::NEG_INFINITY, 0.0, 0.0],
@@ -585,7 +587,8 @@ fn attention_matches_hand_computed_values<B: Backend>(mut backend: B) {
             .expect("the cast succeeds")
         },
     );
-    let mut cache = KvCache::new(&mut backend, DType::BF16, 1, 4, 2).expect("the cache is built");
+    let mut cache =
+        KvCache::new(&mut backend, DType::BF16, 1, 1, 4, 2).expect("the cache is built");
     let attention = Attention::new(
         &mut backend,
         NonZeroUsize::new(2).expect("the head dim is non-zero"),
@@ -644,15 +647,15 @@ fn attention_decode_after_prefill_matches_full_prefill<B: Backend>(mut backend: 
             values: vec![
                 0.5_f32, -1.0, 1.0, 0.25, -0.5, 2.0, 1.0, 1.0, 0.0, -1.0, 1.5, 0.5,
             ],
-            dims: vec![2, 3, 2],
+            dims: vec![1, 2, 3, 2],
         },
         ValuesDimsCase {
             values: vec![1.0, 0.5, -1.0, 1.0, 0.25, -0.75],
-            dims: vec![1, 3, 2],
+            dims: vec![1, 1, 3, 2],
         },
         ValuesDimsCase {
             values: vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0],
-            dims: vec![1, 3, 2],
+            dims: vec![1, 1, 3, 2],
         },
         ValuesDimsCase {
             values: vec![
@@ -694,7 +697,7 @@ fn attention_decode_after_prefill_matches_full_prefill<B: Backend>(mut backend: 
     )
     .expect("the attention is built");
     let mut prefill_cache =
-        KvCache::new(&mut backend, DType::BF16, 1, 3, 2).expect("the cache is built");
+        KvCache::new(&mut backend, DType::BF16, 1, 1, 3, 2).expect("the cache is built");
     prefill_cache
         .update(&mut backend, &key, &value, 0)
         .expect("the cache update succeeds");
@@ -711,7 +714,7 @@ fn attention_decode_after_prefill_matches_full_prefill<B: Backend>(mut backend: 
         .map(|&chunk| f32::from_le_bytes(chunk))
         .collect();
     let mut step_cache =
-        KvCache::new(&mut backend, DType::BF16, 1, 3, 2).expect("the cache is built");
+        KvCache::new(&mut backend, DType::BF16, 1, 1, 3, 2).expect("the cache is built");
     let steps: Vec<f32> = (0_usize..3)
         .flat_map(|position| {
             let seq_len_total = position
@@ -724,7 +727,7 @@ fn attention_decode_after_prefill_matches_full_prefill<B: Backend>(mut backend: 
             )
             .expect("the zeros succeed");
             let [query, key, value] = [&query, &key, &value]
-                .map(|tensor| tensor.narrow(1, position, 1).expect("the narrow succeeds"));
+                .map(|tensor| tensor.narrow(2, position, 1).expect("the narrow succeeds"));
             step_cache
                 .update(&mut backend, &key, &value, position)
                 .expect("the cache update succeeds");
@@ -765,7 +768,7 @@ fn attention_decode_after_prefill_matches_full_prefill_metal() {
 }
 
 fn attention_rejects_a_head_dim_other_than_its_own<B: Backend>(mut backend: B) {
-    let [query, mask] = [&[2, 2, 2][..], &[2, 2]].map(|dims| {
+    let [query, mask] = [&[1, 2, 2, 2][..], &[2, 2]].map(|dims| {
         Tensor::zeros(
             &mut backend,
             DType::BF16,
@@ -773,7 +776,7 @@ fn attention_rejects_a_head_dim_other_than_its_own<B: Backend>(mut backend: B) {
         )
         .expect("the zeros succeed")
     });
-    let cache = KvCache::new(&mut backend, DType::BF16, 1, 2, 2).expect("the cache is built");
+    let cache = KvCache::new(&mut backend, DType::BF16, 1, 1, 2, 2).expect("the cache is built");
     let attention = Attention::new(
         &mut backend,
         NonZeroUsize::new(4).expect("the head dim is non-zero"),
@@ -799,6 +802,153 @@ fn attention_rejects_a_head_dim_other_than_its_own_cpu() {
 #[test]
 fn attention_rejects_a_head_dim_other_than_its_own_metal() {
     attention_rejects_a_head_dim_other_than_its_own(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn kv_cache_writes_each_sequence_in_its_own_rows<B: Backend>(mut backend: B) {
+    let mut cache = KvCache::new(&mut backend, DType::F32, 2, 1, 2, 2).expect("the cache is built");
+    let [key, value] = [[1.0_f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]].map(|values| {
+        Tensor::upload(
+            &mut backend,
+            &values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([2, 1, 1, 2].as_slice()).expect("the shape is valid"),
+        )
+        .expect("the upload succeeds")
+    });
+    cache
+        .update(&mut backend, &key, &value, 1)
+        .expect("the cache update succeeds");
+    let [keys, values] = [cache.keys(), cache.values()].map(|tensor| {
+        tensor
+            .download(&mut backend)
+            .expect("the download succeeds")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
+            .collect::<Vec<f32>>()
+    });
+    assert_eq!(
+        keys,
+        vec![0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0],
+        "position 1 of sequence 0, then position 1 of sequence 1"
+    );
+    assert_eq!(
+        values,
+        vec![0.0, 0.0, 5.0, 6.0, 0.0, 0.0, 7.0, 8.0],
+        "position 1 of sequence 0, then position 1 of sequence 1"
+    );
+}
+
+#[test]
+fn kv_cache_writes_each_sequence_in_its_own_rows_cpu() {
+    kv_cache_writes_each_sequence_in_its_own_rows(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kv_cache_writes_each_sequence_in_its_own_rows_metal() {
+    kv_cache_writes_each_sequence_in_its_own_rows(
+        MetalBackend::new().expect("the Metal backend is created"),
+    );
+}
+
+fn attention_of_a_batch_matches_each_sequence_alone<B: Backend>(mut backend: B) {
+    struct ValuesDimsCase<T0, T1> {
+        values: T0,
+        dims: T1,
+    }
+    let [query, key, value, causal_mask] = [
+        ValuesDimsCase {
+            values: vec![
+                0.5_f32, -1.0, 1.0, 0.25, -0.5, 2.0, 1.0, 1.0, 0.0, -1.0, 1.5, 0.5, -0.25, 0.75,
+                2.0, -1.5,
+            ],
+            dims: vec![2, 2, 2, 2],
+        },
+        ValuesDimsCase {
+            values: vec![1.0, 0.5, -1.0, 1.0, 0.25, -0.75, 1.5, 0.5],
+            dims: vec![2, 1, 2, 2],
+        },
+        ValuesDimsCase {
+            values: vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0, 0.5, 1.5],
+            dims: vec![2, 1, 2, 2],
+        },
+        ValuesDimsCase {
+            values: vec![0.0, f32::NEG_INFINITY, 0.0, 0.0],
+            dims: vec![2, 2],
+        },
+    ]
+    .map(
+        |ValuesDimsCase {
+             values,
+             dims,
+         }| {
+            Tensor::upload(
+                &mut backend,
+                &values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+            )
+            .expect("the upload succeeds")
+            .cast(&mut backend, DType::BF16)
+            .expect("the cast succeeds")
+        },
+    );
+    let attention = Attention::new(
+        &mut backend,
+        NonZeroUsize::new(2).expect("the head dim is non-zero"),
+    )
+    .expect("the attention is built");
+    let mut batch_cache =
+        KvCache::new(&mut backend, DType::BF16, 2, 1, 2, 2).expect("the cache is built");
+    batch_cache
+        .update(&mut backend, &key, &value, 0)
+        .expect("the cache update succeeds");
+    let batch = attention
+        .forward(&mut backend, &query, &batch_cache, 2, &causal_mask)
+        .expect("the batch attention succeeds");
+    assert_eq!(batch.shape().dims(), &[4, 4], "two tokens of two sequences");
+    let batch_bytes = batch.download(&mut backend).expect("the download succeeds");
+    let alone_bytes: Vec<u8> = (0_usize..2)
+        .flat_map(|sequence| {
+            let [query, key, value] = [&query, &key, &value]
+                .map(|tensor| tensor.narrow(0, sequence, 1).expect("the narrow succeeds"));
+            let mut cache =
+                KvCache::new(&mut backend, DType::BF16, 1, 1, 2, 2).expect("the cache is built");
+            cache
+                .update(&mut backend, &key, &value, 0)
+                .expect("the cache update succeeds");
+            attention
+                .forward(&mut backend, &query, &cache, 2, &causal_mask)
+                .expect("the attention succeeds")
+                .download(&mut backend)
+                .expect("the download succeeds")
+        })
+        .collect();
+    assert_eq!(
+        batch_bytes, alone_bytes,
+        "each sequence of the batch equals its attention alone, bit for bit"
+    );
+}
+
+#[test]
+fn attention_of_a_batch_matches_each_sequence_alone_cpu() {
+    attention_of_a_batch_matches_each_sequence_alone(CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn attention_of_a_batch_matches_each_sequence_alone_metal() {
+    attention_of_a_batch_matches_each_sequence_alone(
         MetalBackend::new().expect("the Metal backend is created"),
     );
 }

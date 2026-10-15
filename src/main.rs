@@ -104,8 +104,7 @@ enum Command {
         max_new_tokens: usize,
     },
     #[command(
-        about = "Benchmark prefill and greedy decode at batch 1 on random token IDs and write \
-                 report.json."
+        about = "Benchmark prefill and greedy decode on random token IDs and write report.json."
     )]
     Bench(BenchArgs),
 }
@@ -147,6 +146,12 @@ struct BenchArgs {
     warmup_ms: u64,
     #[arg(long, default_value = "10", help = "Number of measured runs.")]
     runs: NonZeroU32,
+    #[arg(
+        long,
+        default_value = "1",
+        help = "Sequences generated together, each with its own random prompt of the same length."
+    )]
+    batch_size: NonZeroU32,
     #[arg(long, default_value_t = 0, help = "Seed of the random token IDs.")]
     seed: u64,
     #[arg(long, help = "Directory that receives report.json.")]
@@ -394,16 +399,17 @@ fn run(
             max_new_tokens,
         ),
     }?;
+    let token_ids = generation.token_ids.concat();
     info!(
         message = "Generated tokens.",
         ?backend,
         prompt_tokens = prompt_ids.len(),
-        generated_tokens = generation.token_ids.len(),
+        generated_tokens = token_ids.len(),
         prefill_ms = %generation.prefill.as_millis(),
         decode_steps = generation.decode_steps.len(),
         decode_ms_total = %generation.decode_steps.iter().sum::<Duration>().as_millis(),
     );
-    write_token_ids(&mut std::io::stdout().lock(), &generation.token_ids).map_err(|error| {
+    write_token_ids(&mut std::io::stdout().lock(), &token_ids).map_err(|error| {
         error!(message = "Writing the token IDs to stdout failed.", %error);
         CliError::Output
     })
@@ -445,6 +451,7 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
         warmup_run_count: args.warmup_runs,
         warmup_ms: args.warmup_ms,
         run_count: args.runs,
+        batch_size: args.batch_size,
         seed: args.seed,
     };
     let (device, report) = match args.backend {
@@ -673,7 +680,7 @@ fn generate_on<B: Backend>(
     generate(
         backend,
         &llama,
-        prompt_ids,
+        &[prompt_ids],
         max_new_tokens,
         config.eos_token_ids(),
     )
@@ -1222,6 +1229,7 @@ mod tests {
                 warmup_runs: 1,
                 warmup_ms: 0,
                 runs: NonZeroU32::new(10).expect("10 is not zero"),
+                batch_size: NonZeroU32::MIN,
                 seed: 0,
                 out: PathBuf::from("reports"),
             })),
@@ -1230,7 +1238,39 @@ mod tests {
     }
 
     #[test]
-    fn bench_rejects_zero_runs_and_missing_arguments() {
+    fn bench_parses_the_batch_size() {
+        assert_eq!(
+            Cli::try_parse_from([
+                "foundry",
+                "bench",
+                "--model",
+                "a/b",
+                "--prompt-tokens",
+                "512",
+                "--gen-tokens",
+                "128",
+                "--batch-size",
+                "8",
+                "--out",
+                "reports",
+            ])
+            .map(|cli| match cli.command {
+                Command::Bench(args) => Some(args.batch_size),
+                Command::Inspect {
+                    ..
+                }
+                | Command::Run {
+                    ..
+                } => None,
+            })
+            .map_err(|error| error.kind()),
+            Ok(NonZeroU32::new(8)),
+            "a batch of eight sequences"
+        );
+    }
+
+    #[test]
+    fn bench_rejects_zero_runs_zero_batch_and_missing_arguments() {
         struct ArgsKindCase<T0, T1> {
             args: T0,
             kind: T1,
@@ -1248,6 +1288,10 @@ mod tests {
         [
             ArgsKindCase {
                 args: [base.as_slice(), &["--out", "r", "--runs", "0"]].concat(),
+                kind: ErrorKind::ValueValidation,
+            },
+            ArgsKindCase {
+                args: [base.as_slice(), &["--out", "r", "--batch-size", "0"]].concat(),
                 kind: ErrorKind::ValueValidation,
             },
             ArgsKindCase {

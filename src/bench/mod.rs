@@ -65,6 +65,7 @@ pub struct BenchConfig {
     pub warmup_run_count: u32,
     pub warmup_ms: u64,
     pub run_count: NonZeroU32,
+    pub batch_size: NonZeroU32,
     pub seed: u64,
 }
 
@@ -80,7 +81,7 @@ pub enum Mode {
 pub struct RunSamples {
     pub prefill_ns: Option<u64>,
     pub decode_ns: Vec<u64>,
-    pub token_ids: Vec<u32>,
+    pub token_ids: Vec<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
 }
@@ -89,10 +90,10 @@ pub struct RunSamples {
 pub struct Report {
     pub config: BenchConfig,
     pub mode: Mode,
-    pub depth_ids: Vec<u32>,
-    pub prompt_ids: Vec<u32>,
+    pub depth_ids: Vec<Vec<u32>>,
+    pub prompt_ids: Vec<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_id: Option<u32>,
+    pub start_ids: Option<Vec<u32>>,
     pub warmup_run_count: u32,
     pub runs: Vec<RunSamples>,
     pub stats: Stats,
@@ -114,9 +115,10 @@ pub struct Stats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Inputs {
-    depth_ids: Vec<u32>,
-    prompt_ids: Vec<u32>,
-    start_id: Option<u32>,
+    batch_size: NonZeroUsize,
+    depth_ids: Vec<Vec<u32>>,
+    prompt_ids: Vec<Vec<u32>>,
+    start_ids: Option<Vec<u32>>,
     gen_token_count: usize,
 }
 
@@ -153,6 +155,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
     let mode = Mode::try_from(config)?;
     let inputs = draw_inputs(config, mode, vocab_size)?;
     let counts = TokenCounts {
+        batch_size: config.batch_size.get(),
         prompt_count: config.prompt_token_count,
         gen_count: config.gen_token_count,
         depth_count: config.depth_token_count,
@@ -166,6 +169,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
         warmup_runs = config.warmup_run_count,
         warmup_ms = config.warmup_ms,
         runs = config.run_count.get(),
+        batch_size = config.batch_size.get(),
         seed = config.seed,
     );
     let warmup_start = Instant::now();
@@ -211,7 +215,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
         mode,
         depth_ids: inputs.depth_ids,
         prompt_ids: inputs.prompt_ids,
-        start_id: inputs.start_id,
+        start_ids: inputs.start_ids,
         warmup_run_count,
         runs,
         stats,
@@ -226,21 +230,31 @@ fn draw_inputs(
     mode: Mode,
     vocab_size: NonZeroU32,
 ) -> Result<Inputs, BenchError> {
+    let batch_size = NonZeroUsize::try_from(config.batch_size).map_err(|_| {
+        error!(
+            message = "Batch size does not fit in usize.",
+            batch_size = config.batch_size.get()
+        );
+        BenchError::BatchSizeOverflow
+    })?;
     let mut rng = SplitMix64::new(config.seed);
-    let depth_ids = token_ids(&mut rng, token_count(config.depth_token_count)?, vocab_size)?;
-    let prompt_ids = token_ids(
-        &mut rng,
-        token_count(config.prompt_token_count)?,
-        vocab_size,
-    )?;
-    let start_id = match mode {
-        Mode::Tg => Some(token_id(&mut rng, vocab_size)?),
+    let mut rows = |count: u32| {
+        let token_count = token_count(count)?;
+        (0..batch_size.get())
+            .map(|_| token_ids(&mut rng, token_count, vocab_size))
+            .collect::<Result<Vec<Vec<u32>>, BenchError>>()
+    };
+    let depth_ids = rows(config.depth_token_count)?;
+    let prompt_ids = rows(config.prompt_token_count)?;
+    let start_ids = match mode {
+        Mode::Tg => Some(token_ids(&mut rng, batch_size.get(), vocab_size)?),
         Mode::Pp | Mode::Pg => None,
     };
     Ok(Inputs {
+        batch_size,
         depth_ids,
         prompt_ids,
-        start_id,
+        start_ids,
         gen_token_count: token_count(config.gen_token_count)?,
     })
 }
@@ -278,34 +292,37 @@ fn run<B: Backend, M: CausalLm<B>>(
     model: &M,
     inputs: &Inputs,
 ) -> Result<RunSamples, BenchError> {
-    let mut decoder = Decoder::new(backend, model).map_err(|error| {
+    let mut decoder = Decoder::new(backend, model, inputs.batch_size).map_err(|error| {
         error!(message = "Creating the decoder failed.", %error);
         BenchError::Decoder
     })?;
-    if !inputs.depth_ids.is_empty() {
-        step(&mut decoder, &inputs.depth_ids, 0)?;
+    let depth_ids = inputs.depth_ids.concat();
+    if !depth_ids.is_empty() {
+        step(&mut decoder, &depth_ids, 0)?;
     }
-    let mut position = inputs.depth_ids.len();
-    let mut token_ids = Vec::with_capacity(inputs.gen_token_count.saturating_add(1));
-    let (prefill_ns, mut token) =
-        match (NonZeroUsize::new(inputs.prompt_ids.len()), inputs.start_id) {
-            (Some(prompt_len), _) => {
-                let (token, prefill_ns) = timed_step(&mut decoder, &inputs.prompt_ids, position)?;
-                token_ids.push(token);
-                position = advance(position, prompt_len.get())?;
-                (Some(prefill_ns), token)
-            }
-            (None, Some(start_id)) => (None, start_id),
-            (None, None) => {
-                error!(message = "Benchmark holds neither prompt nor start token.");
-                return Err(BenchError::NoToken);
-            }
-        };
+    let mut position = inputs.depth_ids.first().map_or(0, Vec::len);
+    let mut token_ids =
+        vec![Vec::with_capacity(inputs.gen_token_count.saturating_add(1)); inputs.batch_size.get()];
+    let prompt_ids = inputs.prompt_ids.concat();
+    let prompt_len = inputs.prompt_ids.first().map_or(0, Vec::len);
+    let (prefill_ns, mut tokens) = match (NonZeroUsize::new(prompt_len), &inputs.start_ids) {
+        (Some(prompt_len), _) => {
+            let (tokens, prefill_ns) = timed_step(&mut decoder, &prompt_ids, position)?;
+            push_tokens(&mut token_ids, &tokens);
+            position = advance(position, prompt_len.get())?;
+            (Some(prefill_ns), tokens)
+        }
+        (None, Some(start_ids)) => (None, start_ids.clone()),
+        (None, None) => {
+            error!(message = "Benchmark holds neither prompt nor start token.");
+            return Err(BenchError::NoToken);
+        }
+    };
     let decode_ns = (0..inputs.gen_token_count)
         .map(|_| {
-            let (next_token, step_ns) = timed_step(&mut decoder, &[token], position)?;
-            token = next_token;
-            token_ids.push(next_token);
+            let (next_tokens, step_ns) = timed_step(&mut decoder, &tokens, position)?;
+            push_tokens(&mut token_ids, &next_tokens);
+            tokens = next_tokens;
             position = advance(position, 1)?;
             Ok(step_ns)
         })
@@ -318,13 +335,23 @@ fn run<B: Backend, M: CausalLm<B>>(
     })
 }
 
+fn push_tokens(
+    token_ids: &mut [Vec<u32>],
+    tokens: &[u32],
+) {
+    token_ids
+        .iter_mut()
+        .zip(tokens)
+        .for_each(|(row, &token)| row.push(token));
+}
+
 fn timed_step<B: Backend, M: CausalLm<B>>(
     decoder: &mut Decoder<'_, B, M>,
     token_ids: &[u32],
     position: usize,
-) -> Result<(u32, u64), BenchError> {
+) -> Result<(Vec<u32>, u64), BenchError> {
     let start = Instant::now();
-    let token = step(decoder, token_ids, position)?;
+    let tokens = step(decoder, token_ids, position)?;
     let elapsed = start.elapsed();
     let elapsed_ns = u64::try_from(elapsed.as_nanos()).map_err(|_| {
         error!(
@@ -333,19 +360,19 @@ fn timed_step<B: Backend, M: CausalLm<B>>(
         );
         BenchError::DurationOverflow
     })?;
-    Ok((token, elapsed_ns))
+    Ok((tokens, elapsed_ns))
 }
 
 fn step<B: Backend, M: CausalLm<B>>(
     decoder: &mut Decoder<'_, B, M>,
     token_ids: &[u32],
     position: usize,
-) -> Result<u32, BenchError> {
+) -> Result<Vec<u32>, BenchError> {
     decoder.step(token_ids, position).map_err(|error| {
         error!(
             message = "Benchmark step failed.",
             position,
-            seq_len = token_ids.len(),
+            token_count = token_ids.len(),
             %error,
         );
         BenchError::Step
@@ -392,7 +419,10 @@ fn stats(runs: &[RunSamples]) -> Result<Stats, BenchError> {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::num::{
+        NonZeroU32,
+        NonZeroUsize,
+    };
 
     use crate::backend::cpu::{
         CpuBackend,
@@ -425,6 +455,7 @@ mod tests {
         fn cache(
             &self,
             _backend: &mut CpuBackend,
+            _batch_size: NonZeroUsize,
         ) -> Result<Self::Cache, Self::Error> {
             Ok(())
         }
@@ -433,17 +464,27 @@ mod tests {
             &self,
             backend: &mut CpuBackend,
             token_ids: &Tensor<CpuBackend>,
-            _positions: &Tensor<CpuBackend>,
+            positions: &Tensor<CpuBackend>,
             _mask: &Tensor<CpuBackend>,
             _cache: &mut Self::Cache,
             position: usize,
         ) -> Result<Tensor<CpuBackend>, Self::Error> {
-            let seq_len_total = position.saturating_add(token_ids.shape().element_count());
-            let logits = (0..VOCAB_SIZE)
-                .map(|token_id| f32::from(u8::from(token_id == seq_len_total)))
+            let seq_len = positions.shape().element_count();
+            let batch_size = token_ids
+                .shape()
+                .element_count()
+                .checked_div(seq_len)
+                .expect("the step holds at least one position");
+            let seq_len_total = position.saturating_add(seq_len);
+            let logits = (0..batch_size)
+                .flat_map(|sequence| {
+                    (0..VOCAB_SIZE).map(move |token_id| {
+                        f32::from(u8::from(token_id == seq_len_total.saturating_add(sequence)))
+                    })
+                })
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<u8>>();
-            let shape = Shape::try_from([VOCAB_SIZE].as_slice())?;
+            let shape = Shape::try_from([batch_size, VOCAB_SIZE].as_slice())?;
             Tensor::upload(backend, &logits, DType::F32, shape)
         }
     }
@@ -455,6 +496,7 @@ mod tests {
         warmup_run_count: 2,
         warmup_ms: 0,
         run_count: NonZeroU32::MIN.saturating_add(2),
+        batch_size: NonZeroU32::MIN,
         seed: 7,
     };
 
@@ -506,7 +548,7 @@ mod tests {
             config: BenchConfig,
             mode: Mode,
             prefill: bool,
-            token_ids: Vec<u32>,
+            token_ids: Vec<Vec<u32>>,
         }
         [
             ConfigShapeCase {
@@ -518,7 +560,7 @@ mod tests {
                 },
                 mode: Mode::Pp,
                 prefill: true,
-                token_ids: vec![5],
+                token_ids: vec![vec![5]],
             },
             ConfigShapeCase {
                 config: BenchConfig {
@@ -529,7 +571,19 @@ mod tests {
                 },
                 mode: Mode::Tg,
                 prefill: false,
-                token_ids: vec![3, 4, 5],
+                token_ids: vec![vec![3, 4, 5]],
+            },
+            ConfigShapeCase {
+                config: BenchConfig {
+                    prompt_token_count: 0,
+                    gen_token_count: 3,
+                    depth_token_count: 2,
+                    batch_size: NonZeroU32::MIN.saturating_add(1),
+                    ..CONFIG
+                },
+                mode: Mode::Tg,
+                prefill: false,
+                token_ids: vec![vec![3, 4, 5], vec![4, 5, 6]],
             },
             ConfigShapeCase {
                 config: BenchConfig {
@@ -540,7 +594,19 @@ mod tests {
                 },
                 mode: Mode::Pg,
                 prefill: true,
-                token_ids: vec![5, 6, 7],
+                token_ids: vec![vec![5, 6, 7]],
+            },
+            ConfigShapeCase {
+                config: BenchConfig {
+                    prompt_token_count: 3,
+                    gen_token_count: 2,
+                    depth_token_count: 2,
+                    batch_size: NonZeroU32::MIN.saturating_add(1),
+                    ..CONFIG
+                },
+                mode: Mode::Pg,
+                prefill: true,
+                token_ids: vec![vec![5, 6, 7], vec![6, 7, 8]],
             },
         ]
         .into_iter()
@@ -560,22 +626,33 @@ mod tests {
                 .expect("the benchmark runs");
                 let decode_step_count =
                     usize::try_from(config.gen_token_count).expect("u32 fits in usize");
+                let batch_size =
+                    usize::try_from(config.batch_size.get()).expect("u32 fits in usize");
+                let prompt_len = usize::try_from(config.prompt_token_count).expect("fits");
                 assert_eq!(
                     (
                         report.mode,
                         report.warmup_run_count,
-                        report.depth_ids.len(),
-                        report.prompt_ids.len(),
-                        report.start_id.is_some(),
+                        report
+                            .depth_ids
+                            .iter()
+                            .map(Vec::len)
+                            .collect::<Vec<usize>>(),
+                        report
+                            .prompt_ids
+                            .iter()
+                            .map(Vec::len)
+                            .collect::<Vec<usize>>(),
+                        report.start_ids.as_ref().map(Vec::len),
                         report.peak_memory_bytes,
                         report.peak_memory_source,
                     ),
                     (
                         mode,
                         2,
-                        2,
-                        usize::try_from(config.prompt_token_count).expect("fits"),
-                        mode == Mode::Tg,
+                        vec![2; batch_size],
+                        vec![prompt_len; batch_size],
+                        (mode == Mode::Tg).then_some(batch_size),
                         None,
                         None,
                     ),
@@ -591,7 +668,8 @@ mod tests {
                             run.peak_memory_bytes,
                         ),
                         (prefill, decode_step_count, &token_ids, None),
-                        "each token is the cache length after its step in {mode:?}"
+                        "each token is the cache length after its step plus the sequence index in \
+                         {mode:?}"
                     );
                 });
             },
