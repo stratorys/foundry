@@ -2,6 +2,7 @@ mod backend;
 mod dtype;
 mod error;
 mod layout;
+mod memory;
 pub mod primitive;
 mod shape;
 mod tensor;
@@ -18,6 +19,10 @@ pub use self::error::{
     TensorError,
 };
 pub use self::layout::Layout;
+pub use self::memory::{
+    PeakMemory,
+    PeakMemorySource,
+};
 pub use self::shape::{
     RANK_MAX,
     Shape,

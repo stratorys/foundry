@@ -15,6 +15,9 @@ pub enum MetalError {
     #[error("Metal buffer allocation failed.")]
     BufferAllocation,
 
+    #[error("Metal allocated size does not fit in u64.")]
+    AllocatedSizeOverflow,
+
     #[error("Metal command buffer creation failed.")]
     CommandBufferCreation,
 

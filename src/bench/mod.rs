@@ -47,7 +47,10 @@ use self::stats::{
     mean,
     ns_to_f64,
 };
-use crate::core::Backend;
+use crate::core::{
+    Backend,
+    PeakMemorySource,
+};
 use crate::generate::{
     CausalLm,
     Decoder,
@@ -79,6 +82,8 @@ pub struct RunSamples {
     pub prefill_ns: Option<u64>,
     pub decode_ns: Vec<u64>,
     pub token_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -93,6 +98,10 @@ pub struct Report {
     pub runs: Vec<RunSamples>,
     pub stats: Stats,
     pub metrics: Metrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_memory_source: Option<PeakMemorySource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -197,6 +206,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
         .collect::<Result<Vec<RunSamples>, BenchError>>()?;
     let stats = stats(&runs)?;
     let metrics = metrics(&runs, counts)?;
+    let peak_memory = backend.peak_memory();
     Ok(Report {
         config: *config,
         mode,
@@ -207,6 +217,8 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
         runs,
         stats,
         metrics,
+        peak_memory_bytes: peak_memory.map(|peak_memory| peak_memory.bytes),
+        peak_memory_source: peak_memory.map(|peak_memory| peak_memory.source),
     })
 }
 
@@ -278,6 +290,7 @@ fn run<B: Backend, M: CausalLm<B>>(
         prefill_ns,
         decode_ns,
         token_ids,
+        peak_memory_bytes: backend.peak_memory().map(|peak_memory| peak_memory.bytes),
     })
 }
 
@@ -528,13 +541,17 @@ mod tests {
                         report.depth_ids.len(),
                         report.prompt_ids.len(),
                         report.start_id.is_some(),
+                        report.peak_memory_bytes,
+                        report.peak_memory_source,
                     ),
                     (
                         mode,
                         2,
                         2,
                         usize::try_from(config.prompt_token_count).expect("fits"),
-                        mode == Mode::Tg
+                        mode == Mode::Tg,
+                        None,
+                        None,
                     ),
                     "inputs of {mode:?}"
                 );
@@ -544,9 +561,10 @@ mod tests {
                         (
                             run.prefill_ns.is_some(),
                             run.decode_ns.len(),
-                            &run.token_ids
+                            &run.token_ids,
+                            run.peak_memory_bytes,
                         ),
-                        (prefill, decode_step_count, &token_ids),
+                        (prefill, decode_step_count, &token_ids, None),
                         "each token is the cache length after its step in {mode:?}"
                     );
                 });

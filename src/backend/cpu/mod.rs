@@ -28,6 +28,7 @@ use crate::core::{
     Layout,
     Operand,
     OperandMut,
+    PeakMemory,
 };
 
 const CPU_NAME_FALLBACK: &str = "CPU";
@@ -67,6 +68,8 @@ impl Backend for CpuBackend {
             CPU_NAME_FALLBACK.to_owned()
         })
     }
+
+    fn peak_memory(&self) -> Option<PeakMemory> { None }
 
     fn upload(
         &mut self,
@@ -607,6 +610,7 @@ mod tests {
         field_value,
     };
     use crate::core::{
+        Backend,
         CoreError,
         DType,
         Shape,
@@ -653,6 +657,17 @@ mod tests {
              }| {
                 assert_eq!(field_value(text, key), expected, "key {key:?} in {text:?}");
             },
+        );
+    }
+
+    #[test]
+    fn peak_memory_is_none() {
+        let mut backend = CpuBackend::new();
+        backend.upload(&[0; 16]).expect("upload succeeds");
+        assert_eq!(
+            backend.peak_memory(),
+            None,
+            "the CPU backend tracks no memory"
         );
     }
 

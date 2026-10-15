@@ -12,6 +12,7 @@ use crate::bench::stats::{
 };
 
 const NS_PER_S: f64 = 1e9;
+const BYTES_PER_GB: f64 = 1e9;
 const VLLM_PERCENTS: [u32; 6] = [10, 25, 50, 75, 90, 99];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,8 @@ pub struct Mlx {
     pub prompt_tps: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_tps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_memory: Option<f64>,
     pub trials: Vec<MlxTrial>,
 }
 
@@ -60,6 +63,8 @@ pub struct MlxTrial {
     pub prompt_tps: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_tps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_memory: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -179,6 +184,7 @@ fn mlx(
             prompt_tps: f64::from(counts.prompt_count) / seconds(prefill_ns),
             generation_tps: (counts.gen_count >= 2)
                 .then(|| f64::from(counts.gen_count) / seconds(sum_ns(after_first_token(run)))),
+            peak_memory: run.peak_memory_bytes.map(gigabytes),
         })
         .collect::<Vec<MlxTrial>>();
     let prompt_tps = trials
@@ -189,9 +195,14 @@ fn mlx(
         .iter()
         .map(|trial| trial.generation_tps)
         .collect::<Option<Vec<f64>>>();
+    let peak_memory = trials
+        .iter()
+        .map(|trial| trial.peak_memory)
+        .collect::<Option<Vec<f64>>>();
     Ok(Mlx {
         prompt_tps: mean(&prompt_tps).ok_or(BenchError::NoSample)?,
         generation_tps: generation_tps.as_deref().and_then(mean),
+        peak_memory: peak_memory.as_deref().and_then(mean),
         trials,
     })
 }
@@ -278,6 +289,8 @@ pub fn sum_ns(samples_ns: &[u64]) -> u64 {
 
 fn seconds(ns: u64) -> f64 { ns_to_f64(ns) / NS_PER_S }
 
+fn gigabytes(bytes: u64) -> f64 { ns_to_f64(bytes) / BYTES_PER_GB }
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -305,6 +318,7 @@ mod tests {
                     prefill_ns: Some(1_500_000_000),
                     decode_ns: vec![250_000_000, 250_000_000],
                     token_ids: vec![1, 2, 3],
+                    peak_memory_bytes: None,
                 },
                 TokenCounts {
                     prompt_count: 5,
@@ -324,11 +338,13 @@ mod tests {
                 prefill_ns: Some(1_000_000_000),
                 decode_ns: vec![250_000_000, 250_000_000, 500_000_000],
                 token_ids: vec![1, 2, 3, 4],
+                peak_memory_bytes: Some(2_000_000_000),
             },
             RunSamples {
                 prefill_ns: Some(500_000_000),
                 decode_ns: vec![125_000_000, 375_000_000, 1_000_000_000],
                 token_ids: vec![1, 2, 3, 4],
+                peak_memory_bytes: Some(4_000_000_000),
             },
         ];
         assert_eq!(
@@ -355,14 +371,17 @@ mod tests {
                 mlx: Some(Mlx {
                     prompt_tps: 6.0,
                     generation_tps: Some(6.0),
+                    peak_memory: Some(3.0),
                     trials: vec![
                         MlxTrial {
                             prompt_tps: 4.0,
                             generation_tps: Some(6.0),
+                            peak_memory: Some(2.0),
                         },
                         MlxTrial {
                             prompt_tps: 8.0,
                             generation_tps: Some(6.0),
+                            peak_memory: Some(4.0),
                         },
                     ],
                 }),
@@ -402,7 +421,8 @@ mod tests {
                     tokens_per_s: vec![4.0, 4.0],
                 }),
             }),
-            "prefill and three decode steps; the other engines skip the last step"
+            "prefill and three decode steps; the other engines skip the last step; peak memory in \
+             GB"
         );
     }
 
@@ -412,6 +432,7 @@ mod tests {
             prefill_ns: Some(250_000_000),
             decode_ns: Vec::new(),
             token_ids: vec![9],
+            peak_memory_bytes: None,
         }];
         assert_eq!(
             metrics(
@@ -437,9 +458,11 @@ mod tests {
                 mlx: Some(Mlx {
                     prompt_tps: 8.0,
                     generation_tps: None,
+                    peak_memory: None,
                     trials: vec![MlxTrial {
                         prompt_tps: 8.0,
                         generation_tps: None,
+                        peak_memory: None,
                     }],
                 }),
                 sglang: Some(Sglang {
@@ -462,7 +485,7 @@ mod tests {
                 }),
                 candle: None,
             }),
-            "prefill only"
+            "prefill only; no backend peak memory"
         );
     }
 
@@ -473,11 +496,13 @@ mod tests {
                 prefill_ns: None,
                 decode_ns: vec![500_000_000, 500_000_000],
                 token_ids: vec![1, 2],
+                peak_memory_bytes: None,
             },
             RunSamples {
                 prefill_ns: None,
                 decode_ns: vec![250_000_000, 250_000_000],
                 token_ids: vec![1, 2],
+                peak_memory_bytes: None,
             },
         ];
         assert_eq!(

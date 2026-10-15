@@ -13,6 +13,7 @@ use crate::core::{
     FloatDType,
     Operand,
     OperandMut,
+    PeakMemory,
 };
 
 pub trait Backend {
@@ -20,6 +21,8 @@ pub trait Backend {
     type Error: Error + 'static;
 
     fn device_name(&self) -> String;
+
+    fn peak_memory(&self) -> Option<PeakMemory>;
 
     fn upload(
         &mut self,

@@ -491,6 +491,8 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
         llama_cpp_avg_ts = record.report.metrics.llama_cpp.avg_ts,
         mlx_prompt_tps = ?record.report.metrics.mlx.as_ref().map(|mlx| mlx.prompt_tps),
         mlx_generation_tps = ?record.report.metrics.mlx.as_ref().and_then(|mlx| mlx.generation_tps),
+        peak_memory_bytes = ?record.report.peak_memory_bytes,
+        peak_memory_source = ?record.report.peak_memory_source,
         report = %report_path.display(),
     );
     Ok(())

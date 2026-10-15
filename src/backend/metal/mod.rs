@@ -42,6 +42,8 @@ use crate::core::{
     Layout,
     Operand,
     OperandMut,
+    PeakMemory,
+    PeakMemorySource,
     RANK_MAX,
     Shape,
 };
@@ -82,6 +84,8 @@ pub struct MetalBackend {
     library: Library,
     pipelines: HashMap<&'static str, Pipeline>,
     stream: CommandStream,
+    allocated_bytes_baseline: u64,
+    allocated_bytes_peak: u64,
 }
 
 struct BufferView<'buffer> {
@@ -260,16 +264,19 @@ impl MetalBackend {
                 );
                 MetalError::LibraryCompilation
             })?;
+        let allocated_bytes_baseline = allocated_bytes(&device)?;
         Ok(Self {
             device,
             library,
             pipelines: HashMap::new(),
             stream: CommandStream::new(queue),
+            allocated_bytes_baseline,
+            allocated_bytes_peak: allocated_bytes_baseline,
         })
     }
 
     fn allocate(
-        &self,
+        &mut self,
         byte_len: usize,
     ) -> Result<MetalStorage, MetalError> {
         let bytes_max = self.device.maxBufferLength();
@@ -294,6 +301,9 @@ impl MetalBackend {
                 );
                 MetalError::BufferAllocation
             })?;
+        self.allocated_bytes_peak = self
+            .allocated_bytes_peak
+            .max(allocated_bytes(&self.device)?);
         Ok(MetalStorage {
             buffer,
             byte_len,
@@ -704,6 +714,15 @@ impl Backend for MetalBackend {
 
     fn device_name(&self) -> String { self.device.name().to_string() }
 
+    fn peak_memory(&self) -> Option<PeakMemory> {
+        Some(PeakMemory {
+            bytes: self
+                .allocated_bytes_peak
+                .saturating_sub(self.allocated_bytes_baseline),
+            source: PeakMemorySource::MetalCurrentAllocatedSize,
+        })
+    }
+
     fn upload(
         &mut self,
         bytes: &[u8],
@@ -1070,6 +1089,17 @@ fn copied_view<'buffer>(
     }
 }
 
+fn allocated_bytes(device: &Device) -> Result<u64, MetalError> {
+    let allocated_bytes = device.currentAllocatedSize();
+    u64::try_from(allocated_bytes).map_err(|_| {
+        error!(
+            message = "Metal allocated size does not fit in u64.",
+            allocated_bytes
+        );
+        MetalError::AllocatedSizeOverflow
+    })
+}
+
 fn index_u32(value: usize) -> Result<u32, MetalError> {
     u32::try_from(value).map_err(|_| {
         error!(
@@ -1109,6 +1139,7 @@ mod tests {
         Backend,
         CoreError,
         DType,
+        PeakMemorySource,
         Shape,
         Tensor,
         TensorError,
@@ -1118,6 +1149,33 @@ mod tests {
     fn device_name_is_not_empty() {
         let backend = MetalBackend::new().expect("a Metal device is available");
         assert_ne!(backend.device_name(), "", "the Metal device has a name");
+    }
+
+    #[test]
+    fn peak_memory_counts_an_upload_and_never_decreases() {
+        let byte_len = 1 << 20;
+        let mut backend = MetalBackend::new().expect("a Metal device is available");
+        let storage = backend.upload(&vec![0; byte_len]).expect("upload succeeds");
+        let peak = backend.peak_memory().expect("Metal tracks peak memory");
+        assert_eq!(
+            peak.source,
+            PeakMemorySource::MetalCurrentAllocatedSize,
+            "Metal reads the device allocated size"
+        );
+        assert!(
+            peak.bytes >= u64::try_from(byte_len).expect("the length fits in u64"),
+            "peak {} bytes covers the {byte_len} uploaded bytes",
+            peak.bytes
+        );
+        drop(storage);
+        backend.zeros(16).expect("zeros succeeds");
+        let peak_after_free = backend.peak_memory().expect("Metal tracks peak memory");
+        assert!(
+            peak_after_free.bytes >= peak.bytes,
+            "peak {} bytes does not fall below {} bytes after a free",
+            peak_after_free.bytes,
+            peak.bytes
+        );
     }
 
     #[test]
