@@ -1,7 +1,6 @@
 mod error;
 mod metadata;
 mod metrics;
-mod rng;
 mod stats;
 
 use std::num::{
@@ -41,7 +40,6 @@ use self::metrics::{
     run_ts,
     sum_ns,
 };
-use self::rng::SplitMix64;
 pub use self::stats::Summary;
 use self::stats::{
     mean,
@@ -50,6 +48,7 @@ use self::stats::{
 use crate::core::{
     Backend,
     PeakMemorySource,
+    SplitMix64,
 };
 use crate::generate::{
     CausalLm,
@@ -228,10 +227,14 @@ fn draw_inputs(
     vocab_size: NonZeroU32,
 ) -> Result<Inputs, BenchError> {
     let mut rng = SplitMix64::new(config.seed);
-    let depth_ids = rng.token_ids(token_count(config.depth_token_count)?, vocab_size)?;
-    let prompt_ids = rng.token_ids(token_count(config.prompt_token_count)?, vocab_size)?;
+    let depth_ids = token_ids(&mut rng, token_count(config.depth_token_count)?, vocab_size)?;
+    let prompt_ids = token_ids(
+        &mut rng,
+        token_count(config.prompt_token_count)?,
+        vocab_size,
+    )?;
     let start_id = match mode {
-        Mode::Tg => Some(rng.below(vocab_size)?),
+        Mode::Tg => Some(token_id(&mut rng, vocab_size)?),
         Mode::Pp | Mode::Pg => None,
     };
     Ok(Inputs {
@@ -239,6 +242,27 @@ fn draw_inputs(
         prompt_ids,
         start_id,
         gen_token_count: token_count(config.gen_token_count)?,
+    })
+}
+
+fn token_ids(
+    rng: &mut SplitMix64,
+    count: usize,
+    vocab_size: NonZeroU32,
+) -> Result<Vec<u32>, BenchError> {
+    (0..count).map(|_| token_id(rng, vocab_size)).collect()
+}
+
+fn token_id(
+    rng: &mut SplitMix64,
+    vocab_size: NonZeroU32,
+) -> Result<u32, BenchError> {
+    rng.below(vocab_size).ok_or_else(|| {
+        error!(
+            message = "Drawing a random token ID failed.",
+            bound = vocab_size.get()
+        );
+        BenchError::Random
     })
 }
 
@@ -379,10 +403,12 @@ mod tests {
         BenchError,
         Mode,
         bench,
+        token_ids,
     };
     use crate::core::{
         DType,
         Shape,
+        SplitMix64,
         Tensor,
         TensorError,
     };
@@ -591,6 +617,23 @@ mod tests {
             report.warmup_run_count >= 1,
             "at least one warmup run fills 1 ms, got {}",
             report.warmup_run_count
+        );
+    }
+
+    #[test]
+    fn token_ids_are_below_the_vocab_size_and_repeat_with_the_seed() {
+        let vocab_size = NonZeroU32::new(7).expect("7 is not zero");
+        let token_ids_drawn =
+            token_ids(&mut SplitMix64::new(42), 1000, vocab_size).expect("drawing succeeds");
+        assert_eq!(token_ids_drawn.len(), 1000, "one ID per requested token");
+        assert!(
+            token_ids_drawn.iter().all(|&token_id| token_id < 7),
+            "every ID is below 7"
+        );
+        assert_eq!(
+            token_ids(&mut SplitMix64::new(42), 1000, vocab_size),
+            Ok(token_ids_drawn),
+            "the same seed gives the same IDs"
         );
     }
 

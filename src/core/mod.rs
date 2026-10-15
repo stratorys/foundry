@@ -4,6 +4,7 @@ mod error;
 mod layout;
 mod memory;
 pub mod primitive;
+mod rng;
 mod shape;
 mod tensor;
 
@@ -23,6 +24,7 @@ pub use self::memory::{
     PeakMemory,
     PeakMemorySource,
 };
+pub use self::rng::SplitMix64;
 pub use self::shape::{
     RANK_MAX,
     Shape,
