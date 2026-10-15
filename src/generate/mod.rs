@@ -15,10 +15,28 @@ use crate::core::{
     Shape,
     Tensor,
 };
-use crate::models::llama::Llama;
-use crate::nn::KvCache;
 
 const VOCAB_AXIS: usize = 0;
+
+pub trait CausalLm<B: Backend> {
+    type Cache;
+    type Error: std::error::Error;
+
+    fn cache(
+        &self,
+        backend: &mut B,
+    ) -> Result<Self::Cache, Self::Error>;
+
+    fn forward(
+        &self,
+        backend: &mut B,
+        token_ids: &Tensor<B>,
+        positions: &Tensor<B>,
+        mask: &Tensor<B>,
+        cache: &mut Self::Cache,
+        position: usize,
+    ) -> Result<Tensor<B>, Self::Error>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generation {
@@ -27,15 +45,15 @@ pub struct Generation {
     pub decode_steps: Vec<Duration>,
 }
 
-struct Decoder<'run, B: Backend> {
+struct Decoder<'run, B: Backend, M: CausalLm<B>> {
     backend: &'run mut B,
-    model: &'run Llama<B>,
-    cache: Vec<KvCache<B>>,
+    model: &'run M,
+    cache: M::Cache,
 }
 
-pub fn generate<B: Backend>(
+pub fn generate<B: Backend, M: CausalLm<B>>(
     backend: &mut B,
-    model: &Llama<B>,
+    model: &M,
     prompt_ids: &[u32],
     max_new_tokens: usize,
     stop_ids: &[u32],
@@ -85,7 +103,7 @@ pub fn generate<B: Backend>(
     Ok(generation)
 }
 
-impl<B: Backend> Decoder<'_, B> {
+impl<B: Backend, M: CausalLm<B>> Decoder<'_, B, M> {
     fn step(
         &mut self,
         token_ids: &[u32],

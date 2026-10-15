@@ -9,6 +9,7 @@ use crate::core::{
     Tensor,
     TensorError,
 };
+use crate::generate::CausalLm;
 use crate::models::llama::rope::{
     LlamaRope,
     RopeAngles,
@@ -72,11 +73,16 @@ impl<B: Backend> Llama<B> {
             seq_len_max,
         })
     }
+}
 
-    pub fn cache(
+impl<B: Backend> CausalLm<B> for Llama<B> {
+    type Cache = Vec<KvCache<B>>;
+    type Error = LlamaError<B::Error>;
+
+    fn cache(
         &self,
         backend: &mut B,
-    ) -> Result<Vec<KvCache<B>>, LlamaError<B::Error>> {
+    ) -> Result<Self::Cache, Self::Error> {
         self.weights
             .layers()
             .iter()
@@ -93,15 +99,15 @@ impl<B: Backend> Llama<B> {
             .map_err(LlamaError::from)
     }
 
-    pub fn forward(
+    fn forward(
         &self,
         backend: &mut B,
         token_ids: &Tensor<B>,
         positions: &Tensor<B>,
         mask: &Tensor<B>,
-        cache: &mut [KvCache<B>],
+        cache: &mut Self::Cache,
         position: usize,
-    ) -> Result<Tensor<B>, LlamaError<B::Error>> {
+    ) -> Result<Tensor<B>, Self::Error> {
         let seq_len = token_ids.shape().element_count();
         if seq_len == 0 {
             error!(message = "Forward input holds no token.");
@@ -138,7 +144,9 @@ impl<B: Backend> Llama<B> {
         self.logits(backend, token_ids, cache, &step)
             .map_err(LlamaError::from)
     }
+}
 
+impl<B: Backend> Llama<B> {
     fn logits(
         &self,
         backend: &mut B,

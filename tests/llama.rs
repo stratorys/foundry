@@ -4,6 +4,7 @@ use foundry::core::{
     Shape,
     Tensor,
 };
+use foundry::generate::CausalLm;
 use foundry::models::llama::{
     Llama,
     LlamaConfig,
