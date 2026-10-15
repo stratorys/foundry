@@ -1,6 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::Write;
+use std::fs::File;
+use std::io::{
+    BufWriter,
+    Write,
+};
+use std::num::NonZeroU32;
 use std::path::{
     Path,
     PathBuf,
@@ -10,6 +15,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use clap::{
+    Args,
     Parser,
     Subcommand,
     ValueEnum,
@@ -17,6 +23,11 @@ use clap::{
 use foundry::backend::cpu::CpuBackend;
 #[cfg(target_os = "macos")]
 use foundry::backend::metal::MetalBackend;
+use foundry::bench::{
+    BenchConfig,
+    Report,
+    bench,
+};
 use foundry::core::Backend;
 use foundry::generate::{
     Generation,
@@ -83,6 +94,54 @@ enum Command {
         #[arg(long, help = "Maximum number of generated tokens.")]
         max_new_tokens: usize,
     },
+    #[command(
+        about = "Benchmark prefill and greedy decode at batch 1 on random token IDs and write \
+                 report.json."
+    )]
+    Bench(BenchArgs),
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+struct BenchArgs {
+    #[arg(long, help = "Hugging Face repository id, as owner/name.")]
+    model: ModelId,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = BackendKind::Cpu,
+        help = "Backend that runs the model."
+    )]
+    backend: BackendKind,
+    #[arg(
+        long,
+        help = "Prompt tokens processed in one prefill; 0 benchmarks generation only."
+    )]
+    prompt_tokens: u32,
+    #[arg(
+        long,
+        help = "Decode steps after the prefill; 0 benchmarks the prefill only."
+    )]
+    gen_tokens: u32,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Tokens filled into the cache before each measured run."
+    )]
+    depth: u32,
+    #[arg(long, default_value_t = 1, help = "Minimum number of warmup runs.")]
+    warmup_runs: u32,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Minimum warmup duration in milliseconds."
+    )]
+    warmup_ms: u64,
+    #[arg(long, default_value = "10", help = "Number of measured runs.")]
+    runs: NonZeroU32,
+    #[arg(long, default_value_t = 0, help = "Seed of the random token IDs.")]
+    seed: u64,
+    #[arg(long, help = "Directory that receives report.json.")]
+    out: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -137,6 +196,15 @@ enum CliError {
 
     #[error("Generation failed.")]
     Generate,
+
+    #[error("Vocabulary size is zero or does not fit in u32.")]
+    VocabSize,
+
+    #[error("Benchmark failed.")]
+    Bench,
+
+    #[error("Writing the benchmark report failed.")]
+    Report,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -200,6 +268,7 @@ fn main() -> ExitCode {
             prompt_ids,
             max_new_tokens,
         } => run(&model, backend, &prompt_ids, max_new_tokens),
+        Command::Bench(args) => bench_command(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -269,14 +338,7 @@ fn run(
     max_new_tokens: usize,
 ) -> Result<(), CliError> {
     let directory = resolve_snapshot(model)?;
-    let config = LlamaConfig::open(&directory).map_err(|error| {
-        error!(
-            message = "Opening the model config failed.",
-            directory = %directory.display(),
-            %error,
-        );
-        CliError::Config
-    })?;
+    let config = open_config(&directory)?;
     let weights = open_weights(&directory)?;
     let generation = match backend {
         BackendKind::Cpu => generate_on(
@@ -315,6 +377,148 @@ fn run(
     })
 }
 
+fn open_config(directory: &Path) -> Result<LlamaConfig, CliError> {
+    LlamaConfig::open(directory).map_err(|error| {
+        error!(
+            message = "Opening the model config failed.",
+            directory = %directory.display(),
+            %error,
+        );
+        CliError::Config
+    })
+}
+
+fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
+    let directory = resolve_snapshot(&args.model)?;
+    let config = open_config(&directory)?;
+    let weights = open_weights(&directory)?;
+    let vocab_size = u32::try_from(config.vocab_size())
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            error!(
+                message = "Vocabulary size is zero or does not fit in u32.",
+                vocab_size = config.vocab_size()
+            );
+            CliError::VocabSize
+        })?;
+    let bench_config = BenchConfig {
+        prompt_token_count: args.prompt_tokens,
+        gen_token_count: args.gen_tokens,
+        depth_token_count: args.depth,
+        warmup_run_count: args.warmup_runs,
+        warmup_ms: args.warmup_ms,
+        run_count: args.runs,
+        seed: args.seed,
+    };
+    let report = match args.backend {
+        BackendKind::Cpu => bench_on(
+            &mut CpuBackend::new(),
+            &args.model,
+            &config,
+            &weights,
+            vocab_size,
+            &bench_config,
+        ),
+        #[cfg(target_os = "macos")]
+        BackendKind::Metal => bench_on(
+            &mut MetalBackend::new().map_err(|error| {
+                error!(message = "Creating the Metal backend failed.", %error);
+                CliError::Backend
+            })?,
+            &args.model,
+            &config,
+            &weights,
+            vocab_size,
+            &bench_config,
+        ),
+    }?;
+    let report_path = write_bench_report(&args.out, &report)?;
+    info!(
+        message = "Benchmarked the model.",
+        backend = ?args.backend,
+        mode = ?report.mode,
+        llama_cpp_avg_ts = report.metrics.llama_cpp.avg_ts,
+        mlx_prompt_tps = ?report.metrics.mlx.as_ref().map(|mlx| mlx.prompt_tps),
+        mlx_generation_tps = ?report.metrics.mlx.as_ref().and_then(|mlx| mlx.generation_tps),
+        report = %report_path.display(),
+    );
+    Ok(())
+}
+
+fn bench_on<B: Backend>(
+    backend: &mut B,
+    model: &ModelId,
+    config: &LlamaConfig,
+    weights: &Weights,
+    vocab_size: NonZeroU32,
+    bench_config: &BenchConfig,
+) -> Result<Report, CliError> {
+    let seq_len_max = [
+        bench_config.depth_token_count,
+        bench_config.prompt_token_count,
+        bench_config.gen_token_count,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |seq_len_max, token_count| {
+        usize::try_from(token_count)
+            .ok()
+            .and_then(|token_count| seq_len_max.checked_add(token_count))
+    })
+    .ok_or_else(|| {
+        error!(
+            message = "Benchmark token counts overflow usize.",
+            ?bench_config
+        );
+        CliError::SeqLenOverflow
+    })?;
+    let llama = load_llama(backend, model, config, weights, seq_len_max)?;
+    bench(backend, &llama, vocab_size, bench_config).map_err(|error| {
+        error!(message = "Benchmark failed.", %model, %error);
+        CliError::Bench
+    })
+}
+
+fn write_bench_report(
+    out: &Path,
+    report: &Report,
+) -> Result<PathBuf, CliError> {
+    let report_path = out.join("report.json");
+    let write_error = |error: &dyn std::error::Error| {
+        error!(
+            message = "Writing the benchmark report failed.",
+            path = %report_path.display(),
+            %error,
+        );
+        CliError::Report
+    };
+    std::fs::create_dir_all(out).map_err(|error| write_error(&error))?;
+    let mut writer =
+        BufWriter::new(File::create(&report_path).map_err(|error| write_error(&error))?);
+    serde_json::to_writer_pretty(&mut writer, report).map_err(|error| write_error(&error))?;
+    writeln!(writer)
+        .and_then(|()| writer.flush())
+        .map_err(|error| write_error(&error))?;
+    Ok(report_path)
+}
+
+fn load_llama<B: Backend>(
+    backend: &mut B,
+    model: &ModelId,
+    config: &LlamaConfig,
+    weights: &Weights,
+    seq_len_max: usize,
+) -> Result<Llama<B>, CliError> {
+    let llama_weights = LlamaWeights::load(backend, config, weights).map_err(|error| {
+        error!(message = "Loading the model weights failed.", %model, %error);
+        CliError::Load
+    })?;
+    Llama::new(backend, config, llama_weights, seq_len_max).map_err(|error| {
+        error!(message = "Building the model failed.", %model, seq_len_max, %error);
+        CliError::Model
+    })
+}
+
 fn generate_on<B: Backend>(
     backend: &mut B,
     model: &ModelId,
@@ -323,10 +527,6 @@ fn generate_on<B: Backend>(
     prompt_ids: &[u32],
     max_new_tokens: usize,
 ) -> Result<Generation, CliError> {
-    let llama_weights = LlamaWeights::load(backend, config, weights).map_err(|error| {
-        error!(message = "Loading the model weights failed.", %model, %error);
-        CliError::Load
-    })?;
     let seq_len_max = prompt_ids
         .len()
         .checked_add(max_new_tokens)
@@ -338,10 +538,7 @@ fn generate_on<B: Backend>(
             );
             CliError::SeqLenOverflow
         })?;
-    let llama = Llama::new(backend, config, llama_weights, seq_len_max).map_err(|error| {
-        error!(message = "Building the model failed.", %model, seq_len_max, %error);
-        CliError::Model
-    })?;
+    let llama = load_llama(backend, model, config, weights, seq_len_max)?;
     generate(
         backend,
         &llama,
@@ -592,6 +789,8 @@ fn format_gib(bytes: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::num::NonZeroU32;
+    use std::path::PathBuf;
 
     use clap::error::ErrorKind;
     use clap::{
@@ -606,6 +805,7 @@ mod tests {
 
     use crate::{
         BackendKind,
+        BenchArgs,
         Cli,
         CliError,
         Command,
@@ -842,6 +1042,89 @@ mod tests {
                     "4",
                 ],
                 kind: ErrorKind::ValueValidation,
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |ArgsKindCase {
+                 args,
+                 kind,
+             }| {
+                assert_eq!(
+                    Cli::try_parse_from(&args)
+                        .map(|cli| cli.command)
+                        .map_err(|error| error.kind()),
+                    Err(kind),
+                    "args {args:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn bench_parses_counts_with_defaults() {
+        assert_eq!(
+            Cli::try_parse_from([
+                "foundry",
+                "bench",
+                "--model",
+                "a/b",
+                "--prompt-tokens",
+                "512",
+                "--gen-tokens",
+                "128",
+                "--out",
+                "reports",
+            ])
+            .map(|cli| cli.command)
+            .map_err(|error| error.kind()),
+            Ok(Command::Bench(BenchArgs {
+                model: ModelId {
+                    owner: "a".to_owned(),
+                    name: "b".to_owned(),
+                },
+                backend: BackendKind::Cpu,
+                prompt_tokens: 512,
+                gen_tokens: 128,
+                depth: 0,
+                warmup_runs: 1,
+                warmup_ms: 0,
+                runs: NonZeroU32::new(10).expect("10 is not zero"),
+                seed: 0,
+                out: PathBuf::from("reports"),
+            })),
+            "pg 512/128 with one warmup run and ten measured runs"
+        );
+    }
+
+    #[test]
+    fn bench_rejects_zero_runs_and_missing_arguments() {
+        struct ArgsKindCase<T0, T1> {
+            args: T0,
+            kind: T1,
+        }
+        let base = [
+            "foundry",
+            "bench",
+            "--model",
+            "a/b",
+            "--prompt-tokens",
+            "1",
+            "--gen-tokens",
+            "1",
+        ];
+        [
+            ArgsKindCase {
+                args: [base.as_slice(), &["--out", "r", "--runs", "0"]].concat(),
+                kind: ErrorKind::ValueValidation,
+            },
+            ArgsKindCase {
+                args: base.to_vec(),
+                kind: ErrorKind::MissingRequiredArgument,
+            },
+            ArgsKindCase {
+                args: vec!["foundry", "bench", "--model", "a/b", "--out", "r"],
+                kind: ErrorKind::MissingRequiredArgument,
             },
         ]
         .into_iter()

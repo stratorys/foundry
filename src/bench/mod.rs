@@ -1,0 +1,549 @@
+mod error;
+mod metrics;
+mod rng;
+mod stats;
+
+use std::num::{
+    NonZeroU32,
+    NonZeroUsize,
+};
+use std::time::{
+    Duration,
+    Instant,
+};
+
+use serde::Serialize;
+use tracing::error;
+
+pub use self::error::BenchError;
+pub use self::metrics::{
+    Candle,
+    LlamaCpp,
+    Metrics,
+    Mlx,
+    MlxTrial,
+    Sglang,
+    SglangRun,
+    TokenCounts,
+    Vllm,
+};
+use self::metrics::{
+    metrics,
+    sum_ns,
+};
+use self::rng::SplitMix64;
+pub use self::stats::Summary;
+use self::stats::ns_to_f64;
+use crate::core::Backend;
+use crate::generate::{
+    CausalLm,
+    Decoder,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BenchConfig {
+    pub prompt_token_count: u32,
+    pub gen_token_count: u32,
+    pub depth_token_count: u32,
+    pub warmup_run_count: u32,
+    pub warmup_ms: u64,
+    pub run_count: NonZeroU32,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Pp,
+    Tg,
+    Pg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunSamples {
+    pub prefill_ns: Option<u64>,
+    pub decode_ns: Vec<u64>,
+    pub token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Report {
+    pub config: BenchConfig,
+    pub mode: Mode,
+    pub depth_ids: Vec<u32>,
+    pub prompt_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_id: Option<u32>,
+    pub warmup_run_count: u32,
+    pub runs: Vec<RunSamples>,
+    pub stats: Stats,
+    pub metrics: Metrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Stats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_ns: Option<Summary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_step_ns: Option<Summary>,
+    pub run_ns: Summary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Inputs {
+    depth_ids: Vec<u32>,
+    prompt_ids: Vec<u32>,
+    start_id: Option<u32>,
+    gen_token_count: usize,
+}
+
+impl TryFrom<&BenchConfig> for Mode {
+    type Error = BenchError;
+
+    fn try_from(config: &BenchConfig) -> Result<Self, Self::Error> {
+        match (config.prompt_token_count, config.gen_token_count) {
+            (0, 0) => {
+                error!(message = "Benchmark holds neither prompt nor generated tokens.");
+                Err(BenchError::NoToken)
+            }
+            (_, 0) => Ok(Self::Pp),
+            (0, _) => Ok(Self::Tg),
+            _ => Ok(Self::Pg),
+        }
+    }
+}
+
+impl RunSamples {
+    pub fn total_ns(&self) -> u64 {
+        self.prefill_ns
+            .unwrap_or(0)
+            .saturating_add(sum_ns(&self.decode_ns))
+    }
+}
+
+pub fn bench<B: Backend, M: CausalLm<B>>(
+    backend: &mut B,
+    model: &M,
+    vocab_size: NonZeroU32,
+    config: &BenchConfig,
+) -> Result<Report, BenchError> {
+    let mode = Mode::try_from(config)?;
+    let inputs = draw_inputs(config, mode, vocab_size)?;
+    let warmup_start = Instant::now();
+    let warmup = Duration::from_millis(config.warmup_ms);
+    let mut warmup_run_count = 0_u32;
+    while warmup_run_count < config.warmup_run_count || warmup_start.elapsed() < warmup {
+        run(backend, model, &inputs)?;
+        warmup_run_count = warmup_run_count.checked_add(1).ok_or_else(|| {
+            error!(message = "Run count overflows u32.", warmup_run_count);
+            BenchError::RunCountOverflow
+        })?;
+    }
+    let runs = (0..config.run_count.get())
+        .map(|_| run(backend, model, &inputs))
+        .collect::<Result<Vec<RunSamples>, BenchError>>()?;
+    let stats = stats(&runs)?;
+    let metrics = metrics(
+        &runs,
+        TokenCounts {
+            prompt_count: config.prompt_token_count,
+            gen_count: config.gen_token_count,
+            depth_count: config.depth_token_count,
+        },
+    )?;
+    Ok(Report {
+        config: *config,
+        mode,
+        depth_ids: inputs.depth_ids,
+        prompt_ids: inputs.prompt_ids,
+        start_id: inputs.start_id,
+        warmup_run_count,
+        runs,
+        stats,
+        metrics,
+    })
+}
+
+fn draw_inputs(
+    config: &BenchConfig,
+    mode: Mode,
+    vocab_size: NonZeroU32,
+) -> Result<Inputs, BenchError> {
+    let mut rng = SplitMix64::new(config.seed);
+    let depth_ids = rng.token_ids(token_count(config.depth_token_count)?, vocab_size)?;
+    let prompt_ids = rng.token_ids(token_count(config.prompt_token_count)?, vocab_size)?;
+    let start_id = match mode {
+        Mode::Tg => Some(rng.below(vocab_size)?),
+        Mode::Pp | Mode::Pg => None,
+    };
+    Ok(Inputs {
+        depth_ids,
+        prompt_ids,
+        start_id,
+        gen_token_count: token_count(config.gen_token_count)?,
+    })
+}
+
+fn token_count(count: u32) -> Result<usize, BenchError> {
+    usize::try_from(count).map_err(|_| {
+        error!(message = "Token position overflows usize.", count);
+        BenchError::PositionOverflow
+    })
+}
+
+fn run<B: Backend, M: CausalLm<B>>(
+    backend: &mut B,
+    model: &M,
+    inputs: &Inputs,
+) -> Result<RunSamples, BenchError> {
+    let mut decoder = Decoder::new(backend, model).map_err(|error| {
+        error!(message = "Creating the decoder failed.", %error);
+        BenchError::Decoder
+    })?;
+    if !inputs.depth_ids.is_empty() {
+        step(&mut decoder, &inputs.depth_ids, 0)?;
+    }
+    let mut position = inputs.depth_ids.len();
+    let mut token_ids = Vec::with_capacity(inputs.gen_token_count.saturating_add(1));
+    let (prefill_ns, mut token) =
+        match (NonZeroUsize::new(inputs.prompt_ids.len()), inputs.start_id) {
+            (Some(prompt_len), _) => {
+                let (token, prefill_ns) = timed_step(&mut decoder, &inputs.prompt_ids, position)?;
+                token_ids.push(token);
+                position = advance(position, prompt_len.get())?;
+                (Some(prefill_ns), token)
+            }
+            (None, Some(start_id)) => (None, start_id),
+            (None, None) => {
+                error!(message = "Benchmark holds neither prompt nor start token.");
+                return Err(BenchError::NoToken);
+            }
+        };
+    let decode_ns = (0..inputs.gen_token_count)
+        .map(|_| {
+            let (next_token, step_ns) = timed_step(&mut decoder, &[token], position)?;
+            token = next_token;
+            token_ids.push(next_token);
+            position = advance(position, 1)?;
+            Ok(step_ns)
+        })
+        .collect::<Result<Vec<u64>, BenchError>>()?;
+    Ok(RunSamples {
+        prefill_ns,
+        decode_ns,
+        token_ids,
+    })
+}
+
+fn timed_step<B: Backend, M: CausalLm<B>>(
+    decoder: &mut Decoder<'_, B, M>,
+    token_ids: &[u32],
+    position: usize,
+) -> Result<(u32, u64), BenchError> {
+    let start = Instant::now();
+    let token = step(decoder, token_ids, position)?;
+    let elapsed = start.elapsed();
+    let elapsed_ns = u64::try_from(elapsed.as_nanos()).map_err(|_| {
+        error!(
+            message = "Step duration does not fit in u64 nanoseconds.",
+            ?elapsed
+        );
+        BenchError::DurationOverflow
+    })?;
+    Ok((token, elapsed_ns))
+}
+
+fn step<B: Backend, M: CausalLm<B>>(
+    decoder: &mut Decoder<'_, B, M>,
+    token_ids: &[u32],
+    position: usize,
+) -> Result<u32, BenchError> {
+    decoder.step(token_ids, position).map_err(|error| {
+        error!(
+            message = "Benchmark step failed.",
+            position,
+            seq_len = token_ids.len(),
+            %error,
+        );
+        BenchError::Step
+    })
+}
+
+fn advance(
+    position: usize,
+    seq_len: usize,
+) -> Result<usize, BenchError> {
+    position.checked_add(seq_len).ok_or_else(|| {
+        error!(
+            message = "Token position overflows usize.",
+            position, seq_len
+        );
+        BenchError::PositionOverflow
+    })
+}
+
+fn stats(runs: &[RunSamples]) -> Result<Stats, BenchError> {
+    let prefill_ns = runs
+        .iter()
+        .map(|run| run.prefill_ns.map(ns_to_f64))
+        .collect::<Option<Vec<f64>>>()
+        .filter(|samples| !samples.is_empty());
+    let decode_step_ns = runs
+        .iter()
+        .flat_map(|run| run.decode_ns.iter().copied().map(ns_to_f64))
+        .collect::<Vec<f64>>();
+    let run_ns = runs
+        .iter()
+        .map(|run| ns_to_f64(run.total_ns()))
+        .collect::<Vec<f64>>();
+    Ok(Stats {
+        prefill_ns: prefill_ns.as_deref().map(Summary::try_from).transpose()?,
+        decode_step_ns: (!decode_step_ns.is_empty())
+            .then(|| Summary::try_from(decode_step_ns.as_slice()))
+            .transpose()?,
+        run_ns: Summary::try_from(run_ns.as_slice())?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use crate::backend::cpu::{
+        CpuBackend,
+        CpuError,
+    };
+    use crate::bench::{
+        BenchConfig,
+        BenchError,
+        Mode,
+        bench,
+    };
+    use crate::core::{
+        DType,
+        Shape,
+        Tensor,
+        TensorError,
+    };
+    use crate::generate::CausalLm;
+
+    const VOCAB_SIZE: usize = 64;
+
+    struct PositionModel;
+
+    impl CausalLm<CpuBackend> for PositionModel {
+        type Cache = ();
+        type Error = TensorError<CpuError>;
+
+        fn cache(
+            &self,
+            _backend: &mut CpuBackend,
+        ) -> Result<Self::Cache, Self::Error> {
+            Ok(())
+        }
+
+        fn forward(
+            &self,
+            backend: &mut CpuBackend,
+            token_ids: &Tensor<CpuBackend>,
+            _positions: &Tensor<CpuBackend>,
+            _mask: &Tensor<CpuBackend>,
+            _cache: &mut Self::Cache,
+            position: usize,
+        ) -> Result<Tensor<CpuBackend>, Self::Error> {
+            let seq_len_total = position.saturating_add(token_ids.shape().element_count());
+            let logits = (0..VOCAB_SIZE)
+                .map(|token_id| f32::from(u8::from(token_id == seq_len_total)))
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<u8>>();
+            let shape = Shape::try_from([VOCAB_SIZE].as_slice())?;
+            Tensor::upload(backend, &logits, DType::F32, shape)
+        }
+    }
+
+    const CONFIG: BenchConfig = BenchConfig {
+        prompt_token_count: 0,
+        gen_token_count: 0,
+        depth_token_count: 0,
+        warmup_run_count: 2,
+        warmup_ms: 0,
+        run_count: NonZeroU32::MIN.saturating_add(2),
+        seed: 7,
+    };
+
+    #[test]
+    fn mode_follows_the_token_counts() {
+        assert_eq!(
+            [
+                BenchConfig {
+                    prompt_token_count: 4,
+                    gen_token_count: 0,
+                    depth_token_count: 0,
+                    ..CONFIG
+                },
+                BenchConfig {
+                    prompt_token_count: 0,
+                    gen_token_count: 4,
+                    depth_token_count: 0,
+                    ..CONFIG
+                },
+                BenchConfig {
+                    prompt_token_count: 4,
+                    gen_token_count: 4,
+                    depth_token_count: 0,
+                    ..CONFIG
+                },
+                BenchConfig {
+                    prompt_token_count: 0,
+                    gen_token_count: 0,
+                    depth_token_count: 4,
+                    ..CONFIG
+                }
+            ]
+            .iter()
+            .map(Mode::try_from)
+            .collect::<Vec<Result<Mode, BenchError>>>(),
+            vec![
+                Ok(Mode::Pp),
+                Ok(Mode::Tg),
+                Ok(Mode::Pg),
+                Err(BenchError::NoToken)
+            ],
+            "pp without generation, tg without prompt, pg with both"
+        );
+    }
+
+    #[test]
+    fn each_mode_steps_through_the_expected_positions() {
+        struct ConfigShapeCase {
+            config: BenchConfig,
+            mode: Mode,
+            prefill: bool,
+            token_ids: Vec<u32>,
+        }
+        [
+            ConfigShapeCase {
+                config: BenchConfig {
+                    prompt_token_count: 3,
+                    gen_token_count: 0,
+                    depth_token_count: 2,
+                    ..CONFIG
+                },
+                mode: Mode::Pp,
+                prefill: true,
+                token_ids: vec![5],
+            },
+            ConfigShapeCase {
+                config: BenchConfig {
+                    prompt_token_count: 0,
+                    gen_token_count: 3,
+                    depth_token_count: 2,
+                    ..CONFIG
+                },
+                mode: Mode::Tg,
+                prefill: false,
+                token_ids: vec![3, 4, 5],
+            },
+            ConfigShapeCase {
+                config: BenchConfig {
+                    prompt_token_count: 3,
+                    gen_token_count: 2,
+                    depth_token_count: 2,
+                    ..CONFIG
+                },
+                mode: Mode::Pg,
+                prefill: true,
+                token_ids: vec![5, 6, 7],
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |ConfigShapeCase {
+                 config,
+                 mode,
+                 prefill,
+                 token_ids,
+             }| {
+                let report = bench(
+                    &mut CpuBackend::new(),
+                    &PositionModel,
+                    NonZeroU32::new(64).expect("64 is not zero"),
+                    &config,
+                )
+                .expect("the benchmark runs");
+                let decode_step_count =
+                    usize::try_from(config.gen_token_count).expect("u32 fits in usize");
+                assert_eq!(
+                    (
+                        report.mode,
+                        report.warmup_run_count,
+                        report.depth_ids.len(),
+                        report.prompt_ids.len(),
+                        report.start_id.is_some(),
+                    ),
+                    (
+                        mode,
+                        2,
+                        2,
+                        usize::try_from(config.prompt_token_count).expect("fits"),
+                        mode == Mode::Tg
+                    ),
+                    "inputs of {mode:?}"
+                );
+                assert_eq!(report.runs.len(), 3, "three measured runs of {mode:?}");
+                report.runs.iter().for_each(|run| {
+                    assert_eq!(
+                        (
+                            run.prefill_ns.is_some(),
+                            run.decode_ns.len(),
+                            &run.token_ids
+                        ),
+                        (prefill, decode_step_count, &token_ids),
+                        "each token is the cache length after its step in {mode:?}"
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn duration_warmup_runs_until_the_budget_is_spent() {
+        let report = bench(
+            &mut CpuBackend::new(),
+            &PositionModel,
+            NonZeroU32::new(64).expect("64 is not zero"),
+            &BenchConfig {
+                prompt_token_count: 1,
+                gen_token_count: 1,
+                warmup_run_count: 0,
+                warmup_ms: 1,
+                ..CONFIG
+            },
+        )
+        .expect("the benchmark runs");
+        assert!(
+            report.warmup_run_count >= 1,
+            "at least one warmup run fills 1 ms, got {}",
+            report.warmup_run_count
+        );
+    }
+
+    #[test]
+    fn same_seed_draws_the_same_inputs() {
+        let draw = || {
+            bench(
+                &mut CpuBackend::new(),
+                &PositionModel,
+                NonZeroU32::new(64).expect("64 is not zero"),
+                &BenchConfig {
+                    prompt_token_count: 4,
+                    gen_token_count: 1,
+                    depth_token_count: 4,
+                    ..CONFIG
+                },
+            )
+            .map(|report| (report.depth_ids, report.prompt_ids))
+        };
+        assert_eq!(draw(), draw(), "seed 7 gives the same depth and prompt IDs");
+    }
+}
