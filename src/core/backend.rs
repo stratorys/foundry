@@ -19,6 +19,8 @@ pub trait Backend {
     type Storage;
     type Error: Error + 'static;
 
+    fn device_name(&self) -> String;
+
     fn upload(
         &mut self,
         bytes: &[u8],

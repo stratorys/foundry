@@ -1,4 +1,5 @@
 mod error;
+mod metadata;
 mod metrics;
 mod rng;
 mod stats;
@@ -19,6 +20,11 @@ use tracing::{
 };
 
 pub use self::error::BenchError;
+pub use self::metadata::{
+    Metadata,
+    git_commit,
+    rfc3339_utc,
+};
 pub use self::metrics::{
     Candle,
     LlamaCpp,

@@ -702,6 +702,8 @@ impl Backend for MetalBackend {
     type Error = MetalError;
     type Storage = MetalStorage;
 
+    fn device_name(&self) -> String { self.device.name().to_string() }
+
     fn upload(
         &mut self,
         bytes: &[u8],
@@ -1104,12 +1106,19 @@ mod tests {
     };
     use crate::core::primitive::matmul_rule;
     use crate::core::{
+        Backend,
         CoreError,
         DType,
         Shape,
         Tensor,
         TensorError,
     };
+
+    #[test]
+    fn device_name_is_not_empty() {
+        let backend = MetalBackend::new().expect("a Metal device is available");
+        assert_ne!(backend.device_name(), "", "the Metal device has a name");
+    }
 
     #[test]
     fn f32_round_trip_returns_the_same_bytes() {

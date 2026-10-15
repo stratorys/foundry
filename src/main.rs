@@ -15,6 +15,8 @@ use std::str::FromStr;
 use std::time::{
     Duration,
     Instant,
+    SystemTime,
+    UNIX_EPOCH,
 };
 
 use clap::{
@@ -28,8 +30,11 @@ use foundry::backend::cpu::CpuBackend;
 use foundry::backend::metal::MetalBackend;
 use foundry::bench::{
     BenchConfig,
+    Metadata,
     Report,
     bench,
+    git_commit,
+    rfc3339_utc,
 };
 use foundry::core::Backend;
 use foundry::generate::{
@@ -44,6 +49,7 @@ use foundry::models::llama::{
 };
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
+use serde::Serialize;
 use tracing::{
     error,
     info,
@@ -208,6 +214,19 @@ enum CliError {
 
     #[error("Writing the benchmark report failed.")]
     Report,
+
+    #[error("System clock cannot be formatted as an RFC 3339 time.")]
+    Timestamp,
+
+    #[error("Parameter count overflows u64.")]
+    ParameterCountOverflow,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchRecord {
+    metadata: Metadata,
+    #[serde(flatten)]
+    report: Report,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -225,6 +244,16 @@ struct TensorRow {
     dtype: String,
     shape: String,
     bytes: usize,
+}
+
+impl BackendKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            #[cfg(target_os = "macos")]
+            Self::Metal => "metal",
+        }
+    }
 }
 
 impl FromStr for ModelId {
@@ -392,9 +421,13 @@ fn open_config(directory: &Path) -> Result<LlamaConfig, CliError> {
 }
 
 fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
+    let test_time = test_time()?;
+    let git_commit = read_git_commit();
     let directory = resolve_snapshot(&args.model)?;
     let config = open_config(&directory)?;
     let weights = open_weights(&directory)?;
+    let model_bytes = model_bytes(&args.model, &weights)?;
+    let model_parameter_count = parameter_count(&args.model, &weights)?;
     let vocab_size = u32::try_from(config.vocab_size())
         .ok()
         .and_then(NonZeroU32::new)
@@ -414,7 +447,7 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
         run_count: args.runs,
         seed: args.seed,
     };
-    let report = match args.backend {
+    let (device, report) = match args.backend {
         BackendKind::Cpu => bench_on(
             &mut CpuBackend::new(),
             &args.model,
@@ -436,17 +469,98 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
             &bench_config,
         ),
     }?;
-    let report_path = write_bench_report(&args.out, &report)?;
+    let record = BenchRecord {
+        metadata: Metadata {
+            git_commit,
+            test_time,
+            backend: args.backend.name().to_owned(),
+            device,
+            model_id: args.model.to_string(),
+            model_bytes,
+            model_parameter_count,
+        },
+        report,
+    };
+    let report_path = write_bench_report(&args.out, &record)?;
     info!(
         message = "Benchmarked the model.",
-        backend = ?args.backend,
-        mode = ?report.mode,
-        llama_cpp_avg_ts = report.metrics.llama_cpp.avg_ts,
-        mlx_prompt_tps = ?report.metrics.mlx.as_ref().map(|mlx| mlx.prompt_tps),
-        mlx_generation_tps = ?report.metrics.mlx.as_ref().and_then(|mlx| mlx.generation_tps),
+        backend = args.backend.name(),
+        device = %record.metadata.device,
+        git_commit = ?record.metadata.git_commit,
+        mode = ?record.report.mode,
+        llama_cpp_avg_ts = record.report.metrics.llama_cpp.avg_ts,
+        mlx_prompt_tps = ?record.report.metrics.mlx.as_ref().map(|mlx| mlx.prompt_tps),
+        mlx_generation_tps = ?record.report.metrics.mlx.as_ref().and_then(|mlx| mlx.generation_tps),
         report = %report_path.display(),
     );
     Ok(())
+}
+
+fn test_time() -> Result<String, CliError> {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            error!(message = "System clock is before the Unix epoch.", %error);
+            CliError::Timestamp
+        })?;
+    rfc3339_utc(since_epoch.as_secs()).ok_or_else(|| {
+        error!(
+            message = "System clock cannot be formatted as an RFC 3339 time.",
+            unix_s = since_epoch.as_secs()
+        );
+        CliError::Timestamp
+    })
+}
+
+fn read_git_commit() -> Option<String> {
+    let output = match std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(message = "Running git failed; the commit is not recorded.", %error);
+            return None;
+        }
+    };
+    let commit = output
+        .status
+        .success()
+        .then(|| git_commit(&output.stdout))
+        .flatten();
+    if commit.is_none() {
+        warn!(
+            message = "Git returned no commit; the commit is not recorded.",
+            status = %output.status,
+        );
+    }
+    commit
+}
+
+fn model_bytes<S: AsRef<[u8]>>(
+    model: &ModelId,
+    weights: &Weights<S>,
+) -> Result<u64, CliError> {
+    let bytes = summarize_weights(model, weights)?.bytes;
+    u64::try_from(bytes).map_err(|_| {
+        error!(message = "Total tensor byte count overflows u64.", %model, bytes);
+        CliError::TotalByteCountOverflow
+    })
+}
+
+fn parameter_count<S: AsRef<[u8]>>(
+    model: &ModelId,
+    weights: &Weights<S>,
+) -> Result<u64, CliError> {
+    weights.tensors().try_fold(0_u64, |parameter_count, view| {
+        u64::try_from(view.shape.element_count())
+            .ok()
+            .and_then(|element_count| parameter_count.checked_add(element_count))
+            .ok_or_else(|| {
+                error!(message = "Parameter count overflows u64.", %model);
+                CliError::ParameterCountOverflow
+            })
+    })
 }
 
 fn bench_on<B: Backend>(
@@ -456,7 +570,7 @@ fn bench_on<B: Backend>(
     weights: &Weights,
     vocab_size: NonZeroU32,
     bench_config: &BenchConfig,
-) -> Result<Report, CliError> {
+) -> Result<(String, Report), CliError> {
     let seq_len_max = [
         bench_config.depth_token_count,
         bench_config.prompt_token_count,
@@ -475,16 +589,19 @@ fn bench_on<B: Backend>(
         );
         CliError::SeqLenOverflow
     })?;
+    let device = backend.device_name();
+    info!(message = "Selected the device.", %device);
     let llama = load_llama(backend, model, config, weights, seq_len_max)?;
-    bench(backend, &llama, vocab_size, bench_config).map_err(|error| {
+    let report = bench(backend, &llama, vocab_size, bench_config).map_err(|error| {
         error!(message = "Benchmark failed.", %model, %error);
         CliError::Bench
-    })
+    })?;
+    Ok((device, report))
 }
 
 fn write_bench_report(
     out: &Path,
-    report: &Report,
+    record: &BenchRecord,
 ) -> Result<PathBuf, CliError> {
     let report_path = out.join("report.json");
     let write_error = |error: &dyn std::error::Error| {
@@ -498,7 +615,7 @@ fn write_bench_report(
     std::fs::create_dir_all(out).map_err(|error| write_error(&error))?;
     let mut writer =
         BufWriter::new(File::create(&report_path).map_err(|error| write_error(&error))?);
-    serde_json::to_writer_pretty(&mut writer, report).map_err(|error| write_error(&error))?;
+    serde_json::to_writer_pretty(&mut writer, record).map_err(|error| write_error(&error))?;
     writeln!(writer)
         .and_then(|()| writer.flush())
         .map_err(|error| write_error(&error))?;
@@ -827,6 +944,7 @@ mod tests {
         TensorRow,
         WeightsSummary,
         format_gib,
+        parameter_count,
         summarize_weights,
         tensor_rows,
         write_tensors,
@@ -1373,6 +1491,41 @@ mod tests {
             ),
             Err(CliError::BytesMismatch),
             "the index declares one byte more than the tensors hold"
+        );
+    }
+
+    #[test]
+    fn parameter_count_sums_the_elements_of_every_tensor() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 12] },
+            "b": { "dtype": "F32", "shape": [2], "data_offsets": [12, 20] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..20)
+            .collect();
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the file is valid");
+        assert_eq!(
+            parameter_count(
+                &ModelId {
+                    owner: "a".to_owned(),
+                    name: "b".to_owned(),
+                },
+                &weights,
+            ),
+            Ok(8),
+            "six bf16 and two f32 elements"
         );
     }
 

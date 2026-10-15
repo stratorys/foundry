@@ -6,7 +6,10 @@ use half::{
     bf16,
     f16,
 };
-use tracing::error;
+use tracing::{
+    error,
+    warn,
+};
 
 pub use self::error::CpuError;
 use crate::core::primitive::{
@@ -26,6 +29,8 @@ use crate::core::{
     Operand,
     OperandMut,
 };
+
+const CPU_NAME_FALLBACK: &str = "CPU";
 
 pub struct CpuStorage {
     bytes: Vec<u8>,
@@ -55,6 +60,13 @@ impl CpuBackend {
 impl Backend for CpuBackend {
     type Error = CpuError;
     type Storage = CpuStorage;
+
+    fn device_name(&self) -> String {
+        cpu_brand().unwrap_or_else(|| {
+            warn!(message = "CPU model name is unavailable; reporting the generic name.");
+            CPU_NAME_FALLBACK.to_owned()
+        })
+    }
 
     fn upload(
         &mut self,
@@ -551,9 +563,49 @@ fn write_window(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn cpu_brand() -> Option<String> {
+    let output = std::process::Command::new("sysctl")
+        .arg("machdep.cpu.brand_string")
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    output
+        .status
+        .success()
+        .then(|| field_value(&text, "machdep.cpu.brand_string"))
+        .flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_brand() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    field_value(&text, "model name")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn cpu_brand() -> Option<String> { None }
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn field_value(
+    text: &str,
+    key: &str,
+) -> Option<String> {
+    text.lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(line_key, _)| line_key.trim() == key)
+                .map(|(_, value)| value.trim().to_owned())
+        })
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::backend::cpu::CpuBackend;
+    use crate::backend::cpu::{
+        CpuBackend,
+        field_value,
+    };
     use crate::core::{
         CoreError,
         DType,
@@ -561,6 +613,48 @@ mod tests {
         Tensor,
         TensorError,
     };
+
+    #[test]
+    fn field_value_reads_the_first_matching_key() {
+        struct TextKeyExpectedCase<T0, T1, T2> {
+            text: T0,
+            key: T1,
+            expected: T2,
+        }
+        [
+            TextKeyExpectedCase {
+                text: "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) \
+                       CPU @ 2.20GHz\nprocessor\t: 1\nmodel name\t: other\n",
+                key: "model name",
+                expected: Some("Intel(R) Xeon(R) CPU @ 2.20GHz".to_owned()),
+            },
+            TextKeyExpectedCase {
+                text: "machdep.cpu.brand_string: Apple M4 Pro\n",
+                key: "machdep.cpu.brand_string",
+                expected: Some("Apple M4 Pro".to_owned()),
+            },
+            TextKeyExpectedCase {
+                text: "processor\t: 0\nCPU implementer\t: 0x41\n",
+                key: "model name",
+                expected: None,
+            },
+            TextKeyExpectedCase {
+                text: "model name\t:   \n",
+                key: "model name",
+                expected: None,
+            },
+        ]
+        .into_iter()
+        .for_each(
+            |TextKeyExpectedCase {
+                 text,
+                 key,
+                 expected,
+             }| {
+                assert_eq!(field_value(text, key), expected, "key {key:?} in {text:?}");
+            },
+        );
+    }
 
     #[test]
     fn upload_then_download_returns_the_same_bytes_for_each_dtype() {
