@@ -72,7 +72,7 @@ pub trait Device {
 
     fn device_name(&self) -> String;
 
-    fn current_allocated_memory(&self) -> Option<AllocatedMemory>;
+    fn max_memory_allocated(&self) -> Option<AllocatedMemory>;
 
     fn storage_from_bytes(
         &mut self,

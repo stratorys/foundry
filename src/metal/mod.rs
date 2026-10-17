@@ -481,7 +481,7 @@ impl Device for MetalDevice {
 
     fn device_name(&self) -> String { self.device.name().to_string() }
 
-    fn current_allocated_memory(&self) -> Option<AllocatedMemory> {
+    fn max_memory_allocated(&self) -> Option<AllocatedMemory> {
         Some(AllocatedMemory {
             bytes: self
                 .allocated_bytes_peak
@@ -705,14 +705,14 @@ mod tests {
     }
 
     #[test]
-    fn current_allocated_memory_counts_from_bytes_and_never_decreases() {
+    fn max_memory_allocated_counts_from_bytes_and_never_decreases() {
         let nbytes = 1 << 20;
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let storage = device
             .storage_from_bytes(&vec![0; nbytes])
             .expect("storage_from_bytes succeeds");
         let peak = device
-            .current_allocated_memory()
+            .max_memory_allocated()
             .expect("Metal tracks peak memory");
         assert_eq!(
             peak.source,
@@ -727,7 +727,7 @@ mod tests {
         drop(storage);
         device.zeros(16).expect("zeros succeeds");
         let peak_after_free = device
-            .current_allocated_memory()
+            .max_memory_allocated()
             .expect("Metal tracks peak memory");
         assert!(
             peak_after_free.bytes >= peak.bytes,

@@ -207,7 +207,7 @@ pub fn bench<D: Device, M: CausalLm<D>>(
         .collect::<Result<Vec<RunSamples>, BenchError>>()?;
     let stats = stats(&runs)?;
     let metrics = metrics(&runs, counts)?;
-    let peak_memory = device.current_allocated_memory();
+    let peak_memory = device.max_memory_allocated();
     Ok(Report {
         config: *config,
         mode,
@@ -330,7 +330,7 @@ fn run<D: Device, M: CausalLm<D>>(
         decode_ns,
         token_ids,
         peak_memory_bytes: device
-            .current_allocated_memory()
+            .max_memory_allocated()
             .map(|peak_memory| peak_memory.bytes),
     })
 }

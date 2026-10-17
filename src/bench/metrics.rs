@@ -103,8 +103,11 @@ pub fn metrics(
 ) -> Result<Metrics, BenchError> {
     let prefills_ns = runs
         .iter()
-        .map(|run| run.prefill_ns.map(|prefill_ns| (prefill_ns, run)))
-        .collect::<Option<Vec<(u64, &RunSamples)>>>();
+        .map(|run| {
+            run.prefill_ns
+                .map(|prefill_ns| (prefill_ns, run, decode_ns_without_last(run)))
+        })
+        .collect::<Option<Vec<(u64, &RunSamples, &[u64])>>>();
     let measured_runs = prefills_ns.filter(|prefills_ns| !prefills_ns.is_empty());
     Ok(Metrics {
         llama_cpp: llama_cpp(runs, counts)?,
@@ -176,17 +179,16 @@ fn stdev_llama_cpp(samples: &[f64]) -> f64 {
 }
 
 fn mlx(
-    prefills_ns: &[(u64, &RunSamples)],
+    prefills_ns: &[(u64, &RunSamples, &[u64])],
     counts: TokenCounts,
 ) -> Result<Mlx, BenchError> {
     let batch_size = f64::from(counts.batch_size);
     let trials = prefills_ns
         .iter()
-        .map(|&(prefill_ns, run)| MlxTrial {
+        .map(|&(prefill_ns, run, decode_ns)| MlxTrial {
             prompt_tps: batch_size * f64::from(counts.prompt_count) / seconds(prefill_ns),
-            generation_tps: (counts.gen_count >= 2).then(|| {
-                batch_size * f64::from(counts.gen_count) / seconds(sum_ns(after_first_token(run)))
-            }),
+            generation_tps: (counts.gen_count >= 2)
+                .then(|| batch_size * f64::from(counts.gen_count) / seconds(sum_ns(decode_ns))),
             peak_memory: run.peak_memory_bytes.map(gigabytes),
         })
         .collect::<Vec<MlxTrial>>();
@@ -211,14 +213,13 @@ fn mlx(
 }
 
 fn sglang(
-    prefills_ns: &[(u64, &RunSamples)],
+    prefills_ns: &[(u64, &RunSamples, &[u64])],
     counts: TokenCounts,
 ) -> Sglang {
     let batch_size = f64::from(counts.batch_size);
     let runs = prefills_ns
         .iter()
-        .map(|&(prefill_ns, run)| {
-            let decode_ns = after_first_token(run);
+        .map(|&(prefill_ns, _, decode_ns)| {
             let prefill_latency = seconds(prefill_ns);
             let decode_latencies = decode_ns
                 .iter()
@@ -243,12 +244,10 @@ fn sglang(
     }
 }
 
-fn vllm(prefills_ns: &[(u64, &RunSamples)]) -> Result<Vllm, BenchError> {
+fn vllm(prefills_ns: &[(u64, &RunSamples, &[u64])]) -> Result<Vllm, BenchError> {
     let latencies = prefills_ns
         .iter()
-        .map(|&(prefill_ns, run)| {
-            seconds(prefill_ns.saturating_add(sum_ns(after_first_token(run))))
-        })
+        .map(|&(prefill_ns, _, decode_ns)| seconds(prefill_ns.saturating_add(sum_ns(decode_ns))))
         .collect::<Vec<f64>>();
     let mut sorted = latencies.clone();
     sorted.sort_unstable_by(f64::total_cmp);
@@ -268,19 +267,19 @@ fn vllm(prefills_ns: &[(u64, &RunSamples)]) -> Result<Vllm, BenchError> {
 }
 
 fn candle(
-    prefills_ns: &[(u64, &RunSamples)],
+    prefills_ns: &[(u64, &RunSamples, &[u64])],
     counts: TokenCounts,
 ) -> Candle {
     let generated_after_first = f64::from(counts.batch_size) * (f64::from(counts.gen_count) - 1.0);
     Candle {
         tokens_per_s: prefills_ns
             .iter()
-            .map(|&(_, run)| generated_after_first / seconds(sum_ns(after_first_token(run))))
+            .map(|&(_, _, decode_ns)| generated_after_first / seconds(sum_ns(decode_ns)))
             .collect(),
     }
 }
 
-fn after_first_token(run: &RunSamples) -> &[u64] {
+fn decode_ns_without_last(run: &RunSamples) -> &[u64] {
     run.decode_ns
         .split_last()
         .map_or(&[][..], |(_, decode_ns)| decode_ns)
