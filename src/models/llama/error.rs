@@ -61,8 +61,8 @@ pub enum LlamaError {
     #[error("Layer cache count does not match the layer count.")]
     CacheLayerCount,
 
-    #[error("Token count is not a multiple of the position count.")]
-    BatchMismatch,
+    #[error("Input IDs are not [batch, seq_len].")]
+    InputIdsShape,
 
     #[error("Tensor operation failed.")]
     Tensor,

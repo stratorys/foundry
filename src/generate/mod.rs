@@ -6,7 +6,6 @@ use std::time::{
     Instant,
 };
 
-use half::bf16;
 use tracing::error;
 
 pub use self::error::GenerateError;
@@ -34,8 +33,6 @@ pub trait CausalLm<D: Device> {
         &self,
         device: &mut D,
         input_ids: &Tensor<D>,
-        position_ids: &Tensor<D>,
-        attention_mask: &Tensor<D>,
         past_key_values: &mut Self::Cache,
         past_seen_tokens: usize,
     ) -> Result<Tensor<D>, Self::Error>;
@@ -125,33 +122,16 @@ impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
         input_ids: &[u32],
         past_seen_tokens: usize,
     ) -> Result<Vec<u32>, GenerateError> {
-        let token_count = input_ids.len();
-        let (seq_len, kv_length) = step_lens(token_count, self.batch_size, past_seen_tokens)?;
+        let seq_len = step_seq_len(input_ids.len(), self.batch_size)?;
         let token_bytes = input_ids
             .iter()
             .flat_map(|token_id| token_id.to_le_bytes())
             .collect::<Vec<u8>>();
-        let input_ids = self.tensor_from_bytes(&token_bytes, DType::U32, &[token_count])?;
-        let position_ids = self.tensor_from_bytes(
-            &position_ids(past_seen_tokens, kv_length)?,
-            DType::U32,
-            &[seq_len],
-        )?;
-        let attention_mask = self.tensor_from_bytes(
-            &create_causal_mask(past_seen_tokens, kv_length),
-            DType::BF16,
-            &[seq_len, kv_length],
-        )?;
+        let input_ids =
+            self.tensor_from_bytes(&token_bytes, DType::U32, &[self.batch_size.get(), seq_len])?;
         let logits = self
             .model
-            .forward(
-                self.device,
-                &input_ids,
-                &position_ids,
-                &attention_mask,
-                &mut self.cache,
-                past_seen_tokens,
-            )
+            .forward(self.device, &input_ids, &mut self.cache, past_seen_tokens)
             .map_err(|error| {
                 error!(message = "Model forward failed.", past_seen_tokens, seq_len, %error);
                 GenerateError::Forward
@@ -209,30 +189,21 @@ fn batch_dims(prompts: &[&[u32]]) -> Result<(NonZeroUsize, usize), GenerateError
     Ok((batch_size, prompt_len))
 }
 
-fn step_lens(
+fn step_seq_len(
     token_count: usize,
     batch_size: NonZeroUsize,
-    past_seen_tokens: usize,
-) -> Result<(usize, usize), GenerateError> {
+) -> Result<usize, GenerateError> {
     let batch_size = batch_size.get();
-    let Some(seq_len) = token_count
+    token_count
         .checked_div(batch_size)
         .filter(|seq_len| seq_len.checked_mul(batch_size) == Some(token_count))
-    else {
-        error!(
-            message = "Token count is not a multiple of the batch size.",
-            token_count, batch_size
-        );
-        return Err(GenerateError::BatchMismatch);
-    };
-    let kv_length = past_seen_tokens.checked_add(seq_len).ok_or_else(|| {
-        error!(
-            message = "Token position overflows usize.",
-            past_seen_tokens, seq_len
-        );
-        GenerateError::PositionOverflow
-    })?;
-    Ok((seq_len, kv_length))
+        .ok_or_else(|| {
+            error!(
+                message = "Token count is not a multiple of the batch size.",
+                token_count, batch_size
+            );
+            GenerateError::BatchMismatch
+        })
 }
 
 fn decode_token_ids(
@@ -274,58 +245,16 @@ fn extend_rows(
         .collect()
 }
 
-fn position_ids(
-    past_seen_tokens: usize,
-    kv_length: usize,
-) -> Result<Vec<u8>, GenerateError> {
-    (past_seen_tokens..kv_length)
-        .map(|token_position| {
-            u32::try_from(token_position).map_err(|_| {
-                error!(
-                    message = "Token position does not fit in u32.",
-                    token_position
-                );
-                GenerateError::PositionOverflow
-            })
-        })
-        .try_fold(Vec::new(), |mut bytes, token_position| {
-            bytes.extend(token_position?.to_le_bytes());
-            Ok(bytes)
-        })
-}
-
-fn create_causal_mask(
-    past_seen_tokens: usize,
-    kv_length: usize,
-) -> Vec<u8> {
-    (past_seen_tokens..kv_length)
-        .flat_map(|query_position| {
-            (0..kv_length).map(move |key_position| {
-                if key_position <= query_position {
-                    bf16::ZERO
-                } else {
-                    bf16::NEG_INFINITY
-                }
-            })
-        })
-        .flat_map(bf16::to_le_bytes)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
 
-    use half::bf16;
-
     use crate::generate::{
         GenerateError,
         batch_dims,
-        create_causal_mask,
         decode_token_ids,
         extend_rows,
-        position_ids,
-        step_lens,
+        step_seq_len,
     };
 
     #[test]
@@ -352,27 +281,20 @@ mod tests {
     }
 
     #[test]
-    fn step_lens_splits_the_tokens_over_the_batch() {
+    fn step_seq_len_splits_the_tokens_over_the_batch() {
         assert_eq!(
-            step_lens(6, NonZeroUsize::new(2).expect("2 is not zero"), 4),
-            Ok((3, 7)),
-            "six tokens over two sequences at position 4"
+            step_seq_len(6, NonZeroUsize::new(2).expect("2 is not zero")),
+            Ok(3),
+            "six tokens over two sequences"
         );
     }
 
     #[test]
-    fn step_lens_rejects_a_ragged_step_or_a_position_overflow() {
-        let batch_size = NonZeroUsize::new(2).expect("2 is not zero");
+    fn step_seq_len_rejects_a_ragged_step() {
         assert_eq!(
-            [
-                step_lens(3, batch_size, 0),
-                step_lens(2, batch_size, usize::MAX)
-            ],
-            [
-                Err(GenerateError::BatchMismatch),
-                Err(GenerateError::PositionOverflow)
-            ],
-            "three tokens over two sequences, then one token past usize::MAX"
+            step_seq_len(3, NonZeroUsize::new(2).expect("2 is not zero")),
+            Err(GenerateError::BatchMismatch),
+            "three tokens over two sequences"
         );
     }
 
@@ -413,54 +335,6 @@ mod tests {
             extend_rows(vec![vec![2], vec![3]], &[4, 5], &[3]),
             vec![vec![2, 4], vec![3]],
             "row 1 ended on stop id 3"
-        );
-    }
-
-    #[test]
-    fn create_causal_mask_of_a_prefill_hides_later_keys() {
-        let zero = bf16::ZERO;
-        let hidden = bf16::NEG_INFINITY;
-        assert_eq!(
-            create_causal_mask(0, 3),
-            [zero, hidden, hidden, zero, zero, hidden, zero, zero, zero]
-                .into_iter()
-                .flat_map(bf16::to_le_bytes)
-                .collect::<Vec<u8>>(),
-            "three queries over three keys, lower triangle visible"
-        );
-    }
-
-    #[test]
-    fn create_causal_mask_of_a_decode_step_shows_every_key() {
-        assert_eq!(
-            create_causal_mask(4, 5),
-            [bf16::ZERO; 5]
-                .into_iter()
-                .flat_map(bf16::to_le_bytes)
-                .collect::<Vec<u8>>(),
-            "one query at position 4 sees keys 0 to 4"
-        );
-    }
-
-    #[test]
-    fn position_ids_count_from_the_cache_offset() {
-        assert_eq!(
-            position_ids(2, 5),
-            Ok([2_u32, 3, 4]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<u8>>()),
-            "positions 2, 3 and 4"
-        );
-    }
-
-    #[test]
-    fn position_ids_beyond_u32_are_rejected() {
-        let past_seen_tokens = usize::try_from(u32::MAX).expect("u32 fits in usize");
-        assert_eq!(
-            position_ids(past_seen_tokens, past_seen_tokens.saturating_add(2)),
-            Err(GenerateError::PositionOverflow),
-            "position u32::MAX + 1 does not fit"
         );
     }
 }

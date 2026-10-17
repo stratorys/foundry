@@ -78,6 +78,9 @@ pub enum TensorError {
     #[error("Layer index exceeds the cache layers.")]
     CacheLayerOutOfRange,
 
+    #[error("Token position does not fit the position type.")]
+    PositionOverflow,
+
     #[error("Operand count does not match the operation.")]
     OperandCount,
 

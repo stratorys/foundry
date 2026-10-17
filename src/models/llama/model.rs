@@ -23,6 +23,8 @@ use crate::nn::{
     StaticCache,
     Tensor,
     TensorError,
+    create_causal_mask,
+    position_ids,
 };
 use crate::weights::Weights;
 
@@ -92,14 +94,11 @@ impl<D: Device> CausalLm<D> for LlamaForCausalLm<D> {
         &self,
         device: &mut D,
         input_ids: &Tensor<D>,
-        position_ids: &Tensor<D>,
-        attention_mask: &Tensor<D>,
         past_key_values: &mut Self::Cache,
         past_seen_tokens: usize,
     ) -> Result<Tensor<D>, Self::Error> {
         check_forward(
-            input_ids.shape().numel(),
-            position_ids.shape().numel(),
+            input_ids.shape().dims(),
             past_seen_tokens,
             self.model.max_cache_len,
             past_key_values.num_layers(),
@@ -107,14 +106,7 @@ impl<D: Device> CausalLm<D> for LlamaForCausalLm<D> {
         )?;
         let hidden_states = self
             .model
-            .forward(
-                device,
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                past_seen_tokens,
-            )
+            .forward(device, input_ids, past_key_values, past_seen_tokens)
             .map_err(tensor_failed)?;
         self.last_token_logits(device, &hidden_states)
             .map_err(tensor_failed)
@@ -200,28 +192,14 @@ impl<D: Device> LlamaModel<D> {
         &self,
         device: &mut D,
         input_ids: &Tensor<D>,
-        position_ids: &Tensor<D>,
-        attention_mask: &Tensor<D>,
         past_key_values: &mut StaticCache<D>,
         past_seen_tokens: usize,
     ) -> Result<Tensor<D>, TensorError> {
-        let seq_len = position_ids.shape().numel();
-        let batch_size = input_ids
-            .shape()
-            .numel()
-            .checked_div(seq_len)
-            .ok_or_else(|| {
-                error!(message = "Forward input holds no position.");
-                TensorError::NumelMismatch
-            })?;
-        let inputs_embeds = self.embed_tokens.forward(device, input_ids)?;
-        let hidden_size = inputs_embeds
-            .shape()
-            .size(inputs_embeds.shape().last_dim()?)?;
-        let inputs_embeds = inputs_embeds.reshape(Shape::try_from(
-            [batch_size, seq_len, hidden_size].as_slice(),
-        )?)?;
-        let [cos, sin] = self.rotary_emb.forward(device, position_ids)?;
+        let seq_len = input_ids.shape().size(SEQ_DIM)?;
+        let position_ids = position_ids(device, past_seen_tokens, seq_len)?;
+        let attention_mask = create_causal_mask(device, past_seen_tokens, seq_len)?;
+        let inputs_embeds = self.embed(device, input_ids)?;
+        let [cos, sin] = self.rotary_emb.forward(device, &position_ids)?;
         let hidden_states =
             self.layers
                 .iter()
@@ -230,7 +208,7 @@ impl<D: Device> LlamaModel<D> {
                         device,
                         &hidden_states,
                         [&cos, &sin],
-                        attention_mask,
+                        &attention_mask,
                         past_key_values,
                         past_seen_tokens,
                     )
@@ -381,27 +359,22 @@ fn load_rms_norm<D: Device, S: AsRef<[u8]>>(
 }
 
 fn check_forward(
-    token_count: usize,
-    seq_len: usize,
+    dims: &[usize],
     past_seen_tokens: usize,
     max_cache_len: usize,
     cache_count: usize,
     layer_count: usize,
 ) -> Result<(), LlamaError> {
-    if token_count == 0 {
-        error!(message = "Forward input holds no token.");
-        return Err(LlamaError::EmptyInput);
-    }
-    let is_whole_batch = token_count
-        .checked_div(seq_len)
-        .and_then(|batch_size| batch_size.checked_mul(seq_len))
-        == Some(token_count);
-    if !is_whole_batch {
+    let &[batch_size, seq_len] = dims else {
+        error!(message = "Input IDs are not [batch, seq_len].", ?dims);
+        return Err(LlamaError::InputIdsShape);
+    };
+    if batch_size == 0 || seq_len == 0 {
         error!(
-            message = "Token count is not a multiple of the position count.",
-            token_count, seq_len,
+            message = "Forward input holds no token.",
+            batch_size, seq_len
         );
-        return Err(LlamaError::BatchMismatch);
+        return Err(LlamaError::EmptyInput);
     }
     past_seen_tokens
         .checked_add(seq_len)
@@ -456,11 +429,11 @@ mod tests {
     fn check_forward_accepts_whole_batches_that_fit_the_cache() {
         assert_eq!(
             [
-                check_forward(6, 3, 4, 8, 2, 2),
-                check_forward(6, 3, 5, 8, 2, 2)
+                check_forward(&[2, 3], 4, 8, 2, 2),
+                check_forward(&[2, 3], 5, 8, 2, 2)
             ],
             [Ok(()), Ok(())],
-            "six tokens over three positions from position 4, then up to the cache end"
+            "two sequences of three tokens from position 4, then up to the cache end"
         );
     }
 
@@ -468,20 +441,23 @@ mod tests {
     fn check_forward_rejects_invalid_steps() {
         assert_eq!(
             [
-                check_forward(0, 0, 0, 8, 2, 2),
-                check_forward(5, 3, 0, 8, 2, 2),
-                check_forward(6, 3, 6, 8, 2, 2),
-                check_forward(6, 3, usize::MAX, usize::MAX, 2, 2),
-                check_forward(6, 3, 0, 8, 1, 2),
+                check_forward(&[6], 0, 8, 2, 2),
+                check_forward(&[2, 0], 0, 8, 2, 2),
+                check_forward(&[0, 3], 0, 8, 2, 2),
+                check_forward(&[2, 3], 6, 8, 2, 2),
+                check_forward(&[2, 3], usize::MAX, usize::MAX, 2, 2),
+                check_forward(&[2, 3], 0, 8, 1, 2),
             ],
             [
+                Err(LlamaError::InputIdsShape),
                 Err(LlamaError::EmptyInput),
-                Err(LlamaError::BatchMismatch),
+                Err(LlamaError::EmptyInput),
                 Err(LlamaError::CacheOverflow),
                 Err(LlamaError::CacheOverflow),
                 Err(LlamaError::CacheLayerCount),
             ],
-            "no token, ragged step, past the cache end, position overflow, missing layer cache"
+            "flat ids, no position, no sequence, past the cache end, position overflow, missing \
+             layer cache"
         );
     }
 }

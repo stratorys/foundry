@@ -5,6 +5,7 @@ mod error;
 mod kv_cache;
 mod layout;
 mod linear;
+mod masking;
 mod memory;
 mod norm;
 pub mod primitive;
@@ -27,6 +28,10 @@ pub use self::layout::Layout;
 pub use self::linear::{
     Embedding,
     Linear,
+};
+pub use self::masking::{
+    create_causal_mask,
+    position_ids,
 };
 pub use self::memory::{
     AllocatedMemory,
