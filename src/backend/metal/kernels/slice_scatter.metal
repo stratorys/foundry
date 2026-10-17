@@ -18,5 +18,4 @@ slice_scatter_strided(device const T *input [[buffer(0)]],
       constant StridedArgs &, uint);
 
 INSTANTIATE_SLICE_SCATTER("slice_scatter_f32", float)
-INSTANTIATE_SLICE_SCATTER("slice_scatter_f16", half)
 INSTANTIATE_SLICE_SCATTER("slice_scatter_bf16", bf16_t)

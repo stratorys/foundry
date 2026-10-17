@@ -12,9 +12,6 @@ kernel void copy_strided(device const T *input [[buffer(0)]],
 template [[host_name("copy_f32")]] kernel void
 copy_strided<float>(device const float *, device float *,
                     constant StridedArgs &, uint);
-template [[host_name("copy_f16")]] kernel void
-copy_strided<half>(device const half *, device half *, constant StridedArgs &,
-                   uint);
 template [[host_name("copy_bf16")]] kernel void
 copy_strided<bf16_t>(device const bf16_t *, device bf16_t *,
                      constant StridedArgs &, uint);
@@ -38,11 +35,6 @@ kernel void to_dtype_strided(device const In *input [[buffer(0)]],
       device const In *, device Out *, constant StridedArgs &, uint);
 
 INSTANTIATE_TO_DTYPE("to_dtype_f32_f32", float, float)
-INSTANTIATE_TO_DTYPE("to_dtype_f32_f16", float, half)
 INSTANTIATE_TO_DTYPE("to_dtype_f32_bf16", float, bf16_t)
-INSTANTIATE_TO_DTYPE("to_dtype_f16_f32", half, float)
-INSTANTIATE_TO_DTYPE("to_dtype_f16_f16", half, half)
-INSTANTIATE_TO_DTYPE("to_dtype_f16_bf16", half, bf16_t)
 INSTANTIATE_TO_DTYPE("to_dtype_bf16_f32", bf16_t, float)
-INSTANTIATE_TO_DTYPE("to_dtype_bf16_f16", bf16_t, half)
 INSTANTIATE_TO_DTYPE("to_dtype_bf16_bf16", bf16_t, bf16_t)

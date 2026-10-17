@@ -5,7 +5,6 @@ use crate::nn::TensorError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,
-    F16,
     BF16,
     U32,
 }
@@ -16,11 +15,11 @@ impl DType {
     pub const fn itemsize(self) -> usize {
         match self {
             Self::F32 | Self::U32 => 4,
-            Self::F16 | Self::BF16 => 2,
+            Self::BF16 => 2,
         }
     }
 
-    pub const fn is_float(self) -> bool { matches!(self, Self::F32 | Self::F16 | Self::BF16) }
+    pub const fn is_float(self) -> bool { matches!(self, Self::F32 | Self::BF16) }
 }
 
 pub fn exact_f32(value: usize) -> Result<f32, TensorError> {
@@ -45,17 +44,17 @@ mod tests {
     #[test]
     fn size_bytes_matches_each_dtype() {
         assert_eq!(
-            [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::itemsize),
-            [4, 2, 2, 4],
-            "f32 and u32 take four bytes, f16 and bf16 two"
+            [DType::F32, DType::BF16, DType::U32].map(DType::itemsize),
+            [4, 2, 4],
+            "f32 and u32 take four bytes, bf16 two"
         );
     }
 
     #[test]
     fn is_float_is_true_for_float_dtypes_only() {
         assert_eq!(
-            [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::is_float),
-            [true, true, true, false],
+            [DType::F32, DType::BF16, DType::U32].map(DType::is_float),
+            [true, true, false],
             "u32 is the only non-float dtype"
         );
     }

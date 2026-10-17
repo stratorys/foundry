@@ -339,7 +339,6 @@ fn parse_tensor(
 fn parse_dtype(dtype: Dtype) -> Option<DType> {
     [
         (Dtype::F32, DType::F32),
-        (Dtype::F16, DType::F16),
         (Dtype::BF16, DType::BF16),
         (Dtype::U32, DType::U32),
     ]
@@ -695,36 +694,39 @@ mod tests {
 
     #[test]
     fn unknown_dtype_is_rejected() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "I64", "shape": [1], "data_offsets": [0, 8] } }),
-        )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
+        [("I64", 1), ("F16", 4)]
             .into_iter()
-            .chain(header)
-            .chain(0..8)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::UnknownDType),
-            "dtype I64 is not supported"
-        );
+            .for_each(|(dtype, size)| {
+                let header = serde_json::to_vec(
+                    &json!({ "a": { "dtype": dtype, "shape": [size], "data_offsets": [0, 8] } }),
+                )
+                .expect("the header serializes");
+                let file: Vec<u8> = u64::try_from(header.len())
+                    .expect("the header length fits in u64")
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(header)
+                    .chain(0..8)
+                    .collect();
+                assert_eq!(
+                    Weights::from_shards(
+                        None,
+                        vec![Shard {
+                            name: "model.safetensors".to_owned(),
+                            bytes: file
+                        }]
+                    )
+                    .err(),
+                    Some(WeightsError::UnknownDType),
+                    "dtype {dtype} is not supported"
+                );
+            });
     }
 
     #[test]
-    fn f16_and_u32_dtypes_are_accepted() {
+    fn u32_dtype_is_accepted() {
         let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "F16", "shape": [2], "data_offsets": [0, 4] },
-            "b": { "dtype": "U32", "shape": [1], "data_offsets": [4, 8] },
+            "b": { "dtype": "U32", "shape": [1], "data_offsets": [0, 4] },
         }))
         .expect("the header serializes");
         let file: Vec<u8> = u64::try_from(header.len())
@@ -732,7 +734,7 @@ mod tests {
             .to_le_bytes()
             .into_iter()
             .chain(header)
-            .chain(0..8)
+            .chain(0..4)
             .collect();
         let weights = Weights::from_shards(
             None,
@@ -742,11 +744,6 @@ mod tests {
             }],
         )
         .expect("the file is valid");
-        assert_eq!(
-            weights.tensor("a").map(|view| view.dtype),
-            Some(DType::F16),
-            "dtype of a"
-        );
         assert_eq!(
             weights.tensor("b").map(|view| view.dtype),
             Some(DType::U32),

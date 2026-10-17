@@ -26,8 +26,6 @@ struct bf16_t {
 
 inline float to_float(float value) { return value; }
 
-inline float to_float(half value) { return float(value); }
-
 inline float to_float(bf16_t value) {
   return as_type<float>(uint(value.bits) << 16);
 }
@@ -35,8 +33,6 @@ inline float to_float(bf16_t value) {
 template <typename T> T from_float(float value);
 
 template <> inline float from_float<float>(float value) { return value; }
-
-template <> inline half from_float<half>(float value) { return half(value); }
 
 template <> inline bf16_t from_float<bf16_t>(float value) {
   uint bits = as_type<uint>(value);

@@ -72,5 +72,4 @@ kernel void matmul_tiled(device const T *lhs [[buffer(0)]],
       uint3, uint3);
 
 INSTANTIATE_MATMUL("matmul_f32", float)
-INSTANTIATE_MATMUL("matmul_f16", half)
 INSTANTIATE_MATMUL("matmul_bf16", bf16_t)

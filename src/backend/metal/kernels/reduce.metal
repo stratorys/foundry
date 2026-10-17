@@ -88,11 +88,8 @@ kernel void argmax_rows(device const T *input [[buffer(0)]],
       device const T *, device uint *, constant ReduceArgs &, uint, uint);
 
 INSTANTIATE_REDUCE("reduce_sum_f32", float, SumOp)
-INSTANTIATE_REDUCE("reduce_sum_f16", half, SumOp)
 INSTANTIATE_REDUCE("reduce_sum_bf16", bf16_t, SumOp)
 INSTANTIATE_REDUCE("reduce_amax_f32", float, AmaxOp)
-INSTANTIATE_REDUCE("reduce_amax_f16", half, AmaxOp)
 INSTANTIATE_REDUCE("reduce_amax_bf16", bf16_t, AmaxOp)
 INSTANTIATE_ARGMAX("reduce_argmax_f32", float)
-INSTANTIATE_ARGMAX("reduce_argmax_f16", half)
 INSTANTIATE_ARGMAX("reduce_argmax_bf16", bf16_t)

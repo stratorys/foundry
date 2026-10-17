@@ -34,5 +34,4 @@ kernel void index_select_rows(device const T *table [[buffer(0)]],
       constant IndexSelectArgs &, uint);
 
 INSTANTIATE_INDEX_SELECT("index_select_f32", float)
-INSTANTIATE_INDEX_SELECT("index_select_f16", half)
 INSTANTIATE_INDEX_SELECT("index_select_bf16", bf16_t)

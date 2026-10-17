@@ -35,14 +35,10 @@ kernel void binary_strided(device const T *lhs [[buffer(0)]],
       constant StridedArgs &, uint);
 
 INSTANTIATE_BINARY("binary_add_f32", float, AddOp)
-INSTANTIATE_BINARY("binary_add_f16", half, AddOp)
 INSTANTIATE_BINARY("binary_add_bf16", bf16_t, AddOp)
 INSTANTIATE_BINARY("binary_sub_f32", float, SubOp)
-INSTANTIATE_BINARY("binary_sub_f16", half, SubOp)
 INSTANTIATE_BINARY("binary_sub_bf16", bf16_t, SubOp)
 INSTANTIATE_BINARY("binary_mul_f32", float, MulOp)
-INSTANTIATE_BINARY("binary_mul_f16", half, MulOp)
 INSTANTIATE_BINARY("binary_mul_bf16", bf16_t, MulOp)
 INSTANTIATE_BINARY("binary_div_f32", float, DivOp)
-INSTANTIATE_BINARY("binary_div_f16", half, DivOp)
 INSTANTIATE_BINARY("binary_div_bf16", bf16_t, DivOp)

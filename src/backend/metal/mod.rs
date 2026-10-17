@@ -1116,7 +1116,6 @@ fn threadgroup_too_small(
 fn copy_kernel(dtype: DType) -> &'static str {
     match dtype {
         DType::F32 => "copy_f32",
-        DType::F16 => "copy_f16",
         DType::BF16 => "copy_bf16",
         DType::U32 => "copy_u32",
     }
@@ -1128,13 +1127,8 @@ fn to_dtype_kernel(
 ) -> Result<&'static str, MetalError> {
     Ok(match (dtype_from, dtype_to) {
         (DType::F32, DType::F32) => "to_dtype_f32_f32",
-        (DType::F32, DType::F16) => "to_dtype_f32_f16",
         (DType::F32, DType::BF16) => "to_dtype_f32_bf16",
-        (DType::F16, DType::F32) => "to_dtype_f16_f32",
-        (DType::F16, DType::F16) => "to_dtype_f16_f16",
-        (DType::F16, DType::BF16) => "to_dtype_f16_bf16",
         (DType::BF16, DType::F32) => "to_dtype_bf16_f32",
-        (DType::BF16, DType::F16) => "to_dtype_bf16_f16",
         (DType::BF16, DType::BF16) => "to_dtype_bf16_bf16",
         (DType::U32, _) | (_, DType::U32) => return Err(not_float(DType::U32)),
     })
@@ -1146,16 +1140,12 @@ fn unary_kernel(
 ) -> Result<&'static str, MetalError> {
     Ok(match (op, dtype) {
         (UnaryOp::Neg, DType::F32) => "unary_neg_f32",
-        (UnaryOp::Neg, DType::F16) => "unary_neg_f16",
         (UnaryOp::Neg, DType::BF16) => "unary_neg_bf16",
         (UnaryOp::Exp, DType::F32) => "unary_exp_f32",
-        (UnaryOp::Exp, DType::F16) => "unary_exp_f16",
         (UnaryOp::Exp, DType::BF16) => "unary_exp_bf16",
         (UnaryOp::Sqrt, DType::F32) => "unary_sqrt_f32",
-        (UnaryOp::Sqrt, DType::F16) => "unary_sqrt_f16",
         (UnaryOp::Sqrt, DType::BF16) => "unary_sqrt_bf16",
         (UnaryOp::Reciprocal, DType::F32) => "unary_reciprocal_f32",
-        (UnaryOp::Reciprocal, DType::F16) => "unary_reciprocal_f16",
         (UnaryOp::Reciprocal, DType::BF16) => "unary_reciprocal_bf16",
         (_, DType::U32) => return Err(not_float(dtype)),
     })
@@ -1167,16 +1157,12 @@ fn binary_kernel(
 ) -> Result<&'static str, MetalError> {
     Ok(match (op, dtype) {
         (BinaryOp::Add, DType::F32) => "binary_add_f32",
-        (BinaryOp::Add, DType::F16) => "binary_add_f16",
         (BinaryOp::Add, DType::BF16) => "binary_add_bf16",
         (BinaryOp::Sub, DType::F32) => "binary_sub_f32",
-        (BinaryOp::Sub, DType::F16) => "binary_sub_f16",
         (BinaryOp::Sub, DType::BF16) => "binary_sub_bf16",
         (BinaryOp::Mul, DType::F32) => "binary_mul_f32",
-        (BinaryOp::Mul, DType::F16) => "binary_mul_f16",
         (BinaryOp::Mul, DType::BF16) => "binary_mul_bf16",
         (BinaryOp::Div, DType::F32) => "binary_div_f32",
-        (BinaryOp::Div, DType::F16) => "binary_div_f16",
         (BinaryOp::Div, DType::BF16) => "binary_div_bf16",
         (_, DType::U32) => return Err(not_float(dtype)),
     })
@@ -1188,13 +1174,10 @@ fn reduce_kernel(
 ) -> Result<&'static str, MetalError> {
     Ok(match (op, dtype) {
         (ReduceOp::Sum, DType::F32) => "reduce_sum_f32",
-        (ReduceOp::Sum, DType::F16) => "reduce_sum_f16",
         (ReduceOp::Sum, DType::BF16) => "reduce_sum_bf16",
         (ReduceOp::Amax, DType::F32) => "reduce_amax_f32",
-        (ReduceOp::Amax, DType::F16) => "reduce_amax_f16",
         (ReduceOp::Amax, DType::BF16) => "reduce_amax_bf16",
         (ReduceOp::Argmax, DType::F32) => "reduce_argmax_f32",
-        (ReduceOp::Argmax, DType::F16) => "reduce_argmax_f16",
         (ReduceOp::Argmax, DType::BF16) => "reduce_argmax_bf16",
         (_, DType::U32) => return Err(not_float(dtype)),
     })
@@ -1203,7 +1186,6 @@ fn reduce_kernel(
 fn matmul_kernel(dtype: DType) -> Result<&'static str, MetalError> {
     Ok(match dtype {
         DType::F32 => "matmul_f32",
-        DType::F16 => "matmul_f16",
         DType::BF16 => "matmul_bf16",
         DType::U32 => return Err(not_float(dtype)),
     })
@@ -1212,7 +1194,6 @@ fn matmul_kernel(dtype: DType) -> Result<&'static str, MetalError> {
 fn index_select_kernel(dtype: DType) -> Result<&'static str, MetalError> {
     Ok(match dtype {
         DType::F32 => "index_select_f32",
-        DType::F16 => "index_select_f16",
         DType::BF16 => "index_select_bf16",
         DType::U32 => return Err(not_float(dtype)),
     })
@@ -1221,7 +1202,6 @@ fn index_select_kernel(dtype: DType) -> Result<&'static str, MetalError> {
 fn slice_scatter_kernel(dtype: DType) -> Result<&'static str, MetalError> {
     Ok(match dtype {
         DType::F32 => "slice_scatter_f32",
-        DType::F16 => "slice_scatter_f16",
         DType::BF16 => "slice_scatter_bf16",
         DType::U32 => return Err(not_float(dtype)),
     })
@@ -1462,25 +1442,6 @@ mod tests {
     }
 
     #[test]
-    fn f16_round_trip_returns_the_same_bytes() {
-        let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let bytes: Vec<u8> = [0x3C00_u16, 0xC100, 0x4248, 0x0001, 0x8000, 0x7BFF]
-            .iter()
-            .flat_map(|bits| bits.to_le_bytes())
-            .collect();
-        let read_back = Tensor::from_bytes(
-            &mut backend,
-            &bytes,
-            DType::F16,
-            Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds")
-        .to_bytes(&mut backend)
-        .expect("to_bytes succeeds");
-        assert_eq!(read_back, bytes, "f16 bytes survive the round trip");
-    }
-
-    #[test]
     fn bf16_round_trip_returns_the_same_bytes() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let bytes: Vec<u8> = [0x3F80_u16, 0xC020, 0x4049, 0x0001, 0x8000, 0x7F7F]
@@ -1536,7 +1497,7 @@ mod tests {
     #[test]
     fn zeros_to_bytes_only_zero_bytes() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        [DType::F32, DType::F16, DType::BF16, DType::U32]
+        [DType::F32, DType::BF16, DType::U32]
             .into_iter()
             .for_each(|dtype| {
                 let read_back = Tensor::zeros(
@@ -1683,31 +1644,29 @@ mod tests {
             Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
-        [DType::F32, DType::F16, DType::BF16]
-            .into_iter()
-            .for_each(|dtype| {
-                let copied = source
-                    .to_dtype(&mut backend, dtype)
-                    .expect("to_dtype succeeds")
-                    .permute(&[2, 0, 1])
-                    .expect("the permutation is valid")
-                    .contiguous(&mut backend)
-                    .expect("the copy succeeds");
-                assert_eq!(copied.dtype(), dtype, "the copy keeps the dtype");
-                assert_eq!(copied.shape().dims(), &[4, 2, 3], "permuted dims");
-                assert!(copied.layout().is_contiguous(), "the copy is contiguous");
-                let actual: Vec<f32> = copied
-                    .to_dtype(&mut backend, DType::F32)
-                    .expect("to_dtype succeeds")
-                    .to_bytes(&mut backend)
-                    .expect("to_bytes succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                assert_eq!(actual, expected, "permuted values for {dtype:?}");
-            });
+        [DType::F32, DType::BF16].into_iter().for_each(|dtype| {
+            let copied = source
+                .to_dtype(&mut backend, dtype)
+                .expect("to_dtype succeeds")
+                .permute(&[2, 0, 1])
+                .expect("the permutation is valid")
+                .contiguous(&mut backend)
+                .expect("the copy succeeds");
+            assert_eq!(copied.dtype(), dtype, "the copy keeps the dtype");
+            assert_eq!(copied.shape().dims(), &[4, 2, 3], "permuted dims");
+            assert!(copied.layout().is_contiguous(), "the copy is contiguous");
+            let actual: Vec<f32> = copied
+                .to_dtype(&mut backend, DType::F32)
+                .expect("to_dtype succeeds")
+                .to_bytes(&mut backend)
+                .expect("to_bytes succeeds")
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| f32::from_le_bytes(chunk))
+                .collect();
+            assert_eq!(actual, expected, "permuted values for {dtype:?}");
+        });
     }
 
     #[test]
@@ -1875,47 +1834,6 @@ mod tests {
     }
 
     #[test]
-    fn to_dtype_f32_to_f16_and_back_rounds_known_values() {
-        let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let converted = Tensor::from_bytes(
-            &mut backend,
-            &[1.0_f32, -2.5, 0.5, PI]
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<u8>>(),
-            DType::F32,
-            Shape::try_from([4].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds")
-        .to_dtype(&mut backend, DType::F16)
-        .expect("to_dtype succeeds");
-        let bits: Vec<u16> = converted
-            .to_bytes(&mut backend)
-            .expect("to_bytes succeeds")
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&chunk| u16::from_le_bytes(chunk))
-            .collect();
-        assert_eq!(bits, vec![0x3C00, 0xC100, 0x3800, 0x4248], "f16 bits");
-        let round_tripped: Vec<f32> = converted
-            .to_dtype(&mut backend, DType::F32)
-            .expect("to_dtype succeeds")
-            .to_bytes(&mut backend)
-            .expect("to_bytes succeeds")
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&chunk| f32::from_le_bytes(chunk))
-            .collect();
-        assert_eq!(
-            round_tripped,
-            vec![1.0, -2.5, 0.5, 3.140625],
-            "f16 round trip"
-        );
-    }
-
-    #[test]
     fn to_dtype_of_permuted_tensor_reads_strided_input() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let converted = Tensor::from_bytes(
@@ -1964,10 +1882,6 @@ mod tests {
             DtypeToleranceCase {
                 dtype: DType::F32,
                 tolerance: 1e-5_f32,
-            },
-            DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -2071,10 +1985,6 @@ mod tests {
             DtypeToleranceCase {
                 dtype: DType::F32,
                 tolerance: 1e-5_f32,
-            },
-            DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -2422,10 +2332,6 @@ mod tests {
                 tolerance: 1e-5_f32,
             },
             DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
-            },
-            DtypeToleranceCase {
                 dtype: DType::BF16,
                 tolerance: 1e-2,
             },
@@ -2521,56 +2427,54 @@ mod tests {
             expected: T2,
         }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        [DType::F32, DType::F16, DType::BF16]
+        [DType::F32, DType::BF16].into_iter().for_each(|dtype| {
+            [
+                DimDimsExpectedCase {
+                    dim: 0,
+                    dims: &[1, 3][..],
+                    expected: &[1_u32, 0, 1][..],
+                },
+                DimDimsExpectedCase {
+                    dim: 1,
+                    dims: &[2, 1],
+                    expected: &[1, 2],
+                },
+            ]
             .into_iter()
-            .for_each(|dtype| {
-                [
-                    DimDimsExpectedCase {
-                        dim: 0,
-                        dims: &[1, 3][..],
-                        expected: &[1_u32, 0, 1][..],
-                    },
-                    DimDimsExpectedCase {
-                        dim: 1,
-                        dims: &[2, 1],
-                        expected: &[1, 2],
-                    },
-                ]
-                .into_iter()
-                .for_each(
-                    |DimDimsExpectedCase {
-                         dim,
-                         dims,
-                         expected,
-                     }| {
-                        let indices = Tensor::from_bytes(
-                            &mut backend,
-                            &[1.0_f32, 5.0, 3.0, 4.0, 2.0, 6.0]
-                                .iter()
-                                .flat_map(|value| value.to_le_bytes())
-                                .collect::<Vec<u8>>(),
-                            DType::F32,
-                            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
-                        )
-                        .expect("from_bytes succeeds")
-                        .to_dtype(&mut backend, dtype)
-                        .expect("to_dtype succeeds")
-                        .argmax_keepdim(&mut backend, dim)
-                        .expect("the argmax succeeds");
-                        assert_eq!(indices.dtype(), DType::U32, "argmax outputs u32");
-                        assert_eq!(indices.shape().dims(), dims, "argmax keeps the dim");
-                        let actual: Vec<u32> = indices
-                            .to_bytes(&mut backend)
-                            .expect("to_bytes succeeds")
-                            .as_chunks::<4>()
-                            .0
+            .for_each(
+                |DimDimsExpectedCase {
+                     dim,
+                     dims,
+                     expected,
+                 }| {
+                    let indices = Tensor::from_bytes(
+                        &mut backend,
+                        &[1.0_f32, 5.0, 3.0, 4.0, 2.0, 6.0]
                             .iter()
-                            .map(|&chunk| u32::from_le_bytes(chunk))
-                            .collect();
-                        assert_eq!(actual, expected, "argmax over dim {dim} for {dtype:?}");
-                    },
-                );
-            });
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        DType::F32,
+                        Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                    )
+                    .expect("from_bytes succeeds")
+                    .to_dtype(&mut backend, dtype)
+                    .expect("to_dtype succeeds")
+                    .argmax_keepdim(&mut backend, dim)
+                    .expect("the argmax succeeds");
+                    assert_eq!(indices.dtype(), DType::U32, "argmax outputs u32");
+                    assert_eq!(indices.shape().dims(), dims, "argmax keeps the dim");
+                    let actual: Vec<u32> = indices
+                        .to_bytes(&mut backend)
+                        .expect("to_bytes succeeds")
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&chunk| u32::from_le_bytes(chunk))
+                        .collect();
+                    assert_eq!(actual, expected, "argmax over dim {dim} for {dtype:?}");
+                },
+            );
+        });
     }
 
     #[test]
@@ -2755,10 +2659,6 @@ mod tests {
                 tolerance: 1e-5_f32,
             },
             DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
-            },
-            DtypeToleranceCase {
                 dtype: DType::BF16,
                 tolerance: 1e-2,
             },
@@ -2840,10 +2740,6 @@ mod tests {
                 tolerance: 1e-5_f32,
             },
             DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
-            },
-            DtypeToleranceCase {
                 dtype: DType::BF16,
                 tolerance: 1e-2,
             },
@@ -2915,10 +2811,6 @@ mod tests {
             DtypeToleranceCase {
                 dtype: DType::F32,
                 tolerance: 1e-5_f32,
-            },
-            DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -3243,10 +3135,6 @@ mod tests {
                 tolerance: 1e-5_f32,
             },
             DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
-            },
-            DtypeToleranceCase {
                 dtype: DType::BF16,
                 tolerance: 1e-2,
             },
@@ -3440,10 +3328,6 @@ mod tests {
                 tolerance: 1e-5_f32,
             },
             DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
-            },
-            DtypeToleranceCase {
                 dtype: DType::BF16,
                 tolerance: 1e-2,
             },
@@ -3599,10 +3483,6 @@ mod tests {
             DtypeToleranceCase {
                 dtype: DType::F32,
                 tolerance: 1e-5_f32,
-            },
-            DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -3843,10 +3723,6 @@ mod tests {
             DtypeToleranceCase {
                 dtype: DType::F32,
                 tolerance: 1e-5_f32,
-            },
-            DtypeToleranceCase {
-                dtype: DType::F16,
-                tolerance: 1e-2,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
