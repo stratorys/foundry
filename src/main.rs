@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
 use std::io::{
@@ -42,7 +41,6 @@ use foundry::generate::{
 use foundry::models::llama::{
     Llama,
     LlamaConfig,
-    LlamaConfigError,
     LlamaWeights,
 };
 use foundry::weights::Weights;
@@ -54,9 +52,6 @@ use tracing::{
     warn,
 };
 
-const GIB_BYTES: usize = 1024 * 1024 * 1024;
-const LABEL_WIDTH: usize = 14;
-const FIELD_WIDTH: usize = 12;
 const BACKEND_NAME: &str = "metal";
 
 #[derive(Parser)]
@@ -68,16 +63,6 @@ struct Cli {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Command {
-    #[command(
-        about = "Open a model from the Hugging Face cache and summarize its weights and \
-                 architecture."
-    )]
-    Inspect {
-        #[arg(long, help = "Hugging Face repository id, as owner/name.")]
-        model: ModelId,
-        #[arg(long, help = "List every tensor with its dtype, shape and size.")]
-        tensors: bool,
-    },
     #[command(
         about = "Generate token IDs greedily from prompt token IDs on Metal and print them as \
                  JSON."
@@ -216,23 +201,6 @@ struct BenchRecord {
     report: Report,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct WeightsSummary {
-    shard_count: usize,
-    tensor_count: usize,
-    bytes: usize,
-    bytes_declared: Option<u64>,
-    dtypes: BTreeSet<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct TensorRow {
-    name: String,
-    dtype: String,
-    shape: String,
-    bytes: usize,
-}
-
 impl FromStr for ModelId {
     type Err = ModelIdError;
 
@@ -267,10 +235,6 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
     let result = match Cli::parse().command {
-        Command::Inspect {
-            model,
-            tensors,
-        } => inspect(&model, tensors),
         Command::Run {
             model,
             prompt_ids,
@@ -303,29 +267,6 @@ fn resolve_snapshot(model: &ModelId) -> Result<PathBuf, CliError> {
         .local_files_only(true)
         .send()
         .map_err(resolve_error)
-}
-
-fn inspect(
-    model: &ModelId,
-    tensors: bool,
-) -> Result<(), CliError> {
-    let directory = resolve_snapshot(model)?;
-    let weights = open_weights(&directory)?;
-    let summary = summarize_weights(model, &weights)?;
-    let config = load_architecture(&directory)?;
-    let tensor_rows = tensors.then(|| tensor_rows(&weights));
-    write_report(
-        &mut std::io::stdout().lock(),
-        model,
-        &directory,
-        &summary,
-        config.as_ref(),
-        tensor_rows.as_deref(),
-    )
-    .map_err(|error| {
-        error!(message = "Writing the report to stdout failed.", %error);
-        CliError::Output
-    })
 }
 
 fn open_weights(directory: &Path) -> Result<Weights, CliError> {
@@ -479,11 +420,27 @@ fn model_bytes<S: AsRef<[u8]>>(
     model: &ModelId,
     weights: &Weights<S>,
 ) -> Result<u64, CliError> {
-    let bytes = summarize_weights(model, weights)?.bytes;
-    u64::try_from(bytes).map_err(|_| {
-        error!(message = "Total tensor byte count overflows u64.", %model, bytes);
-        CliError::TotalByteCountOverflow
-    })
+    let bytes = weights.tensors().try_fold(0_u64, |bytes, view| {
+        u64::try_from(view.bytes.len())
+            .ok()
+            .and_then(|tensor_bytes| bytes.checked_add(tensor_bytes))
+            .ok_or_else(|| {
+                error!(message = "Total tensor byte count overflows u64.", %model);
+                CliError::TotalByteCountOverflow
+            })
+    })?;
+    if let Some(bytes_declared) = weights.bytes_declared()
+        && bytes != bytes_declared
+    {
+        error!(
+            message = "Tensor byte count does not match the index declaration.",
+            %model,
+            bytes,
+            bytes_declared,
+        );
+        return Err(CliError::BytesMismatch);
+    }
+    Ok(bytes)
 }
 
 fn parameter_count<S: AsRef<[u8]>>(
@@ -711,231 +668,8 @@ fn write_token_ids(
     writeln!(out, "[{token_ids}]")
 }
 
-fn write_report(
-    out: &mut impl Write,
-    model: &ModelId,
-    directory: &Path,
-    summary: &WeightsSummary,
-    config: Option<&LlamaConfig>,
-    tensor_rows: Option<&[TensorRow]>,
-) -> std::io::Result<()> {
-    write_header(out, model, directory)?;
-    write_weights(out, summary)?;
-    if let Some(config) = config {
-        write_architecture(out, config)?;
-    }
-    if let Some(rows) = tensor_rows {
-        write_tensors(out, rows)?;
-    }
-    Ok(())
-}
-
-fn summarize_weights<S: AsRef<[u8]>>(
-    model: &ModelId,
-    weights: &Weights<S>,
-) -> Result<WeightsSummary, CliError> {
-    let bytes = weights.tensors().try_fold(0_usize, |bytes, view| {
-        bytes.checked_add(view.bytes.len()).ok_or_else(|| {
-            error!(message = "Total tensor byte count overflows usize.", %model);
-            CliError::TotalByteCountOverflow
-        })
-    })?;
-    let bytes_declared = weights.bytes_declared();
-    if let Some(bytes_declared) = bytes_declared
-        && u64::try_from(bytes).ok() != Some(bytes_declared)
-    {
-        error!(
-            message = "Tensor byte count does not match the index declaration.",
-            %model,
-            bytes,
-            bytes_declared,
-        );
-        return Err(CliError::BytesMismatch);
-    }
-    let dtypes = weights
-        .tensors()
-        .map(|view| {
-            let dtype = view.dtype;
-            format!("{dtype:?}")
-        })
-        .collect::<BTreeSet<String>>();
-    Ok(WeightsSummary {
-        shard_count: weights.shard_count(),
-        tensor_count: weights.tensors().count(),
-        bytes,
-        bytes_declared,
-        dtypes,
-    })
-}
-
-fn load_architecture(directory: &Path) -> Result<Option<LlamaConfig>, CliError> {
-    match LlamaConfig::open(directory) {
-        Ok(config) => Ok(Some(config)),
-        Err(LlamaConfigError::ModelType) => {
-            warn!(message = "Model type is not supported; architecture is skipped.");
-            Ok(None)
-        }
-        Err(error) => {
-            error!(
-                message = "Opening the model config failed.",
-                directory = %directory.display(),
-                %error,
-            );
-            Err(CliError::Config)
-        }
-    }
-}
-
-fn tensor_rows<S: AsRef<[u8]>>(weights: &Weights<S>) -> Vec<TensorRow> {
-    let mut rows: Vec<TensorRow> = weights
-        .tensors()
-        .map(|view| {
-            let dtype = view.dtype;
-            let dims = view.shape.dims();
-            TensorRow {
-                name: view.name.to_owned(),
-                dtype: format!("{dtype:?}"),
-                shape: format!("{dims:?}"),
-                bytes: view.bytes.len(),
-            }
-        })
-        .collect();
-    rows.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
-    rows
-}
-
-fn write_header(
-    out: &mut impl Write,
-    model: &ModelId,
-    directory: &Path,
-) -> std::io::Result<()> {
-    writeln!(out, "{:<LABEL_WIDTH$}{model}", "Model")?;
-    writeln!(out, "{:<LABEL_WIDTH$}{}", "Snapshot", directory.display())
-}
-
-fn write_weights(
-    out: &mut impl Write,
-    summary: &WeightsSummary,
-) -> std::io::Result<()> {
-    let size_gib = format_gib(summary.bytes);
-    let dtypes = summary
-        .dtypes
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<&str>>()
-        .join(", ");
-    writeln!(out)?;
-    writeln!(out, "Weights")?;
-    write_field(out, "Shards", summary.shard_count)?;
-    write_field(out, "Tensors", summary.tensor_count)?;
-    write_field(
-        out,
-        "Size",
-        format_args!(
-            "{} bytes ({} GiB)",
-            summary.bytes,
-            size_gib.as_deref().unwrap_or("?")
-        ),
-    )?;
-    match summary.bytes_declared {
-        Some(bytes_declared) => write_field(
-            out,
-            "Declared",
-            format_args!("{bytes_declared} bytes (match)"),
-        )?,
-        None => write_field(out, "Declared", "no index")?,
-    }
-    write_field(out, "Dtypes", dtypes)
-}
-
-fn write_architecture(
-    out: &mut impl Write,
-    config: &LlamaConfig,
-) -> std::io::Result<()> {
-    let rope = config.rope_scaling().map_or_else(
-        || format!("theta {}, no scaling", config.rope_theta()),
-        |scaling| {
-            format!(
-                "theta {}, llama3 factor {}, low {}, high {}, original {}",
-                config.rope_theta(),
-                scaling.factor,
-                scaling.low_freq_factor,
-                scaling.high_freq_factor,
-                scaling.original_max_position_embeddings
-            )
-        },
-    );
-    let eos_token_ids = config
-        .eos_token_ids()
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<String>>()
-        .join(", ");
-    writeln!(out)?;
-    writeln!(out, "{:<LABEL_WIDTH$}llama", "Architecture")?;
-    write_field(out, "Layers", config.num_hidden_layers())?;
-    write_field(out, "Hidden", config.hidden_size())?;
-    write_field(out, "MLP", config.intermediate_size())?;
-    write_field(
-        out,
-        "Heads",
-        format_args!(
-            "{} query, {} key-value, head dim {}",
-            config.num_attention_heads(),
-            config.num_key_value_heads(),
-            config.head_dim()
-        ),
-    )?;
-    write_field(out, "Vocab", config.vocab_size())?;
-    write_field(out, "Positions", config.max_position_embeddings())?;
-    write_field(out, "RMS eps", config.rms_norm_eps())?;
-    write_field(out, "RoPE", rope)?;
-    write_field(out, "EOS", eos_token_ids)
-}
-
-fn write_tensors(
-    out: &mut impl Write,
-    rows: &[TensorRow],
-) -> std::io::Result<()> {
-    let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
-    let dtype_width = rows.iter().map(|row| row.dtype.len()).max().unwrap_or(0);
-    let shape_width = rows.iter().map(|row| row.shape.len()).max().unwrap_or(0);
-    let bytes_width = rows
-        .iter()
-        .map(|row| row.bytes.to_string().len())
-        .max()
-        .unwrap_or(0);
-    writeln!(out)?;
-    writeln!(out, "Tensors")?;
-    rows.iter().try_for_each(|row| {
-        writeln!(
-            out,
-            "  {:<name_width$}  {:<dtype_width$}  {:<shape_width$}  {:>bytes_width$}",
-            row.name, row.dtype, row.shape, row.bytes
-        )
-    })
-}
-
-fn write_field(
-    out: &mut impl Write,
-    label: &str,
-    value: impl fmt::Display,
-) -> std::io::Result<()> {
-    writeln!(out, "  {label:<FIELD_WIDTH$}{value}")
-}
-
-fn format_gib(bytes: usize) -> Option<String> {
-    let whole = bytes.checked_div(GIB_BYTES)?;
-    let hundredths = bytes
-        .checked_rem(GIB_BYTES)?
-        .checked_mul(100)?
-        .checked_div(GIB_BYTES)?;
-    Some(format!("{whole}.{hundredths:02}"))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::num::NonZeroU32;
     use std::path::PathBuf;
 
@@ -955,18 +689,11 @@ mod tests {
         Cli,
         CliError,
         Command,
-        GIB_BYTES,
         ModelId,
         ModelIdError,
-        TensorRow,
-        WeightsSummary,
-        format_gib,
+        model_bytes,
         parameter_count,
-        summarize_weights,
-        tensor_rows,
-        write_tensors,
         write_token_ids,
-        write_weights,
     };
 
     #[test]
@@ -1002,67 +729,6 @@ mod tests {
 
     #[test]
     fn cli_definition_is_consistent() { Cli::command().debug_assert(); }
-
-    #[test]
-    fn inspect_parses_model_and_tensors_flag() {
-        struct ArgsTensorsCase<T0, T1> {
-            args: T0,
-            tensors: T1,
-        }
-        [
-            ArgsTensorsCase {
-                args: vec!["foundry", "inspect", "--model", "a/b"],
-                tensors: false,
-            },
-            ArgsTensorsCase {
-                args: vec!["foundry", "inspect", "--model", "a/b", "--tensors"],
-                tensors: true,
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |ArgsTensorsCase {
-                 args,
-                 tensors,
-             }| {
-                assert_eq!(
-                    Cli::try_parse_from(&args)
-                        .map(|cli| cli.command)
-                        .map_err(|error| error.kind()),
-                    Ok(Command::Inspect {
-                        model: ModelId {
-                            owner: "a".to_owned(),
-                            name: "b".to_owned(),
-                        },
-                        tensors,
-                    }),
-                    "args {args:?}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn inspect_without_model_is_rejected() {
-        assert_eq!(
-            Cli::try_parse_from(["foundry", "inspect"])
-                .map(|cli| cli.command)
-                .map_err(|error| error.kind()),
-            Err(ErrorKind::MissingRequiredArgument),
-            "--model is required"
-        );
-    }
-
-    #[test]
-    fn inspect_with_invalid_model_is_rejected() {
-        assert_eq!(
-            Cli::try_parse_from(["foundry", "inspect", "--model", "ab"])
-                .map(|cli| cli.command)
-                .map_err(|error| error.kind()),
-            Err(ErrorKind::ValueValidation),
-            "a model id without owner is rejected"
-        );
-    }
 
     #[test]
     fn missing_subcommand_displays_the_help() {
@@ -1232,10 +898,7 @@ mod tests {
             ])
             .map(|cli| match cli.command {
                 Command::Bench(args) => Some(args.batch_size),
-                Command::Inspect {
-                    ..
-                }
-                | Command::Run {
+                Command::Run {
                     ..
                 } => None,
             })
@@ -1308,131 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn format_gib_truncates_to_two_decimals() {
-        struct BytesExpectedCase<T0, T1> {
-            bytes: T0,
-            expected: T1,
-        }
-        [
-            BytesExpectedCase {
-                bytes: 0,
-                expected: "0.00",
-            },
-            BytesExpectedCase {
-                bytes: GIB_BYTES,
-                expected: "1.00",
-            },
-            BytesExpectedCase {
-                bytes: 1_610_612_736,
-                expected: "1.50",
-            },
-            BytesExpectedCase {
-                bytes: 1_127_428_916,
-                expected: "1.05",
-            },
-            BytesExpectedCase {
-                bytes: 1_073_741_823,
-                expected: "0.99",
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |BytesExpectedCase {
-                 bytes,
-                 expected,
-             }| {
-                assert_eq!(
-                    format_gib(bytes),
-                    Some(expected.to_owned()),
-                    "{bytes} bytes"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn write_weights_prints_declared_size_when_present() {
-        struct BytesDeclaredDeclaredLineCase<T0, T1> {
-            bytes_declared: T0,
-            declared_line: T1,
-        }
-        [
-            BytesDeclaredDeclaredLineCase {
-                bytes_declared: Some(16),
-                declared_line: "  Declared    16 bytes (match)\n",
-            },
-            BytesDeclaredDeclaredLineCase {
-                bytes_declared: None,
-                declared_line: "  Declared    no index\n",
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |BytesDeclaredDeclaredLineCase {
-                 bytes_declared,
-                 declared_line,
-             }| {
-                let mut out = Vec::new();
-                write_weights(
-                    &mut out,
-                    &WeightsSummary {
-                        shard_count: 1,
-                        tensor_count: 2,
-                        bytes: 16,
-                        bytes_declared,
-                        dtypes: BTreeSet::from(["BF16".to_owned(), "F32".to_owned()]),
-                    },
-                )
-                .expect("writing to a vector succeeds");
-                assert_eq!(
-                    String::from_utf8(out),
-                    Ok(format!(
-                        "\nWeights\n  Shards      1\n  Tensors     2\n  Size        16 bytes \
-                         (0.00 GiB)\n{declared_line}  Dtypes      BF16, F32\n"
-                    )),
-                    "declared size {bytes_declared:?}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn write_tensors_aligns_columns() {
-        let mut empty = Vec::new();
-        write_tensors(&mut empty, &[]).expect("writing to a vector succeeds");
-        assert_eq!(
-            String::from_utf8(empty),
-            Ok("\nTensors\n".to_owned()),
-            "no tensor"
-        );
-        let mut out = Vec::new();
-        write_tensors(
-            &mut out,
-            &[
-                TensorRow {
-                    name: "a.long".to_owned(),
-                    dtype: "BF16".to_owned(),
-                    shape: "[2, 3]".to_owned(),
-                    bytes: 12,
-                },
-                TensorRow {
-                    name: "b".to_owned(),
-                    dtype: "F32".to_owned(),
-                    shape: "[2]".to_owned(),
-                    bytes: 8,
-                },
-            ],
-        )
-        .expect("writing to a vector succeeds");
-        assert_eq!(
-            String::from_utf8(out),
-            Ok("\nTensors\n  a.long  BF16  [2, 3]  12\n  b       F32   [2]      8\n".to_owned()),
-            "columns are padded to the widest value"
-        );
-    }
-
-    #[test]
-    fn summarize_weights_counts_shards_tensors_bytes_and_dtypes() {
+    fn model_bytes_sums_tensor_bytes() {
         let header = serde_json::to_vec(&json!({
             "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] },
             "b": { "dtype": "F32", "shape": [1], "data_offsets": [4, 8] },
@@ -1459,26 +998,20 @@ mod tests {
         )
         .expect("the shard is valid");
         assert_eq!(
-            summarize_weights(
+            model_bytes(
                 &ModelId {
                     owner: "a".to_owned(),
                     name: "b".to_owned(),
                 },
                 &weights,
             ),
-            Ok(WeightsSummary {
-                shard_count: 1,
-                tensor_count: 2,
-                bytes: 8,
-                bytes_declared: Some(8),
-                dtypes: BTreeSet::from(["BF16".to_owned(), "F32".to_owned()]),
-            }),
-            "summary of one shard with two tensors"
+            Ok(8),
+            "two tensors of four bytes matching the declared size"
         );
     }
 
     #[test]
-    fn summarize_weights_rejects_a_declared_size_mismatch() {
+    fn model_bytes_rejects_a_declared_size_mismatch() {
         let header = serde_json::to_vec(
             &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
         )
@@ -1504,7 +1037,7 @@ mod tests {
         )
         .expect("the shard is valid");
         assert_eq!(
-            summarize_weights(
+            model_bytes(
                 &ModelId {
                     owner: "a".to_owned(),
                     name: "b".to_owned(),
@@ -1548,48 +1081,6 @@ mod tests {
             ),
             Ok(8),
             "six bf16 and two f32 elements"
-        );
-    }
-
-    #[test]
-    fn tensor_rows_are_sorted_by_name() {
-        let header = serde_json::to_vec(&json!({
-            "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
-            "a": { "dtype": "BF16", "shape": [2, 1], "data_offsets": [4, 8] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..8)
-            .collect();
-        let weights = Weights::from_shards(
-            None,
-            vec![Shard {
-                name: "model.safetensors".to_owned(),
-                bytes: file,
-            }],
-        )
-        .expect("the file is valid");
-        assert_eq!(
-            tensor_rows(&weights),
-            vec![
-                TensorRow {
-                    name: "a".to_owned(),
-                    dtype: "BF16".to_owned(),
-                    shape: "[2, 1]".to_owned(),
-                    bytes: 4,
-                },
-                TensorRow {
-                    name: "b".to_owned(),
-                    dtype: "F32".to_owned(),
-                    shape: "[1]".to_owned(),
-                    bytes: 4,
-                },
-            ],
-            "rows in name order"
         );
     }
 }
