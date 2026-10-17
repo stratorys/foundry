@@ -78,23 +78,29 @@ impl Layout {
         dims: &[usize],
     ) -> Result<Self, TensorError> {
         let ndim = self.shape.ndim();
-        let invalid = || {
+        let is_permutation = dims.len() == ndim && (0..ndim).all(|dim| dims.contains(&dim));
+        if !is_permutation {
             error!(
                 message = "Dims are not a permutation of the dimensions.",
                 ?dims,
                 ndim
             );
-            TensorError::InvalidPermutation
-        };
-        let is_permutation = dims.len() == ndim && (0..ndim).all(|dim| dims.contains(&dim));
-        if !is_permutation {
-            return Err(invalid());
+            return Err(TensorError::InvalidPermutation);
         }
-        let sizes = permuted(self.shape.dims(), dims).ok_or_else(invalid)?;
-        let strides = permuted(self.strides(), dims).ok_or_else(invalid)?;
+        let sizes: [usize; MAX_RANK] = array::from_fn(|index| {
+            dims.get(index)
+                .and_then(|&dim| self.shape.dims().get(dim))
+                .copied()
+                .unwrap_or(1)
+        });
         Ok(Self {
-            shape: Shape::try_from(sizes.as_slice())?,
-            strides: padded(&strides),
+            shape: Shape::try_from(sizes.get(..ndim).unwrap_or_default())?,
+            strides: array::from_fn(|index| {
+                dims.get(index)
+                    .and_then(|&dim| self.strides().get(dim))
+                    .copied()
+                    .unwrap_or(0)
+            }),
             storage_offset: self.storage_offset,
         })
     }
@@ -130,15 +136,8 @@ impl Layout {
                 );
                 TensorError::OffsetOverflow
             })?;
-        let dims: Vec<usize> = self
-            .shape
-            .dims()
-            .iter()
-            .enumerate()
-            .map(|(index, &current)| if index == dim { length } else { current })
-            .collect();
         Ok(Self {
-            shape: Shape::try_from(dims.as_slice())?,
+            shape: self.shape.with_dim(dim, length)?,
             strides: self.strides,
             storage_offset,
         })
@@ -160,64 +159,49 @@ impl Layout {
             .ndim()
             .checked_sub(self.shape.ndim())
             .ok_or_else(incompatible)?;
-        let strides = shape
-            .dims()
-            .iter()
+        let mut strides = [0; MAX_RANK];
+        strides
+            .get_mut(..shape.ndim())
+            .unwrap_or_default()
+            .iter_mut()
+            .zip(shape.dims())
             .enumerate()
-            .map(|(dim, &size_target)| {
+            .try_for_each(|(dim, (slot, &size_target))| {
                 let Some(dim_source) = dim.checked_sub(leading) else {
-                    return Ok(0);
+                    return Ok(());
                 };
-                match (
+                *slot = match (
                     self.shape.dims().get(dim_source).copied(),
                     self.strides().get(dim_source).copied(),
                 ) {
-                    (Some(size_source), Some(stride)) if size_source == size_target => Ok(stride),
-                    (Some(1), Some(_)) => Ok(0),
-                    _ => Err(incompatible()),
-                }
-            })
-            .collect::<Result<Vec<usize>, TensorError>>()?;
+                    (Some(size_source), Some(stride)) if size_source == size_target => stride,
+                    (Some(1), Some(_)) => 0,
+                    _ => return Err(incompatible()),
+                };
+                Ok(())
+            })?;
         Ok(Self {
             shape,
-            strides: padded(&strides),
+            strides,
             storage_offset: self.storage_offset,
         })
     }
 }
 
-struct StrideFold {
-    strides: Vec<usize>,
-    stride_next: usize,
-}
-
 fn contiguous_strides(shape: &Shape) -> [usize; MAX_RANK] {
-    let strides_reversed = shape.dims().iter().rev().fold(
-        StrideFold {
-            strides: Vec::with_capacity(MAX_RANK),
-            stride_next: 1,
-        },
-        |mut fold, &size| {
-            fold.strides.push(fold.stride_next);
-            StrideFold {
-                stride_next: fold.stride_next.saturating_mul(size),
-                strides: fold.strides,
-            }
-        },
-    );
-    let strides: Vec<usize> = strides_reversed.strides.into_iter().rev().collect();
-    padded(&strides)
-}
-
-fn permuted(
-    values: &[usize],
-    dims: &[usize],
-) -> Option<Vec<usize>> {
-    dims.iter().map(|&dim| values.get(dim).copied()).collect()
-}
-
-fn padded(values: &[usize]) -> [usize; MAX_RANK] {
-    array::from_fn(|index| values.get(index).copied().unwrap_or(0))
+    let mut strides = [0; MAX_RANK];
+    let mut stride = 1_usize;
+    for (slot, &size) in strides
+        .get_mut(..shape.ndim())
+        .unwrap_or_default()
+        .iter_mut()
+        .zip(shape.dims())
+        .rev()
+    {
+        *slot = stride;
+        stride = stride.saturating_mul(size);
+    }
+    strides
 }
 
 #[cfg(test)]
@@ -576,6 +560,65 @@ mod tests {
         assert!(
             layout.is_contiguous(),
             "moving a size one dim keeps the layout contiguous"
+        );
+    }
+
+    #[test]
+    fn scalar_layout_has_no_strides_and_is_contiguous() {
+        let layout = Layout::contiguous(Shape::try_from([].as_slice()).expect("valid shape"));
+        assert_eq!(layout.strides(), &[0_usize; 0], "no strides");
+        assert!(layout.is_contiguous(), "a scalar is contiguous");
+    }
+
+    #[test]
+    fn expand_of_a_size_one_dim_with_a_non_zero_stride_uses_a_zero_stride() {
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
+                .narrow(1, 1, 1)
+                .expect("in bounds")
+                .expand(Shape::try_from([2, 5, 4].as_slice()).expect("valid shape"))
+                .expect("expandable");
+        assert_eq!(layout.strides(), &[12, 0, 1], "the stride 4 becomes 0");
+        assert_eq!(layout.storage_offset(), 4, "offset kept");
+    }
+
+    #[test]
+    fn views_keep_the_storage_offset() {
+        let layout =
+            Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
+                .narrow(0, 1, 1)
+                .expect("in bounds")
+                .permute(&[2, 1, 0])
+                .expect("valid permutation")
+                .expand(Shape::try_from([5, 4, 3, 1].as_slice()).expect("valid shape"))
+                .expect("expandable");
+        assert_eq!(layout.shape().dims(), &[5, 4, 3, 1], "expanded dims");
+        assert_eq!(layout.strides(), &[0, 1, 4, 12], "expanded strides");
+        assert_eq!(layout.storage_offset(), 12, "offset of the second block");
+    }
+
+    #[test]
+    fn identity_views_equal_the_base_layout() {
+        let base = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"));
+        assert_eq!(
+            base.permute(&[1, 0])
+                .and_then(|layout| layout.permute(&[1, 0])),
+            Ok(base),
+            "a transpose twice"
+        );
+        assert_eq!(base.narrow(1, 0, 3), Ok(base), "a full narrow");
+    }
+
+    #[test]
+    fn narrow_reports_the_dim_before_the_bounds() {
+        assert_eq!(
+            Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")).narrow(
+                2,
+                usize::MAX,
+                1
+            ),
+            Err(TensorError::DimOutOfRange),
+            "dim 2 does not exist"
         );
     }
 

@@ -71,21 +71,39 @@ impl Shape {
             );
             TensorError::BroadcastIncompatible
         };
-        let dims_reversed = (0..lhs.ndim.max(rhs.ndim))
-            .map(|dim_from_end| {
-                match (
+        let ndim = lhs.ndim.max(rhs.ndim);
+        let mut dims = [1; MAX_RANK];
+        dims.get_mut(..ndim)
+            .unwrap_or_default()
+            .iter_mut()
+            .rev()
+            .enumerate()
+            .try_for_each(|(dim_from_end, slot)| {
+                *slot = match (
                     size_from_end(lhs, dim_from_end),
                     size_from_end(rhs, dim_from_end),
                 ) {
-                    (lhs_size, rhs_size) if lhs_size == rhs_size => Ok(lhs_size),
-                    (1, rhs_size) => Ok(rhs_size),
-                    (lhs_size, 1) => Ok(lhs_size),
-                    _ => Err(incompatible()),
-                }
-            })
-            .collect::<Result<Vec<usize>, TensorError>>()?;
-        let dims: Vec<usize> = dims_reversed.into_iter().rev().collect();
-        Shape::try_from(dims.as_slice())
+                    (lhs_size, rhs_size) if lhs_size == rhs_size => lhs_size,
+                    (1, rhs_size) => rhs_size,
+                    (lhs_size, 1) => lhs_size,
+                    _ => return Err(incompatible()),
+                };
+                Ok(())
+            })?;
+        Shape::try_from(dims.get(..ndim).unwrap_or_default())
+    }
+
+    pub fn with_dim(
+        &self,
+        dim: usize,
+        size: usize,
+    ) -> Result<Shape, TensorError> {
+        self.size(dim)?;
+        let mut dims = self.dims;
+        if let Some(slot) = dims.get_mut(dim) {
+            *slot = size;
+        }
+        Shape::try_from(dims.get(..self.ndim).unwrap_or_default())
     }
 }
 
@@ -203,6 +221,84 @@ mod tests {
             ),
             Err(TensorError::NumelOverflow),
             "two valid shapes can broadcast to an invalid one"
+        );
+    }
+
+    #[test]
+    fn broadcast_of_two_scalars_is_a_scalar() {
+        let scalar = Shape::try_from([].as_slice()).expect("valid shape");
+        assert_eq!(
+            Shape::broadcast(&scalar, &scalar),
+            Ok(scalar),
+            "two scalars"
+        );
+    }
+
+    #[test]
+    fn broadcast_of_rank_four_and_rank_one_aligns_the_last_dim() {
+        assert_eq!(
+            Shape::broadcast(
+                &Shape::try_from([2, 3, 4, 1].as_slice()).expect("valid shape"),
+                &Shape::try_from([5].as_slice()).expect("valid shape"),
+            ),
+            Shape::try_from([2, 3, 4, 5].as_slice()),
+            "the rank one shape stretches the last dim"
+        );
+    }
+
+    #[test]
+    fn with_dim_replaces_one_size() {
+        assert_eq!(
+            Shape::try_from([2, 3, 4].as_slice())
+                .expect("valid shape")
+                .with_dim(1, 7),
+            Shape::try_from([2, 7, 4].as_slice()),
+            "dim 1 becomes 7"
+        );
+    }
+
+    #[test]
+    fn with_dim_to_zero_empties_the_shape() {
+        assert_eq!(
+            Shape::try_from([2, 3].as_slice())
+                .expect("valid shape")
+                .with_dim(0, 0)
+                .map(|shape| shape.numel()),
+            Ok(0),
+            "a zero size empties the shape"
+        );
+    }
+
+    #[test]
+    fn with_dim_on_a_scalar_is_rejected() {
+        assert_eq!(
+            Shape::try_from([].as_slice())
+                .expect("valid shape")
+                .with_dim(0, 1),
+            Err(TensorError::DimOutOfRange),
+            "a scalar has no dim"
+        );
+    }
+
+    #[test]
+    fn with_dim_beyond_the_element_limit_is_rejected() {
+        assert_eq!(
+            Shape::try_from([2, 3].as_slice())
+                .expect("valid shape")
+                .with_dim(0, 1 << 30),
+            Err(TensorError::NumelOverflow),
+            "3 * 2^30 elements exceed the limit"
+        );
+    }
+
+    #[test]
+    fn with_dim_reports_the_dim_before_the_element_limit() {
+        assert_eq!(
+            Shape::try_from([2, 3].as_slice())
+                .expect("valid shape")
+                .with_dim(2, usize::MAX),
+            Err(TensorError::DimOutOfRange),
+            "the dim is checked first"
         );
     }
 

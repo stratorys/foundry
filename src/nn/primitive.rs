@@ -214,7 +214,7 @@ fn reduce_output(
         ReduceOp::Sum | ReduceOp::Amax => dtype,
         ReduceOp::Argmax => DType::U32,
     };
-    Ok((with_dim(shape, dim, 1)?, dtype_output))
+    Ok((shape.with_dim(dim, 1)?, dtype_output))
 }
 
 fn matmul_output(
@@ -229,7 +229,7 @@ fn matmul_output(
         );
         TensorError::MatmulIncompatible
     };
-    let Some((lhs_batch, &[m, lhs_k])) = lhs.dims().split_last_chunk::<2>() else {
+    let Some((lhs_batch, &[_, lhs_k])) = lhs.dims().split_last_chunk::<2>() else {
         return Err(incompatible());
     };
     let Some((rhs_batch, &[rhs_k, n])) = rhs.dims().split_last_chunk::<2>() else {
@@ -238,8 +238,7 @@ fn matmul_output(
     if lhs_batch != rhs_batch || lhs_k != rhs_k {
         return Err(incompatible());
     }
-    let dims: Vec<usize> = lhs_batch.iter().copied().chain([m, n]).collect();
-    Shape::try_from(dims.as_slice())
+    lhs.with_dim(lhs.last_dim()?, n)
 }
 
 fn index_select_output(
@@ -295,7 +294,7 @@ fn cat_output(
         return Err(incompatible());
     }
     let size_output = lhs_size.checked_add(rhs_size).ok_or_else(incompatible)?;
-    with_dim(lhs, dim, size_output)
+    lhs.with_dim(dim, size_output)
 }
 
 fn check_slice_scatter(
@@ -339,21 +338,6 @@ fn require_same_float(
         return Err(TensorError::DTypeMismatch);
     }
     require_float(lhs)
-}
-
-fn with_dim(
-    shape: &Shape,
-    dim: usize,
-    size: usize,
-) -> Result<Shape, TensorError> {
-    shape.size(dim)?;
-    let dims: Vec<usize> = shape
-        .dims()
-        .iter()
-        .enumerate()
-        .map(|(index, &current)| if index == dim { size } else { current })
-        .collect();
-    Shape::try_from(dims.as_slice())
 }
 
 fn dims_equal_except(

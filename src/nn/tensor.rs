@@ -205,15 +205,7 @@ impl<D: Device> Tensor<D> {
         device: &mut D,
         dim: usize,
     ) -> Result<Self, TensorError> {
-        let op = ReduceOp::Sum;
-        Self::apply(
-            device,
-            Op::Reduce {
-                op,
-                dim,
-            },
-            [self],
-        )
+        self.reduce(device, ReduceOp::Sum, dim)
     }
 
     pub fn amax_keepdim(
@@ -221,15 +213,7 @@ impl<D: Device> Tensor<D> {
         device: &mut D,
         dim: usize,
     ) -> Result<Self, TensorError> {
-        let op = ReduceOp::Amax;
-        Self::apply(
-            device,
-            Op::Reduce {
-                op,
-                dim,
-            },
-            [self],
-        )
+        self.reduce(device, ReduceOp::Amax, dim)
     }
 
     pub fn argmax_keepdim(
@@ -237,15 +221,7 @@ impl<D: Device> Tensor<D> {
         device: &mut D,
         dim: usize,
     ) -> Result<Self, TensorError> {
-        let op = ReduceOp::Argmax;
-        Self::apply(
-            device,
-            Op::Reduce {
-                op,
-                dim,
-            },
-            [self],
-        )
+        self.reduce(device, ReduceOp::Argmax, dim)
     }
 
     pub fn matmul(
@@ -349,6 +325,22 @@ impl<D: Device> Tensor<D> {
             device,
             Op::Binary(op),
             [&self.expand(shape)?, &rhs.expand(shape)?],
+        )
+    }
+
+    fn reduce(
+        &self,
+        device: &mut D,
+        op: ReduceOp,
+        dim: usize,
+    ) -> Result<Self, TensorError> {
+        Self::apply(
+            device,
+            Op::Reduce {
+                op,
+                dim,
+            },
+            [self],
         )
     }
 
