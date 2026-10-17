@@ -1,14 +1,14 @@
 use tracing::error;
 
-use crate::core::{
+use crate::nn::{
     Backend,
     CoreError,
     DType,
     Shape,
     Tensor,
     TensorError,
+    softmax,
 };
-use crate::nn::softmax;
 
 #[derive(Debug, PartialEq, Eq)]
 struct AttentionDims {
@@ -106,13 +106,13 @@ fn attention_dims(
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{
-        CoreError,
-        Shape,
-    };
     use crate::nn::attention::{
         AttentionDims,
         attention_dims,
+    };
+    use crate::nn::{
+        CoreError,
+        Shape,
     };
 
     #[test]

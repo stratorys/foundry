@@ -2,7 +2,7 @@ use std::array;
 
 use tracing::error;
 
-use crate::core::{
+use crate::nn::{
     CoreError,
     DType,
     FloatDType,
@@ -502,7 +502,7 @@ fn padded(values: &[usize]) -> [usize; MAX_RANK] {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::primitive::{
+    use crate::nn::primitive::{
         BinarySpec,
         CatSpec,
         IndexSelectSpec,
@@ -521,7 +521,7 @@ mod tests {
         to_dtype_rule,
         unary_rule,
     };
-    use crate::core::{
+    use crate::nn::{
         CoreError,
         DType,
         FloatDType,

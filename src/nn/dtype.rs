@@ -1,6 +1,6 @@
 use tracing::error;
 
-use crate::core::CoreError;
+use crate::nn::CoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
@@ -66,7 +66,7 @@ pub fn exact_f32(value: usize) -> Result<f32, CoreError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{
+    use crate::nn::{
         CoreError,
         DType,
         FloatDType,

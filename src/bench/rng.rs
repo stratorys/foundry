@@ -46,7 +46,7 @@ impl SplitMix64 {
 mod tests {
     use std::num::NonZeroU32;
 
-    use crate::core::SplitMix64;
+    use crate::bench::rng::SplitMix64;
 
     #[test]
     fn split_mix_64_matches_the_reference_sequence() {

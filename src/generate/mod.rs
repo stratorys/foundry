@@ -10,7 +10,7 @@ use half::bf16;
 use tracing::error;
 
 pub use self::error::GenerateError;
-use crate::core::{
+use crate::nn::{
     Backend,
     DType,
     Shape,

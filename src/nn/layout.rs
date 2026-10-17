@@ -2,7 +2,7 @@ use std::array;
 
 use tracing::error;
 
-use crate::core::{
+use crate::nn::{
     CoreError,
     MAX_RANK,
     Shape,
@@ -222,7 +222,7 @@ fn padded(values: &[usize]) -> [usize; MAX_RANK] {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{
+    use crate::nn::{
         CoreError,
         Layout,
         Shape,

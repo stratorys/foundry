@@ -2,14 +2,6 @@ use std::num::NonZeroUsize;
 
 use tracing::error;
 
-use crate::core::{
-    Backend,
-    CoreError,
-    DType,
-    Shape,
-    Tensor,
-    TensorError,
-};
 use crate::generate::CausalLm;
 use crate::models::llama::attention::LlamaAttention;
 use crate::models::llama::mlp::LlamaMlp;
@@ -20,10 +12,16 @@ use crate::models::llama::{
     LlamaError,
 };
 use crate::nn::{
+    Backend,
+    CoreError,
+    DType,
     Embedding,
     Linear,
     RmsNorm,
+    Shape,
     StaticCache,
+    Tensor,
+    TensorError,
 };
 use crate::weights::Weights;
 
@@ -316,9 +314,9 @@ fn forward_dims<E: std::error::Error + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use crate::core::CoreError;
     use crate::models::llama::LlamaError;
     use crate::models::llama::model::forward_dims;
+    use crate::nn::CoreError;
 
     #[test]
     fn forward_dims_reads_the_batch_size_and_the_cache_length() {

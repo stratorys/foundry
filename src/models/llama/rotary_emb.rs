@@ -3,18 +3,18 @@ use std::iter;
 
 use tracing::error;
 
-use crate::core::{
+use crate::models::llama::{
+    Llama3RopeScaling,
+    LlamaConfig,
+    LlamaError,
+};
+use crate::nn::{
     Backend,
     DType,
     Shape,
     Tensor,
     TensorError,
     exact_f32,
-};
-use crate::models::llama::{
-    Llama3RopeScaling,
-    LlamaConfig,
-    LlamaError,
 };
 
 const MAX_POSITION_COUNT: usize = 1 << f32::MANTISSA_DIGITS;

@@ -2,7 +2,7 @@ use std::array;
 
 use tracing::error;
 
-use crate::core::{
+use crate::nn::{
     CoreError,
     DType,
     MAX_ITEMSIZE,
@@ -139,7 +139,7 @@ fn size_from_end(
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{
+    use crate::nn::{
         CoreError,
         Shape,
     };

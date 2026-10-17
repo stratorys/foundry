@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::core::primitive::{
+use crate::nn::primitive::{
     BinaryOp,
     CatSpec,
     IndexSelectSpec,
@@ -9,7 +9,7 @@ use crate::core::primitive::{
     SliceScatterSpec,
     UnaryOp,
 };
-use crate::core::{
+use crate::nn::{
     AllocatedMemory,
     FloatDType,
     Operand,

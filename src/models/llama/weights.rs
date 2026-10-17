@@ -1,11 +1,11 @@
 use tracing::error;
 
-use crate::core::{
+use crate::models::llama::LlamaError;
+use crate::nn::{
     Backend,
     DType,
     Tensor,
 };
-use crate::models::llama::LlamaError;
 use crate::weights::{
     WeightView,
     Weights,
@@ -57,13 +57,13 @@ fn checked_view<'weights, E: std::error::Error + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{
+    use crate::models::llama::LlamaError;
+    use crate::models::llama::weights::checked_view;
+    use crate::nn::{
         CoreError,
         DType,
         Shape,
     };
-    use crate::models::llama::LlamaError;
-    use crate::models::llama::weights::checked_view;
     use crate::weights::WeightView;
 
     #[test]

@@ -23,7 +23,7 @@ use tracing::error;
 
 pub use self::error::MetalError;
 use self::stream::CommandStream;
-use crate::core::primitive::{
+use crate::nn::primitive::{
     BinaryOp,
     CatSpec,
     IndexSelectSpec,
@@ -34,7 +34,7 @@ use crate::core::primitive::{
     SliceScatterSpec,
     UnaryOp,
 };
-use crate::core::{
+use crate::nn::{
     AllocatedMemory,
     AllocatedMemorySource,
     Backend,
@@ -394,7 +394,7 @@ impl MetalBackend {
             inputs.iter().enumerate().for_each(|(index, input)| {
                 // SAFETY: the input buffer is alive for the whole call and the
                 // command buffer retains it. The view comes from a `Tensor`
-                // operand, which only `crate::core` can build, or from a
+                // operand, which only `crate::nn` can build, or from a
                 // buffer this backend allocated with a contiguous layout of
                 // its shape, so every index its layout addresses stays inside
                 // its storage. Every `Shape` has at most `i32::MAX` non-zero
@@ -461,7 +461,7 @@ impl MetalBackend {
         self.encode(&pipeline, |encoder| {
             // SAFETY: the input buffer is alive for the whole call and the
             // command buffer retains it. The view comes from a `Tensor`
-            // operand, which only `crate::core` can build, so every index its
+            // operand, which only `crate::nn` can build, so every index its
             // layout addresses stays inside its storage. Every `Shape` has at
             // most `i32::MAX` non-zero elements, so addresses and the loop
             // counter `k += 256` stay below `u32::MAX` and do not wrap. The
@@ -513,7 +513,7 @@ impl MetalBackend {
         self.encode(&pipeline, |encoder| {
             // SAFETY: both input buffers are alive for the whole call and the
             // command buffer retains them. Each view comes from a `Tensor`
-            // operand, which only `crate::core` can build, or from a copy this
+            // operand, which only `crate::nn` can build, or from a copy this
             // backend allocated with a contiguous layout of its shape, so every
             // index its layout addresses stays inside its storage. Every
             // `Shape` has at most `i32::MAX` non-zero elements, so addresses
@@ -566,7 +566,7 @@ impl MetalBackend {
         self.encode(&pipeline, |encoder| {
             // SAFETY: both input buffers are alive for the whole call and the
             // command buffer retains them. Both views come from `Tensor`
-            // operands, which only `crate::core` can build, so every index
+            // operands, which only `crate::nn` can build, so every index
             // their layouts address stays inside their storage. Every `Shape`
             // has at most `i32::MAX` non-zero elements, so addresses stay below
             // `u32::MAX` and do not wrap, and the kernel reads a table row only
@@ -622,7 +622,7 @@ impl MetalBackend {
         self.encode(&pipeline, |encoder| {
             // SAFETY: the input buffer is alive for the whole call and the
             // command buffer retains it. The view comes from a `Tensor`
-            // operand, which only `crate::core` can build, so every index its
+            // operand, which only `crate::nn` can build, so every index its
             // layout addresses stays inside its storage. Every `Shape` has at
             // most `i32::MAX` non-zero elements, so addresses stay below
             // `u32::MAX` and do not wrap. The storage was produced on this
@@ -1134,8 +1134,8 @@ mod tests {
         MetalError,
         is_matmul_ready,
     };
-    use crate::core::primitive::matmul_rule;
-    use crate::core::{
+    use crate::nn::primitive::matmul_rule;
+    use crate::nn::{
         AllocatedMemorySource,
         Backend,
         CoreError,

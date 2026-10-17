@@ -23,7 +23,7 @@ use serde::Deserialize;
 use tracing::error;
 
 pub use self::error::WeightsError;
-use crate::core::{
+use crate::nn::{
     DType,
     Shape,
 };
@@ -373,7 +373,7 @@ fn check_index<S>(
 mod tests {
     use serde_json::json;
 
-    use crate::core::{
+    use crate::nn::{
         DType,
         Shape,
     };

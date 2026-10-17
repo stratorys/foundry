@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use tracing::error;
 
-use crate::core::primitive::{
+use crate::nn::primitive::{
     BinaryOp,
     ReduceOp,
     UnaryOp,
@@ -16,7 +16,7 @@ use crate::core::primitive::{
     to_dtype_rule,
     unary_rule,
 };
-use crate::core::{
+use crate::nn::{
     Backend,
     CoreError,
     DType,
@@ -471,8 +471,8 @@ fn backend_failed<E: Error + 'static>(operation: &'static str) -> impl FnOnce(E)
 mod tests {
     use std::error::Error;
 
-    use crate::core::TensorError;
-    use crate::core::tensor::backend_failed;
+    use crate::nn::TensorError;
+    use crate::nn::tensor::backend_failed;
 
     #[derive(Debug, thiserror::Error)]
     #[error("backend diagnostic: {detail}")]

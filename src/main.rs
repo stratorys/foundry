@@ -33,7 +33,6 @@ use foundry::bench::{
     git_commit,
     rfc3339_utc,
 };
-use foundry::core::Backend;
 use foundry::generate::{
     Generation,
     generate,
@@ -42,6 +41,7 @@ use foundry::models::llama::{
     LlamaConfig,
     LlamaForCausalLm,
 };
+use foundry::nn::Backend;
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
 use serde::Serialize;

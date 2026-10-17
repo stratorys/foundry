@@ -1,6 +1,8 @@
 mod error;
+mod memory;
 mod metadata;
 mod metrics;
+mod rng;
 mod stats;
 
 use std::num::{
@@ -19,6 +21,7 @@ use tracing::{
 };
 
 pub use self::error::BenchError;
+pub use self::memory::PeakMemorySource;
 pub use self::metadata::{
     Metadata,
     git_commit,
@@ -40,20 +43,17 @@ use self::metrics::{
     run_ts,
     sum_ns,
 };
+use self::rng::SplitMix64;
 pub use self::stats::Summary;
 use self::stats::{
     mean,
     ns_to_f64,
 };
-use crate::core::{
-    AllocatedMemorySource,
-    Backend,
-    SplitMix64,
-};
 use crate::generate::{
     CausalLm,
     Decoder,
 };
+use crate::nn::Backend;
 
 const NS_PER_MS: f64 = 1e6;
 
@@ -101,7 +101,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peak_memory_source: Option<AllocatedMemorySource>,
+    pub peak_memory_source: Option<PeakMemorySource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -221,7 +221,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
         stats,
         metrics,
         peak_memory_bytes: peak_memory.map(|peak_memory| peak_memory.bytes),
-        peak_memory_source: peak_memory.map(|peak_memory| peak_memory.source),
+        peak_memory_source: peak_memory.map(|peak_memory| peak_memory.source.into()),
     })
 }
 
@@ -426,6 +426,7 @@ mod tests {
         NonZeroUsize,
     };
 
+    use crate::bench::rng::SplitMix64;
     use crate::bench::{
         BenchConfig,
         BenchError,
@@ -434,7 +435,6 @@ mod tests {
         draw_inputs,
         token_ids,
     };
-    use crate::core::SplitMix64;
 
     const CONFIG: BenchConfig = BenchConfig {
         prompt_token_count: 0,

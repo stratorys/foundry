@@ -1,4 +1,4 @@
-use crate::core::{
+use crate::nn::{
     CoreError,
     TensorError,
 };
@@ -74,11 +74,11 @@ mod tests {
     use std::error::Error;
     use std::fmt;
 
-    use crate::core::{
+    use crate::models::llama::LlamaError;
+    use crate::nn::{
         CoreError,
         TensorError,
     };
-    use crate::models::llama::LlamaError;
 
     #[test]
     fn model_propagation_preserves_tensor_and_backend_sources() {

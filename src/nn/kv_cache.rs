@@ -1,6 +1,6 @@
 use tracing::error;
 
-use crate::core::{
+use crate::nn::{
     Backend,
     CoreError,
     DType,
