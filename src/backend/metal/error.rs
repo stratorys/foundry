@@ -47,4 +47,10 @@ pub enum MetalError {
 
     #[error("Reading bytes exceeds the buffer length.")]
     ToBytesOutOfBounds,
+
+    #[error("Operation does not match its operands.")]
+    InvalidOperation,
+
+    #[error("Kernel needs a float dtype.")]
+    DTypeNotFloat,
 }

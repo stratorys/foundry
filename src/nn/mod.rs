@@ -1,6 +1,5 @@
 mod activation;
 mod attention;
-mod backend;
 mod dtype;
 mod error;
 mod kv_cache;
@@ -17,7 +16,6 @@ pub use self::activation::{
     softmax,
 };
 pub use self::attention::scaled_dot_product_attention;
-pub use self::backend::Backend;
 pub use self::dtype::{
     DType,
     FloatDType,
@@ -39,12 +37,12 @@ pub use self::memory::{
     AllocatedMemorySource,
 };
 pub use self::norm::RmsNorm;
+pub use self::primitive::Backend;
 pub use self::shape::{
     MAX_RANK,
     Shape,
 };
 pub use self::tensor::{
     Operand,
-    OperandMut,
     Tensor,
 };

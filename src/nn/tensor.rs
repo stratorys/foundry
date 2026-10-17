@@ -5,38 +5,31 @@ use tracing::error;
 
 use crate::nn::primitive::{
     BinaryOp,
+    Op,
     ReduceOp,
     UnaryOp,
-    binary_rule,
-    cat_rule,
-    index_select_rule,
-    matmul_rule,
-    reduce_rule,
-    slice_scatter_rule,
-    to_dtype_rule,
-    unary_rule,
+    output,
 };
 use crate::nn::{
     Backend,
     CoreError,
     DType,
-    FloatDType,
     Layout,
     Shape,
     TensorError,
 };
 
-pub struct Operand<'storage, S, D = DType> {
-    storage: &'storage S,
-    layout: &'storage Layout,
-    dtype: D,
+pub struct Operand<'layout, S> {
+    storage: S,
+    layout: &'layout Layout,
+    dtype: DType,
 }
 
-impl<'storage, S, D: Copy> Operand<'storage, S, D> {
+impl<'layout, S> Operand<'layout, S> {
     fn new(
-        storage: &'storage S,
-        layout: &'storage Layout,
-        dtype: D,
+        storage: S,
+        layout: &'layout Layout,
+        dtype: DType,
     ) -> Self {
         Self {
             storage,
@@ -45,37 +38,13 @@ impl<'storage, S, D: Copy> Operand<'storage, S, D> {
         }
     }
 
-    pub fn storage(&self) -> &'storage S { self.storage }
+    pub fn storage(&self) -> &S { &self.storage }
 
-    pub fn layout(&self) -> &'storage Layout { self.layout }
+    pub fn storage_mut(&mut self) -> &mut S { &mut self.storage }
 
-    pub fn dtype(&self) -> D { self.dtype }
-}
+    pub fn layout(&self) -> &'layout Layout { self.layout }
 
-pub struct OperandMut<'storage, S, D = DType> {
-    storage: &'storage mut S,
-    layout: &'storage Layout,
-    dtype: D,
-}
-
-impl<'storage, S, D: Copy> OperandMut<'storage, S, D> {
-    fn new(
-        storage: &'storage mut S,
-        layout: &'storage Layout,
-        dtype: D,
-    ) -> Self {
-        Self {
-            storage,
-            layout,
-            dtype,
-        }
-    }
-
-    pub fn storage_mut(&mut self) -> &mut S { self.storage }
-
-    pub fn layout(&self) -> &'storage Layout { self.layout }
-
-    pub fn dtype(&self) -> D { self.dtype }
+    pub fn dtype(&self) -> DType { self.dtype }
 }
 
 pub struct Tensor<B: Backend> {
@@ -132,7 +101,7 @@ impl<B: Backend> Tensor<B> {
             return Err(CoreError::ToBytesNonContiguous.into());
         }
         backend
-            .storage_to_bytes(self.operand())
+            .storage_to_bytes(&self.operand())
             .map_err(backend_failed("to_bytes"))
     }
 
@@ -176,28 +145,28 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.unary(backend, UnaryOp::Neg)
+        Self::apply(backend, Op::Unary(UnaryOp::Neg), [self])
     }
 
     pub fn exp(
         &self,
         backend: &mut B,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.unary(backend, UnaryOp::Exp)
+        Self::apply(backend, Op::Unary(UnaryOp::Exp), [self])
     }
 
     pub fn sqrt(
         &self,
         backend: &mut B,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.unary(backend, UnaryOp::Sqrt)
+        Self::apply(backend, Op::Unary(UnaryOp::Sqrt), [self])
     }
 
     pub fn reciprocal(
         &self,
         backend: &mut B,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.unary(backend, UnaryOp::Reciprocal)
+        Self::apply(backend, Op::Unary(UnaryOp::Reciprocal), [self])
     }
 
     pub fn add(
@@ -237,7 +206,15 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.reduce(backend, ReduceOp::Sum, dim)
+        let op = ReduceOp::Sum;
+        Self::apply(
+            backend,
+            Op::Reduce {
+                op,
+                dim,
+            },
+            [self],
+        )
     }
 
     pub fn amax_keepdim(
@@ -245,7 +222,15 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.reduce(backend, ReduceOp::Amax, dim)
+        let op = ReduceOp::Amax;
+        Self::apply(
+            backend,
+            Op::Reduce {
+                op,
+                dim,
+            },
+            [self],
+        )
     }
 
     pub fn argmax_keepdim(
@@ -253,7 +238,15 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.reduce(backend, ReduceOp::Argmax, dim)
+        let op = ReduceOp::Argmax;
+        Self::apply(
+            backend,
+            Op::Reduce {
+                op,
+                dim,
+            },
+            [self],
+        )
     }
 
     pub fn matmul(
@@ -261,19 +254,7 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         rhs: &Self,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = matmul_rule(self.dtype, &self.layout, rhs.dtype, &rhs.layout)?;
-        let storage = backend
-            .matmul(
-                self.float_operand(spec.dtype()),
-                rhs.float_operand(spec.dtype()),
-                &spec,
-            )
-            .map_err(backend_failed("matmul"))?;
-        Ok(Self::from_storage(
-            storage,
-            spec.dtype().into(),
-            *spec.output(),
-        ))
+        Self::apply(backend, Op::Matmul, [self, rhs])
     }
 
     pub fn contiguous(
@@ -283,10 +264,7 @@ impl<B: Backend> Tensor<B> {
         if self.layout.is_contiguous() {
             return Ok(self.view(self.layout));
         }
-        let storage = backend
-            .copy(self.operand())
-            .map_err(backend_failed("copy"))?;
-        Ok(Self::from_storage(storage, self.dtype, *self.shape()))
+        Self::apply(backend, Op::Copy, [self])
     }
 
     pub fn to_dtype(
@@ -294,11 +272,7 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         dtype: DType,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = to_dtype_rule(self.dtype, dtype)?;
-        let storage = backend
-            .to_dtype(self.float_operand(spec.from()), spec.to())
-            .map_err(backend_failed("to_dtype"))?;
-        Ok(Self::from_storage(storage, spec.to().into(), *self.shape()))
+        Self::apply(backend, Op::ToDtype(dtype), [self])
     }
 
     pub fn index_select(
@@ -307,41 +281,27 @@ impl<B: Backend> Tensor<B> {
         dim: usize,
         indices: &Self,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = index_select_rule(
-            self.dtype,
-            &self.layout,
-            dim,
-            indices.dtype,
-            indices.shape(),
-        )?;
-        let storage = backend
-            .index_select(self.float_operand(spec.dtype()), indices.operand(), &spec)
-            .map_err(backend_failed("index_select"))?;
-        Ok(Self::from_storage(
-            storage,
-            spec.dtype().into(),
-            *spec.output(),
-        ))
+        Self::apply(
+            backend,
+            Op::IndexSelect {
+                dim,
+            },
+            [self, indices],
+        )
     }
 
     pub fn cat(
         backend: &mut B,
-        [lhs, rhs]: [&Self; 2],
+        tensors: [&Self; 2],
         dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = cat_rule(lhs.dtype, lhs.shape(), rhs.dtype, rhs.shape(), dim)?;
-        let storage = backend
-            .cat(
-                lhs.float_operand(spec.dtype()),
-                rhs.float_operand(spec.dtype()),
-                &spec,
-            )
-            .map_err(backend_failed("cat"))?;
-        Ok(Self::from_storage(
-            storage,
-            spec.dtype().into(),
-            *spec.output(),
-        ))
+        Self::apply(
+            backend,
+            Op::Cat {
+                dim,
+            },
+            tensors,
+        )
     }
 
     pub fn slice_scatter(
@@ -351,8 +311,14 @@ impl<B: Backend> Tensor<B> {
         dim: usize,
         start: usize,
     ) -> Result<(), TensorError<B::Error>> {
-        let spec =
-            slice_scatter_rule(self.dtype, &self.layout, src.dtype, src.shape(), dim, start)?;
+        let op = Op::SliceScatter {
+            dim,
+            start,
+        };
+        output(
+            op,
+            &[(self.dtype, *self.shape()), (src.dtype, *src.shape())],
+        )?;
         if !self.layout.is_contiguous() {
             error!(
                 message = "Slice scatter requires a contiguous target layout.",
@@ -365,24 +331,12 @@ impl<B: Backend> Tensor<B> {
             CoreError::SharedStorage
         })?;
         backend
-            .slice_scatter(
-                OperandMut::new(storage, &self.layout, spec.dtype()),
-                src.float_operand(spec.dtype()),
-                &spec,
+            .run_in_place(
+                op,
+                Operand::new(storage, &self.layout, self.dtype),
+                &[src.operand()],
             )
-            .map_err(backend_failed("slice_scatter"))
-    }
-
-    fn unary(
-        &self,
-        backend: &mut B,
-        op: UnaryOp,
-    ) -> Result<Self, TensorError<B::Error>> {
-        let dtype = unary_rule(self.dtype)?;
-        let storage = backend
-            .unary(op, self.float_operand(dtype))
-            .map_err(backend_failed("unary"))?;
-        Ok(Self::from_storage(storage, dtype.into(), *self.shape()))
+            .map_err(backend_failed(op.name()))
     }
 
     fn binary(
@@ -391,38 +345,24 @@ impl<B: Backend> Tensor<B> {
         op: BinaryOp,
         rhs: &Self,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = binary_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape())?;
-        let lhs = self.expand(*spec.output())?;
-        let rhs = rhs.expand(*spec.output())?;
-        let storage = backend
-            .binary(
-                op,
-                lhs.float_operand(spec.dtype()),
-                rhs.float_operand(spec.dtype()),
-            )
-            .map_err(backend_failed("binary"))?;
-        Ok(Self::from_storage(
-            storage,
-            spec.dtype().into(),
-            *spec.output(),
-        ))
+        let shape = Shape::broadcast(self.shape(), rhs.shape())?;
+        Self::apply(
+            backend,
+            Op::Binary(op),
+            [&self.expand(shape)?, &rhs.expand(shape)?],
+        )
     }
 
-    fn reduce(
-        &self,
+    fn apply<const N: usize>(
         backend: &mut B,
-        op: ReduceOp,
-        dim: usize,
+        op: Op,
+        inputs: [&Self; N],
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = reduce_rule(op, self.dtype, &self.layout, dim)?;
+        let (shape, dtype) = output(op, &inputs.map(|input| (input.dtype, *input.shape())))?;
         let storage = backend
-            .reduce(self.float_operand(spec.dtype()), &spec)
-            .map_err(backend_failed("reduce"))?;
-        Ok(Self::from_storage(
-            storage,
-            spec.dtype_output(),
-            *spec.output(),
-        ))
+            .run(op, &inputs.map(Self::operand), &shape, dtype)
+            .map_err(backend_failed(op.name()))?;
+        Ok(Self::from_storage(storage, dtype, shape))
     }
 
     fn from_storage(
@@ -448,15 +388,8 @@ impl<B: Backend> Tensor<B> {
         }
     }
 
-    fn operand(&self) -> Operand<'_, B::Storage> {
+    fn operand(&self) -> Operand<'_, &B::Storage> {
         Operand::new(&self.storage, &self.layout, self.dtype)
-    }
-
-    fn float_operand(
-        &self,
-        dtype: FloatDType,
-    ) -> Operand<'_, B::Storage, FloatDType> {
-        Operand::new(&self.storage, &self.layout, dtype)
     }
 }
 

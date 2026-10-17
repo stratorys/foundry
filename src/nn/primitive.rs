@@ -1,13 +1,12 @@
-use std::array;
+use std::error::Error;
 
 use tracing::error;
 
 use crate::nn::{
+    AllocatedMemory,
     CoreError,
     DType,
-    FloatDType,
-    Layout,
-    MAX_RANK,
+    Operand,
     Shape,
 };
 
@@ -45,222 +44,161 @@ pub enum ReduceOp {
     Argmax,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BinarySpec {
-    dtype: FloatDType,
-    output: Shape,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Op {
+    /// One input, same shape and float dtype.
+    Unary(UnaryOp),
+    /// Two inputs of the same float dtype, broadcast together.
+    Binary(BinaryOp),
+    /// One input reduced along `dim`, kept with size one.
+    Reduce { op: ReduceOp, dim: usize },
+    /// Two inputs multiplied over their last two dimensions.
+    Matmul,
+    /// One input copied to a contiguous layout.
+    Copy,
+    /// One float input converted to the float dtype.
+    ToDtype(DType),
+    /// A 2D table and 1D `u32` indices selecting rows along `dim`.
+    IndexSelect { dim: usize },
+    /// Two inputs joined along `dim`.
+    Cat { dim: usize },
+    /// A target and a source written into it from `start` along `dim`.
+    SliceScatter { dim: usize, start: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToDtypeSpec {
-    from: FloatDType,
-    to: FloatDType,
+pub trait Backend {
+    type Storage;
+    type Error: Error + 'static;
+
+    fn device_name(&self) -> String;
+
+    fn current_allocated_memory(&self) -> Option<AllocatedMemory>;
+
+    fn storage_from_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Self::Storage, Self::Error>;
+
+    fn zeros(
+        &mut self,
+        nbytes: usize,
+    ) -> Result<Self::Storage, Self::Error>;
+
+    fn storage_to_bytes(
+        &mut self,
+        input: &Operand<&Self::Storage>,
+    ) -> Result<Vec<u8>, Self::Error>;
+
+    fn run(
+        &mut self,
+        op: Op,
+        inputs: &[Operand<&Self::Storage>],
+        output: &Shape,
+        dtype: DType,
+    ) -> Result<Self::Storage, Self::Error>;
+
+    fn run_in_place(
+        &mut self,
+        op: Op,
+        target: Operand<&mut Self::Storage>,
+        inputs: &[Operand<&Self::Storage>],
+    ) -> Result<(), Self::Error>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReduceSpec {
-    op: ReduceOp,
-    dtype: FloatDType,
-    output: Shape,
-    dim_size: usize,
-    dim_stride: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MatrixLayout {
-    offset: usize,
-    row_stride: usize,
-    col_stride: usize,
-    batch_strides: [usize; MAX_RANK],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MatmulSpec {
-    dtype: FloatDType,
-    output: Shape,
-    batch: Shape,
-    m: usize,
-    k: usize,
-    n: usize,
-    lhs: MatrixLayout,
-    rhs: MatrixLayout,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexSelectSpec {
-    dtype: FloatDType,
-    output: Shape,
-    rows: usize,
-    cols: usize,
-    row_stride: usize,
-    col_stride: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CatSpec {
-    dtype: FloatDType,
-    output: Shape,
-    rhs_offset: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SliceScatterSpec {
-    dtype: FloatDType,
-    offset: usize,
-}
-
-struct StrideFold {
-    strides: Vec<usize>,
-    stride_next: usize,
-}
-
-impl BinarySpec {
-    pub fn dtype(&self) -> FloatDType { self.dtype }
-
-    pub fn output(&self) -> &Shape { &self.output }
-}
-
-impl ToDtypeSpec {
-    pub fn from(&self) -> FloatDType { self.from }
-
-    pub fn to(&self) -> FloatDType { self.to }
-}
-
-impl ReduceSpec {
-    pub fn op(&self) -> ReduceOp { self.op }
-
-    pub fn dtype(&self) -> FloatDType { self.dtype }
-
-    pub fn dtype_output(&self) -> DType {
-        match self.op {
-            ReduceOp::Sum | ReduceOp::Amax => self.dtype.into(),
-            ReduceOp::Argmax => DType::U32,
+impl Op {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Unary(_) => "unary",
+            Self::Binary(_) => "binary",
+            Self::Reduce {
+                ..
+            } => "reduce",
+            Self::Matmul => "matmul",
+            Self::Copy => "copy",
+            Self::ToDtype(_) => "to_dtype",
+            Self::IndexSelect {
+                ..
+            } => "index_select",
+            Self::Cat {
+                ..
+            } => "cat",
+            Self::SliceScatter {
+                ..
+            } => "slice_scatter",
         }
     }
-
-    pub fn output(&self) -> &Shape { &self.output }
-
-    pub fn dim_size(&self) -> usize { self.dim_size }
-
-    pub fn dim_stride(&self) -> usize { self.dim_stride }
 }
 
-impl MatrixLayout {
-    pub fn contiguous(
-        batch: &Shape,
-        rows: usize,
-        cols: usize,
-    ) -> Self {
-        let matrix_len = rows.saturating_mul(cols);
-        let batch_strides_reversed = batch.dims().iter().rev().fold(
-            StrideFold {
-                strides: Vec::with_capacity(MAX_RANK),
-                stride_next: matrix_len,
+pub fn output(
+    op: Op,
+    inputs: &[(DType, Shape)],
+) -> Result<(Shape, DType), CoreError> {
+    match (op, inputs) {
+        (Op::Unary(_), &[(dtype, shape)]) => Ok((shape, require_float(dtype)?)),
+        (Op::Binary(_), &[(lhs_dtype, lhs), (rhs_dtype, rhs)]) => {
+            let dtype = require_same_float(lhs_dtype, rhs_dtype)?;
+            Ok((Shape::broadcast(&lhs, &rhs)?, dtype))
+        }
+        (
+            Op::Reduce {
+                op,
+                dim,
             },
-            |mut fold, &dim| {
-                fold.strides.push(fold.stride_next);
-                StrideFold {
-                    stride_next: fold.stride_next.saturating_mul(dim),
-                    strides: fold.strides,
-                }
+            &[(dtype, shape)],
+        ) => reduce_output(op, dim, dtype, &shape),
+        (Op::Matmul, &[(lhs_dtype, lhs), (rhs_dtype, rhs)]) => {
+            let dtype = require_same_float(lhs_dtype, rhs_dtype)?;
+            Ok((matmul_output(&lhs, &rhs)?, dtype))
+        }
+        (Op::Copy, &[(dtype, shape)]) => Ok((shape, dtype)),
+        (Op::ToDtype(to), &[(from, shape)]) => {
+            require_float(from)?;
+            Ok((shape, require_float(to)?))
+        }
+        (
+            Op::IndexSelect {
+                dim,
             },
-        );
-        let batch_strides: Vec<usize> = batch_strides_reversed.strides.into_iter().rev().collect();
-        Self {
-            offset: 0,
-            row_stride: cols,
-            col_stride: 1,
-            batch_strides: padded(&batch_strides),
+            &[(table_dtype, table), (indices_dtype, indices)],
+        ) => index_select_output(dim, table_dtype, &table, indices_dtype, &indices),
+        (
+            Op::Cat {
+                dim,
+            },
+            &[(lhs_dtype, lhs), (rhs_dtype, rhs)],
+        ) => {
+            let dtype = require_same_float(lhs_dtype, rhs_dtype)?;
+            Ok((cat_output(dim, &lhs, &rhs)?, dtype))
+        }
+        (
+            Op::SliceScatter {
+                dim,
+                start,
+            },
+            &[(target_dtype, target), (src_dtype, src)],
+        ) => {
+            let dtype = require_same_float(target_dtype, src_dtype)?;
+            check_slice_scatter(dim, start, &target, &src)?;
+            Ok((target, dtype))
+        }
+        _ => {
+            error!(
+                message = "Operand count does not match the operation.",
+                ?op,
+                operand_count = inputs.len(),
+            );
+            Err(CoreError::OperandCount)
         }
     }
-
-    pub fn offset(&self) -> usize { self.offset }
-
-    pub fn row_stride(&self) -> usize { self.row_stride }
-
-    pub fn col_stride(&self) -> usize { self.col_stride }
-
-    pub fn batch_strides(&self) -> &[usize; MAX_RANK] { &self.batch_strides }
-
-    fn of(layout: &Layout) -> Option<Self> {
-        let (batch_strides, [row_stride, col_stride]) = layout.strides().split_last_chunk::<2>()?;
-        Some(Self {
-            offset: layout.storage_offset(),
-            row_stride: *row_stride,
-            col_stride: *col_stride,
-            batch_strides: padded(batch_strides),
-        })
-    }
 }
 
-impl MatmulSpec {
-    pub fn dtype(&self) -> FloatDType { self.dtype }
-
-    pub fn output(&self) -> &Shape { &self.output }
-
-    pub fn batch(&self) -> &Shape { &self.batch }
-
-    pub fn m(&self) -> usize { self.m }
-
-    pub fn k(&self) -> usize { self.k }
-
-    pub fn n(&self) -> usize { self.n }
-
-    pub fn lhs(&self) -> &MatrixLayout { &self.lhs }
-
-    pub fn rhs(&self) -> &MatrixLayout { &self.rhs }
-}
-
-impl IndexSelectSpec {
-    pub fn dtype(&self) -> FloatDType { self.dtype }
-
-    pub fn output(&self) -> &Shape { &self.output }
-
-    pub fn rows(&self) -> usize { self.rows }
-
-    pub fn cols(&self) -> usize { self.cols }
-
-    pub fn row_stride(&self) -> usize { self.row_stride }
-
-    pub fn col_stride(&self) -> usize { self.col_stride }
-}
-
-impl CatSpec {
-    pub fn dtype(&self) -> FloatDType { self.dtype }
-
-    pub fn output(&self) -> &Shape { &self.output }
-
-    pub fn rhs_offset(&self) -> usize { self.rhs_offset }
-}
-
-impl SliceScatterSpec {
-    pub fn dtype(&self) -> FloatDType { self.dtype }
-
-    pub fn offset(&self) -> usize { self.offset }
-}
-
-pub fn unary_rule(dtype: DType) -> Result<FloatDType, CoreError> { require_float(dtype) }
-
-pub fn binary_rule(
-    lhs_dtype: DType,
-    lhs_shape: &Shape,
-    rhs_dtype: DType,
-    rhs_shape: &Shape,
-) -> Result<BinarySpec, CoreError> {
-    Ok(BinarySpec {
-        dtype: require_same_float(lhs_dtype, rhs_dtype)?,
-        output: Shape::broadcast(lhs_shape, rhs_shape)?,
-    })
-}
-
-pub fn reduce_rule(
+fn reduce_output(
     op: ReduceOp,
-    dtype: DType,
-    layout: &Layout,
     dim: usize,
-) -> Result<ReduceSpec, CoreError> {
+    dtype: DType,
+    shape: &Shape,
+) -> Result<(Shape, DType), CoreError> {
     let dtype = require_float(dtype)?;
-    let shape = layout.shape();
     let dim_size = shape.size(dim)?;
     let needs_element = matches!(op, ReduceOp::Amax | ReduceOp::Argmax);
     if needs_element && dim_size == 0 {
@@ -272,75 +210,45 @@ pub fn reduce_rule(
         );
         return Err(CoreError::EmptyReduction);
     }
-    Ok(ReduceSpec {
-        op,
-        dtype,
-        output: with_dim(shape, dim, 1)?,
-        dim_size,
-        dim_stride: layout.stride(dim)?,
-    })
+    let dtype_output = match op {
+        ReduceOp::Sum | ReduceOp::Amax => dtype,
+        ReduceOp::Argmax => DType::U32,
+    };
+    Ok((with_dim(shape, dim, 1)?, dtype_output))
 }
 
-pub fn matmul_rule(
-    lhs_dtype: DType,
-    lhs: &Layout,
-    rhs_dtype: DType,
-    rhs: &Layout,
-) -> Result<MatmulSpec, CoreError> {
-    let dtype = require_same_float(lhs_dtype, rhs_dtype)?;
+fn matmul_output(
+    lhs: &Shape,
+    rhs: &Shape,
+) -> Result<Shape, CoreError> {
     let incompatible = || {
         error!(
             message = "Shapes cannot be multiplied.",
-            lhs = ?lhs.shape().dims(),
-            rhs = ?rhs.shape().dims(),
+            lhs = ?lhs.dims(),
+            rhs = ?rhs.dims(),
         );
         CoreError::MatmulIncompatible
     };
-    let Some((lhs_batch, &[m, lhs_k])) = lhs.shape().dims().split_last_chunk::<2>() else {
+    let Some((lhs_batch, &[m, lhs_k])) = lhs.dims().split_last_chunk::<2>() else {
         return Err(incompatible());
     };
-    let Some((rhs_batch, &[rhs_k, n])) = rhs.shape().dims().split_last_chunk::<2>() else {
+    let Some((rhs_batch, &[rhs_k, n])) = rhs.dims().split_last_chunk::<2>() else {
         return Err(incompatible());
     };
     if lhs_batch != rhs_batch || lhs_k != rhs_k {
         return Err(incompatible());
     }
-    let Some(lhs_matrix) = MatrixLayout::of(lhs) else {
-        return Err(incompatible());
-    };
-    let Some(rhs_matrix) = MatrixLayout::of(rhs) else {
-        return Err(incompatible());
-    };
     let dims: Vec<usize> = lhs_batch.iter().copied().chain([m, n]).collect();
-    Ok(MatmulSpec {
-        dtype,
-        output: Shape::try_from(dims.as_slice())?,
-        batch: Shape::try_from(lhs_batch)?,
-        m,
-        k: lhs_k,
-        n,
-        lhs: lhs_matrix,
-        rhs: rhs_matrix,
-    })
+    Shape::try_from(dims.as_slice())
 }
 
-pub fn to_dtype_rule(
-    dtype_from: DType,
-    dtype_to: DType,
-) -> Result<ToDtypeSpec, CoreError> {
-    Ok(ToDtypeSpec {
-        from: require_float(dtype_from)?,
-        to: require_float(dtype_to)?,
-    })
-}
-
-pub fn index_select_rule(
-    table_dtype: DType,
-    table: &Layout,
+fn index_select_output(
     dim: usize,
+    table_dtype: DType,
+    table: &Shape,
     indices_dtype: DType,
-    indices_shape: &Shape,
-) -> Result<IndexSelectSpec, CoreError> {
+    indices: &Shape,
+) -> Result<(Shape, DType), CoreError> {
     let dtype = require_float(table_dtype)?;
     if indices_dtype != DType::U32 {
         error!(message = "Index select indices are not u32.", dtype = ?indices_dtype);
@@ -350,116 +258,84 @@ pub fn index_select_rule(
         error!(
             message = "Indices cannot select rows of the table.",
             dim,
-            table = ?table.shape().dims(),
-            indices = ?indices_shape.dims(),
+            table = ?table.dims(),
+            indices = ?indices.dims(),
         );
         CoreError::IndexSelectIncompatible
     };
     if dim != 0 {
         return Err(incompatible());
     }
-    let &[rows, cols] = table.shape().dims() else {
+    let &[_, cols] = table.dims() else {
         return Err(incompatible());
     };
-    let &[row_stride, col_stride] = table.strides() else {
+    let &[index_count] = indices.dims() else {
         return Err(incompatible());
     };
-    let &[index_count] = indices_shape.dims() else {
-        return Err(incompatible());
-    };
-    Ok(IndexSelectSpec {
-        dtype,
-        output: Shape::try_from([index_count, cols].as_slice())?,
-        rows,
-        cols,
-        row_stride,
-        col_stride,
-    })
+    Ok((Shape::try_from([index_count, cols].as_slice())?, dtype))
 }
 
-pub fn cat_rule(
-    lhs_dtype: DType,
-    lhs_shape: &Shape,
-    rhs_dtype: DType,
-    rhs_shape: &Shape,
+fn cat_output(
     dim: usize,
-) -> Result<CatSpec, CoreError> {
-    let dtype = require_same_float(lhs_dtype, rhs_dtype)?;
+    lhs: &Shape,
+    rhs: &Shape,
+) -> Result<Shape, CoreError> {
     let incompatible = || {
         error!(
             message = "Shapes cannot be concatenated.",
             dim,
-            lhs = ?lhs_shape.dims(),
-            rhs = ?rhs_shape.dims(),
+            lhs = ?lhs.dims(),
+            rhs = ?rhs.dims(),
         );
         CoreError::CatIncompatible
     };
-    let lhs_size = lhs_shape.size(dim)?;
-    let rhs_size = rhs_shape.size(dim)?;
-    if !dims_equal_except(lhs_shape, rhs_shape, dim) {
+    let lhs_size = lhs.size(dim)?;
+    let rhs_size = rhs.size(dim)?;
+    if !dims_equal_except(lhs, rhs, dim) {
         return Err(incompatible());
     }
     let size_output = lhs_size.checked_add(rhs_size).ok_or_else(incompatible)?;
-    let output = with_dim(lhs_shape, dim, size_output)?;
-    let rhs_offset = lhs_size
-        .checked_mul(Layout::contiguous(output).stride(dim)?)
-        .ok_or_else(incompatible)?;
-    Ok(CatSpec {
-        dtype,
-        output,
-        rhs_offset,
-    })
+    with_dim(lhs, dim, size_output)
 }
 
-pub fn slice_scatter_rule(
-    target_dtype: DType,
-    target: &Layout,
-    src_dtype: DType,
-    src_shape: &Shape,
+fn check_slice_scatter(
     dim: usize,
     start: usize,
-) -> Result<SliceScatterSpec, CoreError> {
-    let dtype = require_same_float(target_dtype, src_dtype)?;
-    let target_shape = target.shape();
-    let out_of_bounds = || {
+    target: &Shape,
+    src: &Shape,
+) -> Result<(), CoreError> {
+    let target_size = target.size(dim)?;
+    let src_size = src.size(dim)?;
+    let fits = start
+        .checked_add(src_size)
+        .is_some_and(|end| end <= target_size);
+    if !fits || !dims_equal_except(target, src, dim) {
         error!(
             message = "Slice scatter does not fit the target.",
             dim,
             start,
-            target = ?target_shape.dims(),
-            src = ?src_shape.dims(),
+            target = ?target.dims(),
+            src = ?src.dims(),
         );
-        CoreError::SliceScatterOutOfBounds
-    };
-    let target_size = target_shape.size(dim)?;
-    let src_size = src_shape.size(dim)?;
-    let fits = start
-        .checked_add(src_size)
-        .is_some_and(|end| end <= target_size);
-    if !fits || !dims_equal_except(target_shape, src_shape, dim) {
-        return Err(out_of_bounds());
+        return Err(CoreError::SliceScatterOutOfBounds);
     }
-    let offset = start
-        .checked_mul(target.stride(dim)?)
-        .and_then(|skipped| skipped.checked_add(target.storage_offset()))
-        .ok_or_else(out_of_bounds)?;
-    Ok(SliceScatterSpec {
-        dtype,
-        offset,
-    })
+    Ok(())
 }
 
-fn require_float(dtype: DType) -> Result<FloatDType, CoreError> {
-    dtype.float().ok_or_else(|| {
-        error!(message = "DType is not a float dtype.", ?dtype);
-        CoreError::DTypeNotFloat
-    })
+fn require_float(dtype: DType) -> Result<DType, CoreError> {
+    match dtype.float() {
+        Some(_) => Ok(dtype),
+        None => {
+            error!(message = "DType is not a float dtype.", ?dtype);
+            Err(CoreError::DTypeNotFloat)
+        }
+    }
 }
 
 fn require_same_float(
     lhs: DType,
     rhs: DType,
-) -> Result<FloatDType, CoreError> {
+) -> Result<DType, CoreError> {
     if lhs != rhs {
         error!(message = "DTypes do not match.", ?lhs, ?rhs);
         return Err(CoreError::DTypeMismatch);
@@ -496,44 +372,36 @@ fn dims_equal_except(
             .all(|(index, (lhs_size, rhs_size))| index == dim || lhs_size == rhs_size)
 }
 
-fn padded(values: &[usize]) -> [usize; MAX_RANK] {
-    array::from_fn(|index| values.get(index).copied().unwrap_or(0))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::nn::primitive::{
-        BinarySpec,
-        CatSpec,
-        IndexSelectSpec,
-        MatmulSpec,
-        MatrixLayout,
+        BinaryOp,
+        Op,
         ReduceOp,
-        ReduceSpec,
-        SliceScatterSpec,
-        ToDtypeSpec,
-        binary_rule,
-        cat_rule,
-        index_select_rule,
-        matmul_rule,
-        reduce_rule,
-        slice_scatter_rule,
-        to_dtype_rule,
-        unary_rule,
+        UnaryOp,
+        output,
     };
     use crate::nn::{
         CoreError,
         DType,
-        FloatDType,
         Layout,
         Shape,
     };
 
     #[test]
-    fn unary_keeps_float_dtype() {
+    fn unary_keeps_shape_and_float_dtype() {
         assert_eq!(
-            unary_rule(DType::BF16),
-            Ok(FloatDType::BF16),
+            output(
+                Op::Unary(UnaryOp::Exp),
+                &[(
+                    DType::BF16,
+                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                )]
+            ),
+            Ok((
+                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
             "a float dtype is kept"
         );
     }
@@ -541,34 +409,93 @@ mod tests {
     #[test]
     fn unary_rejects_integer_dtype() {
         assert_eq!(
-            unary_rule(DType::U32),
+            output(
+                Op::Unary(UnaryOp::Neg),
+                &[(
+                    DType::U32,
+                    Shape::try_from([2].as_slice()).expect("valid shape")
+                )]
+            ),
             Err(CoreError::DTypeNotFloat),
             "unary needs a float dtype"
         );
     }
 
     #[test]
+    fn operand_count_must_match_the_operation() {
+        assert_eq!(
+            [
+                output(Op::Unary(UnaryOp::Neg), &[]),
+                output(
+                    Op::Matmul,
+                    &[(
+                        DType::F32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    )]
+                ),
+                output(
+                    Op::Copy,
+                    &[
+                        (
+                            DType::F32,
+                            Shape::try_from([2].as_slice()).expect("valid shape")
+                        ),
+                        (
+                            DType::F32,
+                            Shape::try_from([2].as_slice()).expect("valid shape")
+                        )
+                    ]
+                ),
+            ],
+            [
+                Err(CoreError::OperandCount),
+                Err(CoreError::OperandCount),
+                Err(CoreError::OperandCount),
+            ],
+            "no operand, one operand for matmul, two operands for copy"
+        );
+    }
+
+    #[test]
     fn binary_broadcasts_shapes() {
         assert_eq!(
-            binary_rule(
-                DType::BF16,
-                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                DType::BF16,
-                &Shape::try_from([3].as_slice()).expect("valid shape"),
+            output(
+                Op::Binary(BinaryOp::Add),
+                &[
+                    (
+                        DType::BF16,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::BF16,
+                        Shape::try_from([3].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
-            Ok(BinarySpec {
-                dtype: FloatDType::BF16,
-                output: Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-            }),
+            Ok((
+                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
             "dtype and broadcast shape"
         );
     }
 
     #[test]
     fn binary_rejects_dtype_mismatch() {
-        let shape = Shape::try_from([2, 3].as_slice()).expect("valid shape");
         assert_eq!(
-            binary_rule(DType::BF16, &shape, DType::F32, &shape),
+            output(
+                Op::Binary(BinaryOp::Mul),
+                &[
+                    (
+                        DType::BF16,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    )
+                ]
+            ),
             Err(CoreError::DTypeMismatch),
             "binary needs equal dtypes"
         );
@@ -576,9 +503,20 @@ mod tests {
 
     #[test]
     fn binary_rejects_integer_dtype() {
-        let shape = Shape::try_from([2, 3].as_slice()).expect("valid shape");
         assert_eq!(
-            binary_rule(DType::U32, &shape, DType::U32, &shape),
+            output(
+                Op::Binary(BinaryOp::Sub),
+                &[
+                    (
+                        DType::U32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::U32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    )
+                ]
+            ),
             Err(CoreError::DTypeNotFloat),
             "binary needs a float dtype"
         );
@@ -587,11 +525,18 @@ mod tests {
     #[test]
     fn binary_rejects_incompatible_shapes() {
         assert_eq!(
-            binary_rule(
-                DType::BF16,
-                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                DType::BF16,
-                &Shape::try_from([4, 3].as_slice()).expect("valid shape"),
+            output(
+                Op::Binary(BinaryOp::Div),
+                &[
+                    (
+                        DType::BF16,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::BF16,
+                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::BroadcastIncompatible),
             "dims 2 and 4 do not broadcast"
@@ -600,50 +545,42 @@ mod tests {
 
     #[test]
     fn reduce_keeps_dim_with_size_one() {
-        let spec = reduce_rule(
-            ReduceOp::Sum,
-            DType::BF16,
-            &Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape")),
-            1,
-        )
-        .expect("valid reduction");
         assert_eq!(
-            spec,
-            ReduceSpec {
-                op: ReduceOp::Sum,
-                dtype: FloatDType::BF16,
-                output: Shape::try_from([2, 1, 4].as_slice()).expect("valid shape"),
-                dim_size: 3,
-                dim_stride: 4,
-            },
-            "dtype, output dims, dim size and stride"
+            output(
+                Op::Reduce {
+                    op: ReduceOp::Sum,
+                    dim: 1,
+                },
+                &[(
+                    DType::BF16,
+                    Shape::try_from([2, 3, 4].as_slice()).expect("valid shape")
+                )]
+            ),
+            Ok((
+                Shape::try_from([2, 1, 4].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
+            "a sum keeps the dtype and the dim with size one"
         );
-        assert_eq!(spec.dtype_output(), DType::BF16, "a sum keeps the dtype");
     }
 
     #[test]
     fn reduce_argmax_outputs_u32() {
-        let spec = reduce_rule(
-            ReduceOp::Argmax,
-            DType::F32,
-            &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-            1,
-        )
-        .expect("valid reduction");
         assert_eq!(
-            spec,
-            ReduceSpec {
-                op: ReduceOp::Argmax,
-                dtype: FloatDType::F32,
-                output: Shape::try_from([2, 1].as_slice()).expect("valid shape"),
-                dim_size: 3,
-                dim_stride: 1,
-            },
-            "argmax over dim 1"
-        );
-        assert_eq!(
-            spec.dtype_output(),
-            DType::U32,
+            output(
+                Op::Reduce {
+                    op: ReduceOp::Argmax,
+                    dim: 1,
+                },
+                &[(
+                    DType::F32,
+                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                )]
+            ),
+            Ok((
+                Shape::try_from([2, 1].as_slice()).expect("valid shape"),
+                DType::U32
+            )),
             "argmax outputs u32 indices"
         );
     }
@@ -651,11 +588,15 @@ mod tests {
     #[test]
     fn reduce_rejects_integer_dtype() {
         assert_eq!(
-            reduce_rule(
-                ReduceOp::Sum,
-                DType::U32,
-                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-                1,
+            output(
+                Op::Reduce {
+                    op: ReduceOp::Sum,
+                    dim: 1,
+                },
+                &[(
+                    DType::U32,
+                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                )]
             ),
             Err(CoreError::DTypeNotFloat),
             "reduce needs a float dtype"
@@ -665,11 +606,15 @@ mod tests {
     #[test]
     fn reduce_rejects_dim_out_of_range() {
         assert_eq!(
-            reduce_rule(
-                ReduceOp::Sum,
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-                2,
+            output(
+                Op::Reduce {
+                    op: ReduceOp::Sum,
+                    dim: 2,
+                },
+                &[(
+                    DType::F32,
+                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                )]
             ),
             Err(CoreError::DimOutOfRange),
             "dim 2 does not exist"
@@ -678,12 +623,20 @@ mod tests {
 
     #[test]
     fn reduce_amax_and_argmax_over_empty_dim_are_rejected() {
-        let layout = Layout::contiguous(Shape::try_from([2, 0].as_slice()).expect("valid shape"));
         [ReduceOp::Amax, ReduceOp::Argmax]
             .into_iter()
             .for_each(|op| {
                 assert_eq!(
-                    reduce_rule(op, DType::F32, &layout, 1),
+                    output(
+                        Op::Reduce {
+                            op,
+                            dim: 1,
+                        },
+                        &[(
+                            DType::F32,
+                            Shape::try_from([2, 0].as_slice()).expect("valid shape")
+                        )]
+                    ),
                     Err(CoreError::EmptyReduction),
                     "{op:?} over an empty dim"
                 );
@@ -692,83 +645,64 @@ mod tests {
 
     #[test]
     fn reduce_sum_over_empty_dim_keeps_dim_with_size_one() {
-        let spec = reduce_rule(
-            ReduceOp::Sum,
-            DType::F32,
-            &Layout::contiguous(Shape::try_from([2, 0].as_slice()).expect("valid shape")),
-            1,
-        )
-        .expect("a sum over an empty dim is zero");
-        assert_eq!(spec.output().dims(), &[2, 1], "output dims");
-    }
-
-    #[test]
-    fn matmul_multiplies_last_two_dims() {
-        let spec = matmul_rule(
-            DType::BF16,
-            &Layout::contiguous(Shape::try_from([5, 2, 3].as_slice()).expect("valid shape")),
-            DType::BF16,
-            &Layout::contiguous(Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")),
-        )
-        .expect("compatible shapes");
         assert_eq!(
-            spec,
-            MatmulSpec {
-                dtype: FloatDType::BF16,
-                output: Shape::try_from([5, 2, 4].as_slice()).expect("valid shape"),
-                batch: Shape::try_from([5].as_slice()).expect("valid shape"),
-                m: 2,
-                k: 3,
-                n: 4,
-                lhs: MatrixLayout {
-                    offset: 0,
-                    row_stride: 3,
-                    col_stride: 1,
-                    batch_strides: [6, 0, 0, 0],
+            output(
+                Op::Reduce {
+                    op: ReduceOp::Sum,
+                    dim: 1,
                 },
-                rhs: MatrixLayout {
-                    offset: 0,
-                    row_stride: 4,
-                    col_stride: 1,
-                    batch_strides: [12, 0, 0, 0],
-                },
-            },
-            "dtype, output, batch, matrix dims and operand strides"
+                &[(
+                    DType::F32,
+                    Shape::try_from([2, 0].as_slice()).expect("valid shape")
+                )]
+            ),
+            Ok((
+                Shape::try_from([2, 1].as_slice()).expect("valid shape"),
+                DType::F32
+            )),
+            "a sum over an empty dim is zero"
         );
     }
 
     #[test]
-    fn matmul_reads_transposed_operand_strides() {
-        let rhs = Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape"))
-            .permute(&[1, 0])
-            .expect("valid permutation");
-        let spec = matmul_rule(
-            DType::F32,
-            &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-            DType::F32,
-            &rhs,
-        )
-        .expect("compatible shapes");
+    fn matmul_multiplies_last_two_dims() {
         assert_eq!(
-            spec.rhs(),
-            &MatrixLayout {
-                offset: 0,
-                row_stride: 1,
-                col_stride: 3,
-                batch_strides: [0, 0, 0, 0],
-            },
-            "the transposed rhs walks rows with stride 1"
+            output(
+                Op::Matmul,
+                &[
+                    (
+                        DType::BF16,
+                        Shape::try_from([5, 2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::BF16,
+                        Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")
+                    )
+                ]
+            ),
+            Ok((
+                Shape::try_from([5, 2, 4].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
+            "batch kept, m by n output"
         );
     }
 
     #[test]
     fn matmul_rejects_inner_dim_mismatch() {
         assert_eq!(
-            matmul_rule(
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([4, 5].as_slice()).expect("valid shape")),
+            output(
+                Op::Matmul,
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([4, 5].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::MatmulIncompatible),
             "inner dims 3 and 4 differ"
@@ -778,11 +712,18 @@ mod tests {
     #[test]
     fn matmul_rejects_batch_mismatch() {
         assert_eq!(
-            matmul_rule(
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([2, 2, 3].as_slice()).expect("valid shape")),
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")),
+            output(
+                Op::Matmul,
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([2, 2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::MatmulIncompatible),
             "batch dims 2 and 5 differ"
@@ -791,48 +732,58 @@ mod tests {
 
     #[test]
     fn matmul_rejects_rank_below_two() {
-        struct LhsRhsCase<T0, T1> {
-            lhs: T0,
-            rhs: T1,
-        }
-        [
-            LhsRhsCase {
-                lhs: [3].as_slice(),
-                rhs: [3, 4].as_slice(),
-            },
-            LhsRhsCase {
-                lhs: &[2, 3],
-                rhs: &[3],
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |LhsRhsCase {
-                 lhs,
-                 rhs,
-             }| {
-                assert_eq!(
-                    matmul_rule(
-                        DType::F32,
-                        &Layout::contiguous(Shape::try_from(lhs).expect("valid shape")),
-                        DType::F32,
-                        &Layout::contiguous(Shape::try_from(rhs).expect("valid shape")),
-                    ),
-                    Err(CoreError::MatmulIncompatible),
-                    "lhs {lhs:?} and rhs {rhs:?}"
-                );
-            },
+        assert_eq!(
+            [
+                output(
+                    Op::Matmul,
+                    &[
+                        (
+                            DType::F32,
+                            Shape::try_from([3].as_slice()).expect("valid shape")
+                        ),
+                        (
+                            DType::F32,
+                            Shape::try_from([3, 4].as_slice()).expect("valid shape")
+                        )
+                    ]
+                ),
+                output(
+                    Op::Matmul,
+                    &[
+                        (
+                            DType::F32,
+                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                        ),
+                        (
+                            DType::F32,
+                            Shape::try_from([3].as_slice()).expect("valid shape")
+                        )
+                    ]
+                ),
+            ],
+            [
+                Err(CoreError::MatmulIncompatible),
+                Err(CoreError::MatmulIncompatible)
+            ],
+            "a rank 1 lhs, then a rank 1 rhs"
         );
     }
 
     #[test]
     fn matmul_rejects_integer_dtype() {
         assert_eq!(
-            matmul_rule(
-                DType::U32,
-                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-                DType::U32,
-                &Layout::contiguous(Shape::try_from([3, 4].as_slice()).expect("valid shape")),
+            output(
+                Op::Matmul,
+                &[
+                    (
+                        DType::U32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::U32,
+                        Shape::try_from([3, 4].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::DTypeNotFloat),
             "matmul needs a float dtype"
@@ -842,11 +793,18 @@ mod tests {
     #[test]
     fn matmul_rejects_dtype_mismatch() {
         assert_eq!(
-            matmul_rule(
-                DType::BF16,
-                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([3, 4].as_slice()).expect("valid shape")),
+            output(
+                Op::Matmul,
+                &[
+                    (
+                        DType::BF16,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([3, 4].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::DTypeMismatch),
             "matmul needs equal dtypes"
@@ -856,11 +814,18 @@ mod tests {
     #[test]
     fn matmul_rejects_output_beyond_the_element_limit() {
         assert_eq!(
-            matmul_rule(
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([1 << 16, 1].as_slice()).expect("valid shape")),
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape")),
+            output(
+                Op::Matmul,
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([1 << 16, 1].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::NumelOverflow),
             "the output holds 2^32 elements"
@@ -868,84 +833,108 @@ mod tests {
     }
 
     #[test]
-    fn to_dtype_returns_both_float_dtypes() {
+    fn copy_keeps_shape_and_any_dtype() {
         assert_eq!(
-            to_dtype_rule(DType::F32, DType::BF16),
-            Ok(ToDtypeSpec {
-                from: FloatDType::F32,
-                to: FloatDType::BF16,
-            }),
-            "source and target dtypes"
+            output(
+                Op::Copy,
+                &[(
+                    DType::U32,
+                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                )]
+            ),
+            Ok((
+                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                DType::U32
+            )),
+            "copy accepts integers"
+        );
+    }
+
+    #[test]
+    fn to_dtype_returns_the_target_dtype() {
+        assert_eq!(
+            output(
+                Op::ToDtype(DType::BF16),
+                &[(
+                    DType::F32,
+                    Shape::try_from([3].as_slice()).expect("valid shape")
+                )]
+            ),
+            Ok((
+                Shape::try_from([3].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
+            "shape kept, target dtype"
         );
     }
 
     #[test]
     fn to_dtype_rejects_integer_source_and_target() {
-        struct FromToCase<T0, T1> {
-            from: T0,
-            to: T1,
-        }
-        [
-            FromToCase {
-                from: DType::U32,
-                to: DType::F32,
-            },
-            FromToCase {
-                from: DType::F32,
-                to: DType::U32,
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |FromToCase {
-                 from,
-                 to,
-             }| {
-                assert_eq!(
-                    to_dtype_rule(from, to),
-                    Err(CoreError::DTypeNotFloat),
-                    "to_dtype from {from:?} to {to:?}"
-                );
-            },
+        assert_eq!(
+            [
+                output(
+                    Op::ToDtype(DType::F32),
+                    &[(
+                        DType::U32,
+                        Shape::try_from([3].as_slice()).expect("valid shape")
+                    )]
+                ),
+                output(
+                    Op::ToDtype(DType::U32),
+                    &[(
+                        DType::F32,
+                        Shape::try_from([3].as_slice()).expect("valid shape")
+                    )]
+                ),
+            ],
+            [Err(CoreError::DTypeNotFloat), Err(CoreError::DTypeNotFloat)],
+            "from u32, then to u32"
         );
     }
 
     #[test]
     fn index_select_selects_table_rows() {
-        let table = Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape"))
-            .permute(&[1, 0])
-            .expect("valid permutation");
-        let spec = index_select_rule(
-            DType::BF16,
-            &table,
-            0,
-            DType::U32,
-            &Shape::try_from([5].as_slice()).expect("valid shape"),
-        )
-        .expect("valid index select");
         assert_eq!(
-            spec,
-            IndexSelectSpec {
-                dtype: FloatDType::BF16,
-                output: Shape::try_from([5, 4].as_slice()).expect("valid shape"),
-                rows: 3,
-                cols: 4,
-                row_stride: 1,
-                col_stride: 3,
-            },
-            "dtype, output dims, table dims and strides"
+            output(
+                Op::IndexSelect {
+                    dim: 0,
+                },
+                &[
+                    (
+                        DType::BF16,
+                        Shape::try_from([3, 4].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::U32,
+                        Shape::try_from([5].as_slice()).expect("valid shape")
+                    )
+                ]
+            ),
+            Ok((
+                Shape::try_from([5, 4].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
+            "one row of the table per index"
         );
     }
 
     #[test]
     fn index_select_rejects_integer_table() {
         assert_eq!(
-            index_select_rule(
-                DType::U32,
-                &Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape")),
-                0,
-                DType::U32,
-                &Shape::try_from([2].as_slice()).expect("valid shape"),
+            output(
+                Op::IndexSelect {
+                    dim: 0,
+                },
+                &[
+                    (
+                        DType::U32,
+                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::U32,
+                        Shape::try_from([2].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::DTypeNotFloat),
             "the table needs a float dtype"
@@ -955,12 +944,20 @@ mod tests {
     #[test]
     fn index_select_rejects_non_u32_indices() {
         assert_eq!(
-            index_select_rule(
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape")),
-                0,
-                DType::F32,
-                &Shape::try_from([2].as_slice()).expect("valid shape"),
+            output(
+                Op::IndexSelect {
+                    dim: 0,
+                },
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([2].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::IndicesNotU32),
             "indices must be u32"
@@ -969,54 +966,54 @@ mod tests {
 
     #[test]
     fn index_select_rejects_invalid_ranks() {
-        struct TableIndicesCase<T0, T1> {
-            table: T0,
-            indices: T1,
-        }
         [
-            TableIndicesCase {
-                table: [4].as_slice(),
-                indices: [2].as_slice(),
-            },
-            TableIndicesCase {
-                table: &[2, 3, 4],
-                indices: &[2],
-            },
-            TableIndicesCase {
-                table: &[4, 3],
-                indices: &[2, 1],
-            },
+            (
+                Shape::try_from([4].as_slice()).expect("valid shape"),
+                Shape::try_from([2].as_slice()).expect("valid shape"),
+            ),
+            (
+                Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
+                Shape::try_from([2].as_slice()).expect("valid shape"),
+            ),
+            (
+                Shape::try_from([4, 3].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 1].as_slice()).expect("valid shape"),
+            ),
         ]
         .into_iter()
-        .for_each(
-            |TableIndicesCase {
-                 table,
-                 indices,
-             }| {
-                assert_eq!(
-                    index_select_rule(
-                        DType::F32,
-                        &Layout::contiguous(Shape::try_from(table).expect("valid shape")),
-                        0,
-                        DType::U32,
-                        &Shape::try_from(indices).expect("valid shape"),
-                    ),
-                    Err(CoreError::IndexSelectIncompatible),
-                    "table {table:?} and indices {indices:?}"
-                );
-            },
-        );
+        .for_each(|(table, indices)| {
+            assert_eq!(
+                output(
+                    Op::IndexSelect {
+                        dim: 0,
+                    },
+                    &[(DType::F32, table), (DType::U32, indices)]
+                ),
+                Err(CoreError::IndexSelectIncompatible),
+                "table {:?} and indices {:?}",
+                table.dims(),
+                indices.dims()
+            );
+        });
     }
 
     #[test]
     fn index_select_rejects_a_dim_other_than_zero() {
         assert_eq!(
-            index_select_rule(
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape")),
-                1,
-                DType::U32,
-                &Shape::try_from([2].as_slice()).expect("valid shape"),
+            output(
+                Op::IndexSelect {
+                    dim: 1,
+                },
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::U32,
+                        Shape::try_from([2].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::IndexSelectIncompatible),
             "only rows of the table are selected"
@@ -1026,12 +1023,20 @@ mod tests {
     #[test]
     fn index_select_rejects_output_beyond_the_element_limit() {
         assert_eq!(
-            index_select_rule(
-                DType::F32,
-                &Layout::contiguous(Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape")),
-                0,
-                DType::U32,
-                &Shape::try_from([1 << 16].as_slice()).expect("valid shape"),
+            output(
+                Op::IndexSelect {
+                    dim: 0,
+                },
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::U32,
+                        Shape::try_from([1 << 16].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::NumelOverflow),
             "the output holds 2^32 elements"
@@ -1040,34 +1045,47 @@ mod tests {
 
     #[test]
     fn cat_adds_the_sizes_along_dim() {
-        let spec = cat_rule(
-            DType::BF16,
-            &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
-            DType::BF16,
-            &Shape::try_from([2, 5, 4].as_slice()).expect("valid shape"),
-            1,
-        )
-        .expect("compatible shapes");
         assert_eq!(
-            spec,
-            CatSpec {
-                dtype: FloatDType::BF16,
-                output: Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"),
-                rhs_offset: 12,
-            },
-            "dtype, output dims and rhs offset"
+            output(
+                Op::Cat {
+                    dim: 1,
+                },
+                &[
+                    (
+                        DType::BF16,
+                        Shape::try_from([2, 3, 4].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::BF16,
+                        Shape::try_from([2, 5, 4].as_slice()).expect("valid shape")
+                    )
+                ]
+            ),
+            Ok((
+                Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
+            "sizes 3 and 5 add along dim 1"
         );
     }
 
     #[test]
     fn cat_rejects_mismatch_outside_dim() {
         assert_eq!(
-            cat_rule(
-                DType::F32,
-                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                DType::F32,
-                &Shape::try_from([4, 5].as_slice()).expect("valid shape"),
-                1,
+            output(
+                Op::Cat {
+                    dim: 1,
+                },
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([4, 5].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::CatIncompatible),
             "dims 2 and 4 differ outside the dim"
@@ -1077,12 +1095,20 @@ mod tests {
     #[test]
     fn cat_rejects_rank_mismatch() {
         assert_eq!(
-            cat_rule(
-                DType::F32,
-                &Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
-                DType::F32,
-                &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                0,
+            output(
+                Op::Cat {
+                    dim: 0,
+                },
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([2, 3, 4].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
             Err(CoreError::CatIncompatible),
             "ranks 3 and 2 differ"
@@ -1091,155 +1117,193 @@ mod tests {
 
     #[test]
     fn cat_rejects_dtype_mismatch_and_integer_dtype() {
-        let shape = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        let cat = Op::Cat {
+            dim: 0,
+        };
         assert_eq!(
-            cat_rule(DType::F32, &shape, DType::BF16, &shape, 0),
-            Err(CoreError::DTypeMismatch),
-            "cat needs equal dtypes"
-        );
-        assert_eq!(
-            cat_rule(DType::U32, &shape, DType::U32, &shape, 0),
-            Err(CoreError::DTypeNotFloat),
-            "cat needs a float dtype"
+            [
+                output(
+                    cat,
+                    &[
+                        (
+                            DType::F32,
+                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                        ),
+                        (
+                            DType::BF16,
+                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                        )
+                    ]
+                ),
+                output(
+                    cat,
+                    &[
+                        (
+                            DType::U32,
+                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                        ),
+                        (
+                            DType::U32,
+                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                        )
+                    ]
+                ),
+            ],
+            [Err(CoreError::DTypeMismatch), Err(CoreError::DTypeNotFloat)],
+            "cat needs equal float dtypes"
         );
     }
 
     #[test]
     fn cat_rejects_dim_out_of_range() {
-        struct LhsRhsCase<T0, T1> {
-            lhs: T0,
-            rhs: T1,
-        }
         [
-            LhsRhsCase {
-                lhs: [2, 3].as_slice(),
-                rhs: [2, 3].as_slice(),
-            },
-            LhsRhsCase {
-                lhs: &[2, 3, 4],
-                rhs: &[2, 3],
-            },
+            (
+                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+            ),
+            (
+                Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+            ),
         ]
         .into_iter()
-        .for_each(
-            |LhsRhsCase {
-                 lhs,
-                 rhs,
-             }| {
-                assert_eq!(
-                    cat_rule(
-                        DType::F32,
-                        &Shape::try_from(lhs).expect("valid shape"),
-                        DType::F32,
-                        &Shape::try_from(rhs).expect("valid shape"),
-                        2,
-                    ),
-                    Err(CoreError::DimOutOfRange),
-                    "lhs {lhs:?} and rhs {rhs:?}"
-                );
-            },
-        );
+        .for_each(|(lhs, rhs)| {
+            assert_eq!(
+                output(
+                    Op::Cat {
+                        dim: 2,
+                    },
+                    &[(DType::F32, lhs), (DType::F32, rhs)]
+                ),
+                Err(CoreError::DimOutOfRange),
+                "lhs {:?} and rhs {:?}",
+                lhs.dims(),
+                rhs.dims()
+            );
+        });
     }
 
     #[test]
     fn cat_rejects_output_beyond_the_element_limit() {
-        let shape = Shape::try_from([1 << 30].as_slice()).expect("valid shape");
         assert_eq!(
-            cat_rule(DType::F32, &shape, DType::F32, &shape, 0),
+            output(
+                Op::Cat {
+                    dim: 0,
+                },
+                &[
+                    (
+                        DType::F32,
+                        Shape::try_from([1 << 30].as_slice()).expect("valid shape")
+                    ),
+                    (
+                        DType::F32,
+                        Shape::try_from([1 << 30].as_slice()).expect("valid shape")
+                    )
+                ]
+            ),
             Err(CoreError::NumelOverflow),
             "the output holds 2^31 elements"
         );
     }
 
     #[test]
-    fn slice_scatter_returns_window_offset() {
+    fn slice_scatter_keeps_the_target() {
         let target =
-            Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"))
+            *Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"))
                 .narrow(0, 1, 1)
-                .expect("valid narrow");
+                .expect("valid narrow")
+                .shape();
         assert_eq!(
-            slice_scatter_rule(
-                DType::BF16,
-                &target,
-                DType::BF16,
-                &Shape::try_from([1, 2, 4].as_slice()).expect("valid shape"),
-                1,
-                3,
+            output(
+                Op::SliceScatter {
+                    dim: 1,
+                    start: 3,
+                },
+                &[
+                    (DType::BF16, target),
+                    (
+                        DType::BF16,
+                        Shape::try_from([1, 2, 4].as_slice()).expect("valid shape")
+                    )
+                ]
             ),
-            Ok(SliceScatterSpec {
-                dtype: FloatDType::BF16,
-                offset: 44,
-            }),
-            "target offset 32 plus start 3 times stride 4"
+            Ok((
+                Shape::try_from([1, 8, 4].as_slice()).expect("valid shape"),
+                DType::BF16
+            )),
+            "the target shape and dtype"
         );
     }
 
     #[test]
     fn slice_scatter_rejects_out_of_bounds_and_mismatches() {
-        struct SrcDimStartCase<T0, T1, T2> {
-            src: T0,
-            dim: T1,
-            start: T2,
-        }
-        let target = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"));
         [
-            SrcDimStartCase {
-                src: [1, 3].as_slice(),
-                dim: 0,
-                start: usize::MAX,
-            },
-            SrcDimStartCase {
-                src: &[2, 3],
-                dim: 0,
-                start: 1,
-            },
-            SrcDimStartCase {
-                src: &[1, 2],
-                dim: 0,
-                start: 0,
-            },
-            SrcDimStartCase {
-                src: &[1, 3, 1],
-                dim: 0,
-                start: 0,
-            },
+            (
+                Shape::try_from([1, 3].as_slice()).expect("valid shape"),
+                0,
+                usize::MAX,
+            ),
+            (
+                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                0,
+                1,
+            ),
+            (
+                Shape::try_from([1, 2].as_slice()).expect("valid shape"),
+                0,
+                0,
+            ),
+            (
+                Shape::try_from([1, 3, 1].as_slice()).expect("valid shape"),
+                0,
+                0,
+            ),
         ]
         .into_iter()
-        .for_each(
-            |SrcDimStartCase {
-                 src,
-                 dim,
-                 start,
-             }| {
-                assert_eq!(
-                    slice_scatter_rule(
-                        DType::F32,
-                        &target,
-                        DType::F32,
-                        &Shape::try_from(src).expect("valid shape"),
+        .for_each(|(src, dim, start)| {
+            assert_eq!(
+                output(
+                    Op::SliceScatter {
                         dim,
                         start,
-                    ),
-                    Err(CoreError::SliceScatterOutOfBounds),
-                    "src {src:?} at start {start}"
-                );
-            },
-        );
+                    },
+                    &[
+                        (
+                            DType::F32,
+                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
+                        ),
+                        (DType::F32, src)
+                    ]
+                ),
+                Err(CoreError::SliceScatterOutOfBounds),
+                "src {:?} at start {start}",
+                src.dims()
+            );
+        });
     }
 
     #[test]
     fn slice_scatter_rejects_dtype_and_dim() {
-        let target = Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"));
-        let src = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        let target = Shape::try_from([2, 3].as_slice()).expect("valid shape");
         assert_eq!(
-            slice_scatter_rule(DType::F32, &target, DType::BF16, &src, 0, 0),
-            Err(CoreError::DTypeMismatch),
-            "slice scatter needs equal dtypes"
-        );
-        assert_eq!(
-            slice_scatter_rule(DType::F32, &target, DType::F32, &src, 2, 0),
-            Err(CoreError::DimOutOfRange),
-            "dim 2 does not exist"
+            [
+                output(
+                    Op::SliceScatter {
+                        dim: 0,
+                        start: 0,
+                    },
+                    &[(DType::F32, target), (DType::BF16, target)]
+                ),
+                output(
+                    Op::SliceScatter {
+                        dim: 2,
+                        start: 0,
+                    },
+                    &[(DType::F32, target), (DType::F32, target)]
+                ),
+            ],
+            [Err(CoreError::DTypeMismatch), Err(CoreError::DimOutOfRange)],
+            "unequal dtypes, then dim 2 out of range"
         );
     }
 }

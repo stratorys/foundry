@@ -1,6 +1,7 @@
 mod error;
 mod stream;
 
+use std::array;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
@@ -25,13 +26,8 @@ pub use self::error::MetalError;
 use self::stream::CommandStream;
 use crate::nn::primitive::{
     BinaryOp,
-    CatSpec,
-    IndexSelectSpec,
-    MatmulSpec,
-    MatrixLayout,
+    Op,
     ReduceOp,
-    ReduceSpec,
-    SliceScatterSpec,
     UnaryOp,
 };
 use crate::nn::{
@@ -44,7 +40,6 @@ use crate::nn::{
     MAX_ITEMSIZE,
     MAX_RANK,
     Operand,
-    OperandMut,
     Shape,
 };
 
@@ -133,6 +128,29 @@ struct MatmulDispatch {
     grid: MTLSize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MatrixLayout {
+    offset: usize,
+    row_stride: usize,
+    col_stride: usize,
+    batch_strides: [usize; MAX_RANK],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MatmulGeometry {
+    batch: Shape,
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: MatrixLayout,
+    rhs: MatrixLayout,
+}
+
+struct StrideFold {
+    strides: Vec<usize>,
+    stride_next: usize,
+}
+
 struct MatmulInput<'buffer> {
     view: BufferView<'buffer>,
     layout: MatrixLayout,
@@ -184,15 +202,22 @@ impl IndexSelectArgs {
     fn new(
         table: &BufferView<'_>,
         indices: &BufferView<'_>,
-        spec: &IndexSelectSpec,
+        output: &Shape,
     ) -> Result<Self, MetalError> {
+        let (&[rows, cols], &[row_stride, col_stride]) =
+            (table.layout.shape().dims(), table.layout.strides())
+        else {
+            return Err(invalid_operation(Op::IndexSelect {
+                dim: 0,
+            }));
+        };
         Ok(Self {
-            count: index_u32(spec.output().numel())?,
-            rows: index_u32(spec.rows())?,
-            cols: index_u32(spec.cols())?,
+            count: index_u32(output.numel())?,
+            rows: index_u32(rows)?,
+            cols: index_u32(cols)?,
             table_offset: index_u32(table.layout.storage_offset())?,
-            table_row_stride: index_u32(spec.row_stride())?,
-            table_col_stride: index_u32(spec.col_stride())?,
+            table_row_stride: index_u32(row_stride)?,
+            table_col_stride: index_u32(col_stride)?,
             indices: StridedArgs::new(indices)?,
         })
     }
@@ -201,12 +226,80 @@ impl IndexSelectArgs {
 impl ReduceArgs {
     fn new(
         input: &BufferView<'_>,
-        spec: &ReduceSpec,
+        output: &Shape,
+        dim: usize,
     ) -> Result<Self, MetalError> {
+        let (Some(&dim_size), Some(&dim_stride)) = (
+            input.layout.shape().dims().get(dim),
+            input.layout.strides().get(dim),
+        ) else {
+            return Err(invalid_operation(Op::Reduce {
+                op: ReduceOp::Sum,
+                dim,
+            }));
+        };
         Ok(Self {
-            rows: StridedArgs::with_shape(input.layout, spec.output())?,
-            dim_size: index_u32(spec.dim_size())?,
-            dim_stride: index_u32(spec.dim_stride())?,
+            rows: StridedArgs::with_shape(input.layout, output)?,
+            dim_size: index_u32(dim_size)?,
+            dim_stride: index_u32(dim_stride)?,
+        })
+    }
+}
+
+impl MatrixLayout {
+    fn contiguous(
+        batch: &Shape,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        let matrix_len = rows.saturating_mul(cols);
+        let batch_strides_reversed = batch.dims().iter().rev().fold(
+            StrideFold {
+                strides: Vec::with_capacity(MAX_RANK),
+                stride_next: matrix_len,
+            },
+            |mut fold, &dim| {
+                fold.strides.push(fold.stride_next);
+                StrideFold {
+                    stride_next: fold.stride_next.saturating_mul(dim),
+                    strides: fold.strides,
+                }
+            },
+        );
+        let batch_strides: Vec<usize> = batch_strides_reversed.strides.into_iter().rev().collect();
+        Self {
+            offset: 0,
+            row_stride: cols,
+            col_stride: 1,
+            batch_strides: padded(&batch_strides),
+        }
+    }
+
+    fn of(layout: &Layout) -> Option<Self> {
+        let (batch_strides, [row_stride, col_stride]) = layout.strides().split_last_chunk::<2>()?;
+        Some(Self {
+            offset: layout.storage_offset(),
+            row_stride: *row_stride,
+            col_stride: *col_stride,
+            batch_strides: padded(batch_strides),
+        })
+    }
+}
+
+impl MatmulGeometry {
+    fn of(
+        lhs: &Layout,
+        rhs: &Layout,
+    ) -> Option<Self> {
+        let (batch, &[m, k]) = lhs.shape().dims().split_last_chunk::<2>()?;
+        let &[_, n] = rhs.shape().dims().split_last_chunk::<2>()?.1;
+        Some(Self {
+            batch: Shape::try_from(batch).ok()?,
+            m,
+            k,
+            n,
+            lhs: MatrixLayout::of(lhs)?,
+            rhs: MatrixLayout::of(rhs)?,
         })
     }
 }
@@ -214,34 +307,34 @@ impl ReduceArgs {
 impl MatmulOperand {
     fn new(matrix: &MatrixLayout) -> Result<Self, MetalError> {
         Ok(Self {
-            offset: index_u32(matrix.offset())?,
-            row_stride: index_u32(matrix.row_stride())?,
-            col_stride: index_u32(matrix.col_stride())?,
-            batch_strides: padded_u32(matrix.batch_strides())?,
+            offset: index_u32(matrix.offset)?,
+            row_stride: index_u32(matrix.row_stride)?,
+            col_stride: index_u32(matrix.col_stride)?,
+            batch_strides: padded_u32(&matrix.batch_strides)?,
         })
     }
 }
 
 impl MatmulDispatch {
     fn new(
-        spec: &MatmulSpec,
+        geometry: &MatmulGeometry,
         lhs: &MatrixLayout,
         rhs: &MatrixLayout,
     ) -> Result<Self, MetalError> {
-        let batch_dims = spec.batch().dims();
+        let batch_dims = geometry.batch.dims();
         let args = MatmulArgs {
-            m: index_u32(spec.m())?,
-            n: index_u32(spec.n())?,
-            k: index_u32(spec.k())?,
+            m: index_u32(geometry.m)?,
+            n: index_u32(geometry.n)?,
+            k: index_u32(geometry.k)?,
             batch_ndim: index_u32(batch_dims.len())?,
             batch_dims: padded_u32(batch_dims)?,
             lhs: MatmulOperand::new(lhs)?,
             rhs: MatmulOperand::new(rhs)?,
         };
         let grid = MTLSize {
-            width: spec.n().div_ceil(MATMUL_TILE),
-            height: spec.m().div_ceil(MATMUL_TILE),
-            depth: spec.batch().numel(),
+            width: geometry.n.div_ceil(MATMUL_TILE),
+            height: geometry.m.div_ceil(MATMUL_TILE),
+            depth: geometry.batch.numel(),
         };
         Ok(Self {
             args,
@@ -323,13 +416,14 @@ impl MetalBackend {
         }
     }
 
-    fn view<'buffer, D: Copy>(
+    fn view<'buffer>(
         &self,
-        operand: &Operand<'buffer, MetalStorage, D>,
+        operand: &Operand<'buffer, &'buffer MetalStorage>,
     ) -> Result<BufferView<'buffer>, MetalError> {
-        self.owns(operand.storage())?;
+        let storage: &'buffer MetalStorage = operand.storage();
+        self.owns(storage)?;
         Ok(BufferView {
-            storage: operand.storage(),
+            storage,
             layout: operand.layout(),
         })
     }
@@ -685,9 +779,9 @@ impl MetalBackend {
         &mut self,
         operand: BufferView<'buffer>,
         matrix: &MatrixLayout,
-        spec: &MatmulSpec,
-        rows: usize,
-        cols: usize,
+        batch: &Shape,
+        [rows, cols]: [usize; 2],
+        dtype: DType,
     ) -> Result<MatmulInput<'buffer>, MetalError> {
         if is_matmul_ready(matrix, rows, cols) {
             return Ok(MatmulInput {
@@ -696,12 +790,154 @@ impl MetalBackend {
                 copy: None,
             });
         }
-        let storage = self.copy_view(&operand, spec.dtype().into())?;
+        let storage = self.copy_view(&operand, dtype)?;
         Ok(MatmulInput {
             view: operand,
-            layout: MatrixLayout::contiguous(spec.batch(), rows, cols),
+            layout: MatrixLayout::contiguous(batch, rows, cols),
             copy: Some(storage),
         })
+    }
+
+    fn unary(
+        &mut self,
+        op: UnaryOp,
+        input: &BufferView<'_>,
+        dtype: DType,
+    ) -> Result<MetalStorage, MetalError> {
+        let output = self.allocate(input.layout.shape().nbytes(dtype))?;
+        self.dispatch_strided(unary_kernel(op, float(dtype)?), &[input], &output)?;
+        Ok(output)
+    }
+
+    fn binary(
+        &mut self,
+        op: BinaryOp,
+        lhs: &BufferView<'_>,
+        rhs: &BufferView<'_>,
+        dtype: DType,
+    ) -> Result<MetalStorage, MetalError> {
+        let output = self.allocate(lhs.layout.shape().nbytes(dtype))?;
+        self.dispatch_strided(binary_kernel(op, float(dtype)?), &[lhs, rhs], &output)?;
+        Ok(output)
+    }
+
+    fn reduce(
+        &mut self,
+        (op, dim): (ReduceOp, usize),
+        input: &BufferView<'_>,
+        input_dtype: DType,
+        output_shape: &Shape,
+        dtype: DType,
+    ) -> Result<MetalStorage, MetalError> {
+        let args = ReduceArgs::new(input, output_shape, dim)?;
+        let output = self.allocate(output_shape.nbytes(dtype))?;
+        self.dispatch_reduce(
+            reduce_kernel(op, float(input_dtype)?),
+            input,
+            &args,
+            output_shape.numel(),
+            &output,
+        )?;
+        Ok(output)
+    }
+
+    fn matmul(
+        &mut self,
+        lhs: BufferView<'_>,
+        rhs: BufferView<'_>,
+        output_shape: &Shape,
+        dtype: DType,
+    ) -> Result<MetalStorage, MetalError> {
+        let geometry = MatmulGeometry::of(lhs.layout, rhs.layout)
+            .ok_or_else(|| invalid_operation(Op::Matmul))?;
+        let output = self.allocate(output_shape.nbytes(dtype))?;
+        if output_shape.numel() == 0 {
+            return Ok(output);
+        }
+        let lhs_input = self.matmul_operand(
+            lhs,
+            &geometry.lhs,
+            &geometry.batch,
+            [geometry.m, geometry.k],
+            dtype,
+        )?;
+        let rhs_input = self.matmul_operand(
+            rhs,
+            &geometry.rhs,
+            &geometry.batch,
+            [geometry.k, geometry.n],
+            dtype,
+        )?;
+        let lhs_layout = Layout::contiguous(*lhs_input.view.layout.shape());
+        let rhs_layout = Layout::contiguous(*rhs_input.view.layout.shape());
+        let dispatch = MatmulDispatch::new(&geometry, &lhs_input.layout, &rhs_input.layout)?;
+        let lhs = copied_view(lhs_input.view, lhs_input.copy.as_ref(), &lhs_layout);
+        let rhs = copied_view(rhs_input.view, rhs_input.copy.as_ref(), &rhs_layout);
+        self.dispatch_matmul(
+            matmul_kernel(float(dtype)?),
+            &lhs,
+            &rhs,
+            &dispatch.args,
+            dispatch.grid,
+            &output,
+        )?;
+        Ok(output)
+    }
+
+    fn convert_dtype(
+        &mut self,
+        input: &BufferView<'_>,
+        dtype_from: DType,
+        dtype: DType,
+    ) -> Result<MetalStorage, MetalError> {
+        let output = self.allocate(input.layout.shape().nbytes(dtype))?;
+        let kernel = to_dtype_kernel(float(dtype_from)?, float(dtype)?);
+        self.dispatch_strided(kernel, &[input], &output)?;
+        Ok(output)
+    }
+
+    fn index_select(
+        &mut self,
+        table: &BufferView<'_>,
+        indices: &BufferView<'_>,
+        output_shape: &Shape,
+        dtype: DType,
+    ) -> Result<MetalStorage, MetalError> {
+        let args = IndexSelectArgs::new(table, indices, output_shape)?;
+        let output = self.allocate(output_shape.nbytes(dtype))?;
+        self.dispatch_index_select(
+            index_select_kernel(float(dtype)?),
+            table,
+            indices,
+            &args,
+            output_shape.numel(),
+            &output,
+        )?;
+        Ok(output)
+    }
+
+    fn cat(
+        &mut self,
+        lhs: &BufferView<'_>,
+        rhs: &BufferView<'_>,
+        dim: usize,
+        output_shape: &Shape,
+        dtype: DType,
+    ) -> Result<MetalStorage, MetalError> {
+        let kernel = slice_scatter_kernel(float(dtype)?);
+        let mut output = self.allocate(output_shape.nbytes(dtype))?;
+        let layout = Layout::contiguous(*output_shape);
+        let rhs_offset = slice_offset(&layout, dim, lhs.layout.shape().dims().get(dim).copied())
+            .ok_or_else(|| {
+                invalid_operation(Op::Cat {
+                    dim,
+                })
+            })?;
+        let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), 0)?;
+        let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), rhs_offset)?;
+        self.dispatch_write(kernel, lhs, &lhs_window, &mut output)?;
+        self.dispatch_write(kernel, rhs, &rhs_window, &mut output)?;
+        Ok(output)
     }
 }
 
@@ -749,10 +985,10 @@ impl Backend for MetalBackend {
 
     fn storage_to_bytes(
         &mut self,
-        input: Operand<'_, MetalStorage>,
+        input: &Operand<&MetalStorage>,
     ) -> Result<Vec<u8>, MetalError> {
         let dtype = input.dtype();
-        let input = self.view(&input)?;
+        let input = self.view(input)?;
         let bytes = input.layout.shape().nbytes(dtype);
         let bytes_offset = input
             .layout
@@ -794,151 +1030,71 @@ impl Backend for MetalBackend {
         Ok(output)
     }
 
-    fn unary(
+    fn run(
         &mut self,
-        op: UnaryOp,
-        input: Operand<'_, MetalStorage, FloatDType>,
+        op: Op,
+        inputs: &[Operand<&MetalStorage>],
+        output: &Shape,
+        dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let dtype = input.dtype();
-        let input = self.view(&input)?;
-        let output = self.allocate(input.layout.shape().nbytes(dtype.into()))?;
-        self.dispatch_strided(unary_kernel(op, dtype), &[&input], &output)?;
-        Ok(output)
-    }
-
-    fn binary(
-        &mut self,
-        op: BinaryOp,
-        lhs: Operand<'_, MetalStorage, FloatDType>,
-        rhs: Operand<'_, MetalStorage, FloatDType>,
-    ) -> Result<MetalStorage, MetalError> {
-        let dtype = lhs.dtype();
-        let lhs = self.view(&lhs)?;
-        let rhs = self.view(&rhs)?;
-        let output = self.allocate(lhs.layout.shape().nbytes(dtype.into()))?;
-        self.dispatch_strided(binary_kernel(op, dtype), &[&lhs, &rhs], &output)?;
-        Ok(output)
-    }
-
-    fn reduce(
-        &mut self,
-        input: Operand<'_, MetalStorage, FloatDType>,
-        spec: &ReduceSpec,
-    ) -> Result<MetalStorage, MetalError> {
-        let input = self.view(&input)?;
-        let args = ReduceArgs::new(&input, spec)?;
-        let output = self.allocate(spec.output().nbytes(spec.dtype_output()))?;
-        self.dispatch_reduce(
-            reduce_kernel(spec.op(), spec.dtype()),
-            &input,
-            &args,
-            spec.output().numel(),
-            &output,
-        )?;
-        Ok(output)
-    }
-
-    fn matmul(
-        &mut self,
-        lhs: Operand<'_, MetalStorage, FloatDType>,
-        rhs: Operand<'_, MetalStorage, FloatDType>,
-        spec: &MatmulSpec,
-    ) -> Result<MetalStorage, MetalError> {
-        let lhs = self.view(&lhs)?;
-        let rhs = self.view(&rhs)?;
-        let output = self.allocate(spec.output().nbytes(spec.dtype().into()))?;
-        if spec.output().numel() == 0 {
-            return Ok(output);
+        match (op, inputs) {
+            (Op::Unary(unary), [input]) => self.unary(unary, &self.view(input)?, dtype),
+            (Op::Binary(binary), [lhs, rhs]) => {
+                self.binary(binary, &self.view(lhs)?, &self.view(rhs)?, dtype)
+            }
+            (
+                Op::Reduce {
+                    op,
+                    dim,
+                },
+                [input],
+            ) => self.reduce((op, dim), &self.view(input)?, input.dtype(), output, dtype),
+            (Op::Matmul, [lhs, rhs]) => {
+                self.matmul(self.view(lhs)?, self.view(rhs)?, output, dtype)
+            }
+            (Op::Copy, [input]) => self.copy_view(&self.view(input)?, dtype),
+            (Op::ToDtype(_), [input]) => {
+                self.convert_dtype(&self.view(input)?, input.dtype(), dtype)
+            }
+            (
+                Op::IndexSelect {
+                    ..
+                },
+                [table, indices],
+            ) => self.index_select(&self.view(table)?, &self.view(indices)?, output, dtype),
+            (
+                Op::Cat {
+                    dim,
+                },
+                [lhs, rhs],
+            ) => self.cat(&self.view(lhs)?, &self.view(rhs)?, dim, output, dtype),
+            _ => Err(invalid_operation(op)),
         }
-        let lhs_input = self.matmul_operand(lhs, spec.lhs(), spec, spec.m(), spec.k())?;
-        let rhs_input = self.matmul_operand(rhs, spec.rhs(), spec, spec.k(), spec.n())?;
-        let lhs_layout = Layout::contiguous(*lhs_input.view.layout.shape());
-        let rhs_layout = Layout::contiguous(*rhs_input.view.layout.shape());
-        let dispatch = MatmulDispatch::new(spec, &lhs_input.layout, &rhs_input.layout)?;
-        let lhs = copied_view(lhs_input.view, lhs_input.copy.as_ref(), &lhs_layout);
-        let rhs = copied_view(rhs_input.view, rhs_input.copy.as_ref(), &rhs_layout);
-        self.dispatch_matmul(
-            matmul_kernel(spec.dtype()),
-            &lhs,
-            &rhs,
-            &dispatch.args,
-            dispatch.grid,
-            &output,
-        )?;
-        Ok(output)
     }
 
-    fn copy(
+    fn run_in_place(
         &mut self,
-        input: Operand<'_, MetalStorage>,
-    ) -> Result<MetalStorage, MetalError> {
-        let dtype = input.dtype();
-        self.copy_view(&self.view(&input)?, dtype)
-    }
-
-    fn to_dtype(
-        &mut self,
-        input: Operand<'_, MetalStorage, FloatDType>,
-        dtype: FloatDType,
-    ) -> Result<MetalStorage, MetalError> {
-        let dtype_from = input.dtype();
-        let input = self.view(&input)?;
-        let output = self.allocate(input.layout.shape().nbytes(dtype.into()))?;
-        self.dispatch_strided(to_dtype_kernel(dtype_from, dtype), &[&input], &output)?;
-        Ok(output)
-    }
-
-    fn index_select(
-        &mut self,
-        table: Operand<'_, MetalStorage, FloatDType>,
-        indices: Operand<'_, MetalStorage>,
-        spec: &IndexSelectSpec,
-    ) -> Result<MetalStorage, MetalError> {
-        let table = self.view(&table)?;
-        let indices = self.view(&indices)?;
-        let args = IndexSelectArgs::new(&table, &indices, spec)?;
-        let output = self.allocate(spec.output().nbytes(spec.dtype().into()))?;
-        self.dispatch_index_select(
-            index_select_kernel(spec.dtype()),
-            &table,
-            &indices,
-            &args,
-            spec.output().numel(),
-            &output,
-        )?;
-        Ok(output)
-    }
-
-    fn cat(
-        &mut self,
-        lhs: Operand<'_, MetalStorage, FloatDType>,
-        rhs: Operand<'_, MetalStorage, FloatDType>,
-        spec: &CatSpec,
-    ) -> Result<MetalStorage, MetalError> {
-        let lhs = self.view(&lhs)?;
-        let rhs = self.view(&rhs)?;
-        let kernel = slice_scatter_kernel(spec.dtype());
-        let mut output = self.allocate(spec.output().nbytes(spec.dtype().into()))?;
-        let layout = Layout::contiguous(*spec.output());
-        let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), 0)?;
-        let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), spec.rhs_offset())?;
-        self.dispatch_write(kernel, &lhs, &lhs_window, &mut output)?;
-        self.dispatch_write(kernel, &rhs, &rhs_window, &mut output)?;
-        Ok(output)
-    }
-
-    fn slice_scatter(
-        &mut self,
-        mut target: OperandMut<'_, MetalStorage, FloatDType>,
-        src: Operand<'_, MetalStorage, FloatDType>,
-        spec: &SliceScatterSpec,
+        op: Op,
+        mut target: Operand<&mut MetalStorage>,
+        inputs: &[Operand<&MetalStorage>],
     ) -> Result<(), MetalError> {
-        self.owns(target.storage_mut())?;
+        let (
+            Op::SliceScatter {
+                dim,
+                start,
+            },
+            [src],
+        ) = (op, inputs)
+        else {
+            return Err(invalid_operation(op));
+        };
+        self.owns(target.storage())?;
         let layout = target.layout();
-        let src = self.view(&src)?;
-        let window = StridedArgs::window(layout, src.layout.shape(), spec.offset())?;
+        let src = self.view(src)?;
+        let offset = slice_offset(layout, dim, Some(start)).ok_or_else(|| invalid_operation(op))?;
+        let window = StridedArgs::window(layout, src.layout.shape(), offset)?;
         self.dispatch_write(
-            slice_scatter_kernel(spec.dtype()),
+            slice_scatter_kernel(float(target.dtype())?),
             &src,
             &window,
             target.storage_mut(),
@@ -1070,9 +1226,35 @@ fn is_matmul_ready(
     rows: usize,
     cols: usize,
 ) -> bool {
-    let is_row_major = matrix.col_stride() == 1 || cols == 1;
-    let is_transposed = matrix.row_stride() == 1 || rows == 1;
+    let is_row_major = matrix.col_stride == 1 || cols == 1;
+    let is_transposed = matrix.row_stride == 1 || rows == 1;
     is_row_major || is_transposed
+}
+
+fn float(dtype: DType) -> Result<FloatDType, MetalError> {
+    dtype.float().ok_or_else(|| {
+        error!(message = "Kernel needs a float dtype.", ?dtype);
+        MetalError::DTypeNotFloat
+    })
+}
+
+fn invalid_operation(op: Op) -> MetalError {
+    error!(message = "Operation does not match its operands.", ?op);
+    MetalError::InvalidOperation
+}
+
+fn slice_offset(
+    layout: &Layout,
+    dim: usize,
+    start: Option<usize>,
+) -> Option<usize> {
+    start?
+        .checked_mul(*layout.strides().get(dim)?)?
+        .checked_add(layout.storage_offset())
+}
+
+fn padded(values: &[usize]) -> [usize; MAX_RANK] {
+    array::from_fn(|index| values.get(index).copied().unwrap_or(0))
 }
 
 fn copied_view<'buffer>(
@@ -1130,20 +1312,94 @@ mod tests {
     };
 
     use crate::backend::metal::{
+        MatmulGeometry,
+        MatrixLayout,
         MetalBackend,
         MetalError,
         is_matmul_ready,
+        slice_offset,
     };
-    use crate::nn::primitive::matmul_rule;
     use crate::nn::{
         AllocatedMemorySource,
         Backend,
         CoreError,
         DType,
+        Layout,
         Shape,
         Tensor,
         TensorError,
     };
+
+    #[test]
+    fn matmul_geometry_reads_dims_and_operand_strides() {
+        let geometry = MatmulGeometry::of(
+            &Layout::contiguous(Shape::try_from([5, 2, 3].as_slice()).expect("valid shape")),
+            &Layout::contiguous(Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")),
+        );
+        assert_eq!(
+            geometry,
+            Some(MatmulGeometry {
+                batch: Shape::try_from([5].as_slice()).expect("valid shape"),
+                m: 2,
+                k: 3,
+                n: 4,
+                lhs: MatrixLayout {
+                    offset: 0,
+                    row_stride: 3,
+                    col_stride: 1,
+                    batch_strides: [6, 0, 0, 0],
+                },
+                rhs: MatrixLayout {
+                    offset: 0,
+                    row_stride: 4,
+                    col_stride: 1,
+                    batch_strides: [12, 0, 0, 0],
+                },
+            }),
+            "batch, matrix dims and operand strides"
+        );
+    }
+
+    #[test]
+    fn matmul_geometry_reads_transposed_operand_strides() {
+        let rhs = Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape"))
+            .permute(&[1, 0])
+            .expect("valid permutation");
+        assert_eq!(
+            MatmulGeometry::of(
+                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
+                &rhs,
+            )
+            .map(|geometry| geometry.rhs),
+            Some(MatrixLayout {
+                offset: 0,
+                row_stride: 1,
+                col_stride: 3,
+                batch_strides: [0, 0, 0, 0],
+            }),
+            "the transposed rhs walks rows with stride 1"
+        );
+    }
+
+    #[test]
+    fn slice_offset_adds_start_times_stride_to_the_layout_offset() {
+        let target =
+            Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"))
+                .narrow(0, 1, 1)
+                .expect("valid narrow");
+        let cat_output =
+            Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"));
+        assert_eq!(
+            [
+                slice_offset(&target, 1, Some(3)),
+                slice_offset(&cat_output, 1, Some(3)),
+                slice_offset(&target, 3, Some(0)),
+                slice_offset(&target, 1, Some(usize::MAX)),
+            ],
+            [Some(44), Some(12), None, None],
+            "offset 32 plus 3 times 4, then 3 times 4, then a missing dim, then an overflow"
+        );
+    }
 
     #[test]
     fn device_name_is_not_empty() {
@@ -2623,8 +2879,9 @@ mod tests {
                 let weight_transposed = weight.permute(&[1, 0]).expect("the permutation is valid");
                 assert!(
                     !weight_transposed.layout().is_contiguous()
-                        && matmul_rule(dtype, x.layout(), dtype, weight_transposed.layout())
-                            .is_ok_and(|spec| is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
+                        && MatmulGeometry::of(x.layout(), weight_transposed.layout()).is_some_and(
+                            |geometry| is_matmul_ready(&geometry.rhs, geometry.k, geometry.n)
+                        ),
                     "a transposed weight is read in place"
                 );
                 let actual: Vec<f32> = x
@@ -2698,8 +2955,9 @@ mod tests {
                 });
                 let lhs_transposed = lhs.permute(&[1, 0]).expect("the permutation is valid");
                 assert!(
-                    matmul_rule(dtype, lhs_transposed.layout(), dtype, rhs.layout())
-                        .is_ok_and(|spec| is_matmul_ready(spec.lhs(), spec.m(), spec.k())),
+                    MatmulGeometry::of(lhs_transposed.layout(), rhs.layout()).is_some_and(
+                        |geometry| is_matmul_ready(&geometry.lhs, geometry.m, geometry.k)
+                    ),
                     "a transposed lhs is read in place"
                 );
                 let actual: Vec<f32> = lhs_transposed
@@ -3029,8 +3287,9 @@ mod tests {
                 .to_dtype(&mut backend, dtype)
                 .expect("to_dtype succeeds");
                 assert!(
-                    matmul_rule(dtype, lhs.layout(), dtype, rhs.layout())
-                        .is_ok_and(|spec| !is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
+                    MatmulGeometry::of(lhs.layout(), rhs.layout()).is_some_and(|geometry| {
+                        !is_matmul_ready(&geometry.rhs, geometry.k, geometry.n)
+                    }),
                     "strides (12, 4) on the last two dims need a copy"
                 );
                 let actual: Vec<f32> = lhs

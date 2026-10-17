@@ -77,6 +77,9 @@ pub enum CoreError {
 
     #[error("Layer index exceeds the cache layers.")]
     CacheLayerOutOfRange,
+
+    #[error("Operand count does not match the operation.")]
+    OperandCount,
 }
 
 /// A validation failure or a concrete backend failure during a tensor
