@@ -28,13 +28,17 @@ pub fn create_causal_mask<D: Device>(
     past_seen_tokens: usize,
     seq_len: usize,
 ) -> Result<Tensor<D>, TensorError> {
+    let (shape, bytes) = causal_mask(past_seen_tokens, seq_len)?;
+    Tensor::from_bytes(device, &bytes, DType::BF16, shape)
+}
+
+fn causal_mask(
+    past_seen_tokens: usize,
+    seq_len: usize,
+) -> Result<(Shape, Vec<u8>), TensorError> {
     let kv_length = kv_length(past_seen_tokens, seq_len)?;
-    Tensor::from_bytes(
-        device,
-        &causal_mask_bytes(past_seen_tokens, kv_length),
-        DType::BF16,
-        Shape::try_from([seq_len, kv_length].as_slice())?,
-    )
+    let shape = Shape::try_from([seq_len, kv_length].as_slice())?;
+    Ok((shape, causal_mask_bytes(past_seen_tokens, kv_length)))
 }
 
 fn kv_length(
@@ -94,6 +98,7 @@ mod tests {
 
     use crate::nn::TensorError;
     use crate::nn::masking::{
+        causal_mask,
         causal_mask_bytes,
         kv_length,
         position_id_bytes,
@@ -122,6 +127,29 @@ mod tests {
                 .flat_map(bf16::to_le_bytes)
                 .collect::<Vec<u8>>(),
             "one query at position 4 sees keys 0 to 4"
+        );
+    }
+
+    #[test]
+    fn causal_mask_checks_the_shape_before_building_the_bytes() {
+        let dims_and_bytes = |past_seen_tokens, seq_len| {
+            causal_mask(past_seen_tokens, seq_len)
+                .map(|(shape, bytes)| (shape.dims().to_vec(), bytes))
+        };
+        assert_eq!(
+            [dims_and_bytes(4, 1), dims_and_bytes(0, 100_000)],
+            [
+                Ok((
+                    vec![1, 5],
+                    [bf16::ZERO; 5]
+                        .into_iter()
+                        .flat_map(bf16::to_le_bytes)
+                        .collect::<Vec<u8>>()
+                )),
+                Err(TensorError::NumelOverflow),
+            ],
+            "one decode step over five keys, then a 100 000 token prefill that would build about \
+             20 GB of mask bytes"
         );
     }
 
