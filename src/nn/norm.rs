@@ -18,7 +18,7 @@ impl<B: Backend> RmsNorm<B> {
         backend: &mut B,
         weight: Tensor<B>,
         eps: f32,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let dim_f32 = exact_f32(weight.shape().numel())?;
         let scalar_shape = Shape::try_from([1].as_slice())?;
         Ok(Self {
@@ -37,7 +37,7 @@ impl<B: Backend> RmsNorm<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         let dim = x.shape().last_dim()?;
         let x_f32 = x.to_dtype(backend, DType::F32)?;
         let scale = x_f32

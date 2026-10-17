@@ -1,6 +1,6 @@
 use tracing::error;
 
-use crate::nn::CoreError;
+use crate::nn::TensorError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
@@ -53,23 +53,23 @@ impl From<FloatDType> for DType {
     fn from(dtype: FloatDType) -> Self { Self::from_float(dtype) }
 }
 
-pub fn exact_f32(value: usize) -> Result<f32, CoreError> {
+pub fn exact_f32(value: usize) -> Result<f32, TensorError> {
     u16::try_from(value).map(f32::from).map_err(|_| {
         error!(
             message = "Value exceeds the largest value converted exactly to f32.",
             value,
             max_value = u16::MAX,
         );
-        CoreError::DimensionTooLargeForF32
+        TensorError::DimensionTooLargeForF32
     })
 }
 
 #[cfg(test)]
 mod tests {
     use crate::nn::{
-        CoreError,
         DType,
         FloatDType,
+        TensorError,
         exact_f32,
     };
 
@@ -92,7 +92,7 @@ mod tests {
             [
                 Ok(0.0),
                 Ok(65_535.0),
-                Err(CoreError::DimensionTooLargeForF32)
+                Err(TensorError::DimensionTooLargeForF32)
             ],
             "u16::MAX is the largest value converted"
         );

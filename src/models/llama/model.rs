@@ -4,6 +4,7 @@ use tracing::error;
 
 use crate::generate::CausalLm;
 use crate::models::llama::attention::LlamaAttention;
+use crate::models::llama::error::tensor_failed;
 use crate::models::llama::mlp::LlamaMlp;
 use crate::models::llama::rotary_emb::LlamaRotaryEmbedding;
 use crate::models::llama::weights::load_tensor;
@@ -13,7 +14,6 @@ use crate::models::llama::{
 };
 use crate::nn::{
     Backend,
-    CoreError,
     DType,
     Embedding,
     Linear,
@@ -55,7 +55,7 @@ impl<B: Backend> LlamaForCausalLm<B> {
         config: &LlamaConfig,
         weights: &Weights<S>,
         max_cache_len: usize,
-    ) -> Result<Self, LlamaError<B::Error>> {
+    ) -> Result<Self, LlamaError> {
         let model = LlamaModel::load(backend, config, weights, "model", max_cache_len)?;
         let lm_head = Linear::new(model.embed_tokens.weight().clone());
         Ok(Self {
@@ -68,14 +68,14 @@ impl<B: Backend> LlamaForCausalLm<B> {
 
 impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
     type Cache = StaticCache<B>;
-    type Error = LlamaError<B::Error>;
+    type Error = LlamaError;
 
     fn cache(
         &self,
         backend: &mut B,
         batch_size: NonZeroUsize,
     ) -> Result<Self::Cache, Self::Error> {
-        Ok(StaticCache::new(
+        StaticCache::new(
             backend,
             CACHE_DTYPE,
             self.config.num_hidden_layers(),
@@ -83,7 +83,8 @@ impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
             self.config.num_key_value_heads(),
             self.model.max_cache_len,
             self.config.head_dim(),
-        )?)
+        )
+        .map_err(tensor_failed)
     }
 
     fn forward(
@@ -95,26 +96,48 @@ impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
         past_key_values: &mut Self::Cache,
         past_seen_tokens: usize,
     ) -> Result<Tensor<B>, Self::Error> {
-        let hidden_states = self.model.forward(
-            backend,
-            input_ids,
-            position_ids,
-            attention_mask,
-            past_key_values,
+        check_forward(
+            input_ids.shape().numel(),
+            position_ids.shape().numel(),
             past_seen_tokens,
+            self.model.max_cache_len,
+            past_key_values.num_layers(),
+            self.model.layers.len(),
         )?;
+        let hidden_states = self
+            .model
+            .forward(
+                backend,
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                past_seen_tokens,
+            )
+            .map_err(tensor_failed)?;
+        self.last_token_logits(backend, &hidden_states)
+            .map_err(tensor_failed)
+    }
+}
+
+impl<B: Backend> LlamaForCausalLm<B> {
+    fn last_token_logits(
+        &self,
+        backend: &mut B,
+        hidden_states: &Tensor<B>,
+    ) -> Result<Tensor<B>, TensorError> {
         let &[batch_size, seq_len, hidden_size] = hidden_states.shape().dims() else {
             error!(
                 message = "Model output is not [batch, seq, hidden].",
                 dims = ?hidden_states.shape().dims(),
             );
-            return Err(LlamaError::Validation(CoreError::DimOutOfRange));
+            return Err(TensorError::DimOutOfRange);
         };
         let last_hidden_state = hidden_states
             .narrow(SEQ_DIM, seq_len.saturating_sub(1), 1)?
             .contiguous(backend)?
             .reshape(Shape::try_from([batch_size, hidden_size].as_slice())?)?;
-        Ok(self.lm_head.forward(backend, &last_hidden_state)?)
+        self.lm_head.forward(backend, &last_hidden_state)
     }
 }
 
@@ -125,7 +148,7 @@ impl<B: Backend> LlamaModel<B> {
         weights: &Weights<S>,
         prefix: &str,
         max_cache_len: usize,
-    ) -> Result<Self, LlamaError<B::Error>> {
+    ) -> Result<Self, LlamaError> {
         let rotary_emb = LlamaRotaryEmbedding::new(backend, config, max_cache_len)?;
         let embed_tokens = Embedding::new(load_tensor(
             backend,
@@ -143,7 +166,7 @@ impl<B: Backend> LlamaModel<B> {
                     layer_idx,
                 )
             })
-            .collect::<Result<Vec<LlamaDecoderLayer<B>>, LlamaError<B::Error>>>()?;
+            .collect::<Result<Vec<LlamaDecoderLayer<B>>, LlamaError>>()?;
         let norm = load_rms_norm(backend, config, weights, &format!("{prefix}.norm.weight"))?;
         Ok(Self {
             embed_tokens,
@@ -162,16 +185,16 @@ impl<B: Backend> LlamaModel<B> {
         attention_mask: &Tensor<B>,
         past_key_values: &mut StaticCache<B>,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, LlamaError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         let seq_len = position_ids.shape().numel();
-        let (batch_size, _) = forward_dims(
-            input_ids.shape().numel(),
-            seq_len,
-            past_seen_tokens,
-            self.max_cache_len,
-            past_key_values.num_layers(),
-            self.layers.len(),
-        )?;
+        let batch_size = input_ids
+            .shape()
+            .numel()
+            .checked_div(seq_len)
+            .ok_or_else(|| {
+                error!(message = "Forward input holds no position.");
+                TensorError::NumelMismatch
+            })?;
         let inputs_embeds = self.embed_tokens.forward(backend, input_ids)?;
         let hidden_size = inputs_embeds
             .shape()
@@ -193,7 +216,7 @@ impl<B: Backend> LlamaModel<B> {
                         past_seen_tokens,
                     )
                 })?;
-        Ok(self.norm.forward(backend, &hidden_states)?)
+        self.norm.forward(backend, &hidden_states)
     }
 }
 
@@ -204,7 +227,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         weights: &Weights<S>,
         prefix: &str,
         layer_idx: usize,
-    ) -> Result<Self, LlamaError<B::Error>> {
+    ) -> Result<Self, LlamaError> {
         let input_layernorm = load_rms_norm(
             backend,
             config,
@@ -241,7 +264,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         attention_mask: &Tensor<B>,
         past_key_values: &mut StaticCache<B>,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         let normed = self.input_layernorm.forward(backend, hidden_states)?;
         let attn_output = self.self_attn.forward(
             backend,
@@ -265,34 +288,35 @@ fn load_rms_norm<B: Backend, S: AsRef<[u8]>>(
     config: &LlamaConfig,
     weights: &Weights<S>,
     name: &str,
-) -> Result<RmsNorm<B>, LlamaError<B::Error>> {
+) -> Result<RmsNorm<B>, LlamaError> {
     let weight = load_tensor(backend, weights, name, &[config.hidden_size()])?;
-    Ok(RmsNorm::new(backend, weight, config.rms_norm_eps())?)
+    RmsNorm::new(backend, weight, config.rms_norm_eps()).map_err(tensor_failed)
 }
 
-fn forward_dims<E: std::error::Error + 'static>(
+fn check_forward(
     token_count: usize,
     seq_len: usize,
     past_seen_tokens: usize,
     max_cache_len: usize,
     cache_count: usize,
     layer_count: usize,
-) -> Result<(usize, usize), LlamaError<E>> {
+) -> Result<(), LlamaError> {
     if token_count == 0 {
         error!(message = "Forward input holds no token.");
         return Err(LlamaError::EmptyInput);
     }
-    let Some(batch_size) = token_count
+    let is_whole_batch = token_count
         .checked_div(seq_len)
-        .filter(|batch_size| batch_size.checked_mul(seq_len) == Some(token_count))
-    else {
+        .and_then(|batch_size| batch_size.checked_mul(seq_len))
+        == Some(token_count);
+    if !is_whole_batch {
         error!(
             message = "Token count is not a multiple of the position count.",
             token_count, seq_len,
         );
         return Err(LlamaError::BatchMismatch);
-    };
-    let kv_length = past_seen_tokens
+    }
+    past_seen_tokens
         .checked_add(seq_len)
         .filter(|&kv_length| kv_length <= max_cache_len)
         .ok_or_else(|| {
@@ -309,33 +333,35 @@ fn forward_dims<E: std::error::Error + 'static>(
         );
         return Err(LlamaError::CacheLayerCount);
     }
-    Ok((batch_size, kv_length))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use crate::models::llama::LlamaError;
-    use crate::models::llama::model::forward_dims;
-    use crate::nn::CoreError;
+    use crate::models::llama::model::check_forward;
 
     #[test]
-    fn forward_dims_reads_the_batch_size_and_the_cache_length() {
+    fn check_forward_accepts_whole_batches_that_fit_the_cache() {
         assert_eq!(
-            forward_dims::<CoreError>(6, 3, 4, 8, 2, 2),
-            Ok((2, 7)),
-            "six tokens over three positions from position 4, in a cache of 8"
+            [
+                check_forward(6, 3, 4, 8, 2, 2),
+                check_forward(6, 3, 5, 8, 2, 2)
+            ],
+            [Ok(()), Ok(())],
+            "six tokens over three positions from position 4, then up to the cache end"
         );
     }
 
     #[test]
-    fn forward_dims_rejects_invalid_steps() {
+    fn check_forward_rejects_invalid_steps() {
         assert_eq!(
             [
-                forward_dims::<CoreError>(0, 0, 0, 8, 2, 2),
-                forward_dims::<CoreError>(5, 3, 0, 8, 2, 2),
-                forward_dims::<CoreError>(6, 3, 6, 8, 2, 2),
-                forward_dims::<CoreError>(6, 3, usize::MAX, usize::MAX, 2, 2),
-                forward_dims::<CoreError>(6, 3, 0, 8, 1, 2),
+                check_forward(0, 0, 0, 8, 2, 2),
+                check_forward(5, 3, 0, 8, 2, 2),
+                check_forward(6, 3, 6, 8, 2, 2),
+                check_forward(6, 3, usize::MAX, usize::MAX, 2, 2),
+                check_forward(6, 3, 0, 8, 1, 2),
             ],
             [
                 Err(LlamaError::EmptyInput),

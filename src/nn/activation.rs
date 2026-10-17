@@ -11,7 +11,7 @@ pub struct Silu<B: Backend> {
 }
 
 impl<B: Backend> Silu<B> {
-    pub fn new(backend: &mut B) -> Result<Self, TensorError<B::Error>> {
+    pub fn new(backend: &mut B) -> Result<Self, TensorError> {
         Ok(Self {
             one: Tensor::from_bytes(
                 backend,
@@ -26,7 +26,7 @@ impl<B: Backend> Silu<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         let x_f32 = x.to_dtype(backend, DType::F32)?;
         let denominator = x_f32.neg(backend)?.exp(backend)?.add(backend, &self.one)?;
         x_f32
@@ -39,7 +39,7 @@ pub fn softmax<B: Backend>(
     backend: &mut B,
     x: &Tensor<B>,
     dim: usize,
-) -> Result<Tensor<B>, TensorError<B::Error>> {
+) -> Result<Tensor<B>, TensorError> {
     let x_f32 = x.to_dtype(backend, DType::F32)?;
     let row_max = x_f32.amax_keepdim(backend, dim)?;
     let exps = x_f32.sub(backend, &row_max)?.exp(backend)?;

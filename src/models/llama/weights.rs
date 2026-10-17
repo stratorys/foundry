@@ -1,6 +1,7 @@
 use tracing::error;
 
 use crate::models::llama::LlamaError;
+use crate::models::llama::error::tensor_failed;
 use crate::nn::{
     Backend,
     DType,
@@ -18,18 +19,16 @@ pub fn load_tensor<B: Backend, S: AsRef<[u8]>>(
     weights: &Weights<S>,
     name: &str,
     dims_expected: &[usize],
-) -> Result<Tensor<B>, LlamaError<B::Error>> {
+) -> Result<Tensor<B>, LlamaError> {
     let view = checked_view(weights.tensor(name), name, dims_expected)?;
-    Ok(Tensor::from_bytes(
-        backend, view.bytes, view.dtype, view.shape,
-    )?)
+    Tensor::from_bytes(backend, view.bytes, view.dtype, view.shape).map_err(tensor_failed)
 }
 
-fn checked_view<'weights, E: std::error::Error + 'static>(
+fn checked_view<'weights>(
     view: Option<WeightView<'weights>>,
     name: &str,
     dims_expected: &[usize],
-) -> Result<WeightView<'weights>, LlamaError<E>> {
+) -> Result<WeightView<'weights>, LlamaError> {
     let view = view.ok_or_else(|| {
         error!(message = "Tensor is not in the weights.", name);
         LlamaError::TensorNotFound
@@ -60,7 +59,6 @@ mod tests {
     use crate::models::llama::LlamaError;
     use crate::models::llama::weights::checked_view;
     use crate::nn::{
-        CoreError,
         DType,
         Shape,
     };
@@ -75,7 +73,7 @@ mod tests {
             bytes: &[0; 8],
         };
         assert_eq!(
-            checked_view::<CoreError>(Some(view), "model.norm.weight", &[4]),
+            checked_view(Some(view), "model.norm.weight", &[4]),
             Ok(view),
             "a bf16 tensor of 4 elements"
         );
@@ -91,9 +89,9 @@ mod tests {
         };
         assert_eq!(
             [
-                checked_view::<CoreError>(None, "model.norm.weight", &[4]),
-                checked_view::<CoreError>(Some(view(DType::F32)), "model.norm.weight", &[4]),
-                checked_view::<CoreError>(Some(view(DType::BF16)), "model.norm.weight", &[8]),
+                checked_view(None, "model.norm.weight", &[4]),
+                checked_view(Some(view(DType::F32)), "model.norm.weight", &[4]),
+                checked_view(Some(view(DType::BF16)), "model.norm.weight", &[8]),
             ],
             [
                 Err(LlamaError::TensorNotFound),

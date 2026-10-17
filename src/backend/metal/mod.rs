@@ -1315,14 +1315,12 @@ mod tests {
         MatmulGeometry,
         MatrixLayout,
         MetalBackend,
-        MetalError,
         is_matmul_ready,
         slice_offset,
     };
     use crate::nn::{
         AllocatedMemorySource,
         Backend,
-        CoreError,
         DType,
         Layout,
         Shape,
@@ -1599,10 +1597,7 @@ mod tests {
             Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
         );
         assert!(
-            matches!(
-                result.err(),
-                Some(TensorError::Validation(CoreError::ByteLengthMismatch))
-            ),
+            matches!(result.err(), Some(TensorError::ByteLengthMismatch)),
             "a byte length that does not match shape × dtype is rejected"
         );
     }
@@ -1617,10 +1612,7 @@ mod tests {
             Shape::try_from([(1 << 31) - 1].as_slice()).expect("the shape is valid"),
         );
         assert!(
-            matches!(
-                result.err(),
-                Some(TensorError::Validation(CoreError::ByteLengthMismatch))
-            ),
+            matches!(result.err(), Some(TensorError::ByteLengthMismatch)),
             "the byte length is checked before allocation"
         );
     }
@@ -1662,7 +1654,7 @@ mod tests {
         assert!(
             matches!(
                 permuted.to_bytes(&mut backend).err(),
-                Some(TensorError::Validation(CoreError::ToBytesNonContiguous))
+                Some(TensorError::ToBytesNonContiguous)
             ),
             "a non-contiguous layout cannot be read as bytes"
         );
@@ -2311,7 +2303,7 @@ mod tests {
         assert!(
             matches!(
                 indices.add(&mut backend, &indices).err(),
-                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+                Some(TensorError::DTypeNotFloat)
             ),
             "binary ops reject u32 on Metal"
         );
@@ -2736,7 +2728,7 @@ mod tests {
         assert!(
             matches!(
                 indices.sum_keepdim(&mut backend, 0).err(),
-                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+                Some(TensorError::DTypeNotFloat)
             ),
             "reductions reject u32 on Metal"
         );
@@ -3974,9 +3966,7 @@ mod tests {
         assert!(
             matches!(
                 target.slice_scatter(&mut backend, &update, 1, 0),
-                Err(TensorError::Validation(
-                    CoreError::SliceScatterNonContiguous
-                ))
+                Err(TensorError::SliceScatterNonContiguous)
             ),
             "a broadcast target would be written by several threads"
         );
@@ -3997,10 +3987,7 @@ mod tests {
         let update = target.narrow(1, 0, 1).expect("the narrow is valid");
         let result = target.slice_scatter(&mut backend, &update, 1, 3);
         assert!(
-            matches!(
-                result.err(),
-                Some(TensorError::Validation(CoreError::SharedStorage))
-            ),
+            matches!(result.err(), Some(TensorError::SharedStorage)),
             "an update aliasing the target is rejected"
         );
     }
@@ -4042,10 +4029,7 @@ mod tests {
         let view = target.narrow(0, 0, 1).expect("the narrow is valid");
         let result = target.slice_scatter(&mut backend, &update, 1, 3);
         assert!(
-            matches!(
-                result.err(),
-                Some(TensorError::Validation(CoreError::SharedStorage))
-            ),
+            matches!(result.err(), Some(TensorError::SharedStorage)),
             "a live view would observe the write"
         );
         assert_eq!(view.shape().dims(), &[1, 4], "the view is still alive");
@@ -4110,14 +4094,9 @@ mod tests {
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
         let tensor = Tensor::from_bytes(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("from_bytes succeeds");
-        assert!(
-            matches!(
-                tensor.to_bytes(&mut consumer).err(),
-                Some(TensorError::Backend {
-                    operation: "to_bytes",
-                    source: MetalError::ForeignStorage
-                })
-            ),
+        assert_eq!(
+            tensor.to_bytes(&mut consumer).err(),
+            Some(TensorError::Backend),
             "a storage from another backend cannot be read as bytes"
         );
     }
@@ -4129,14 +4108,9 @@ mod tests {
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
         let tensor = Tensor::from_bytes(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("from_bytes succeeds");
-        assert!(
-            matches!(
-                tensor.neg(&mut consumer).err(),
-                Some(TensorError::Backend {
-                    operation: "unary",
-                    source: MetalError::ForeignStorage
-                })
-            ),
+        assert_eq!(
+            tensor.neg(&mut consumer).err(),
+            Some(TensorError::Backend),
             "a storage from another backend cannot be read by a kernel"
         );
     }
@@ -4157,14 +4131,9 @@ mod tests {
             Shape::try_from(&[2_usize, 1][..]).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        assert!(
-            matches!(
-                target.slice_scatter(&mut consumer, &update, 1, 0),
-                Err(TensorError::Backend {
-                    operation: "slice_scatter",
-                    source: MetalError::ForeignStorage
-                })
-            ),
+        assert_eq!(
+            target.slice_scatter(&mut consumer, &update, 1, 0),
+            Err(TensorError::Backend),
             "a target from another backend cannot be written"
         );
     }
@@ -4206,14 +4175,14 @@ mod tests {
         assert!(
             matches!(
                 values.index_select(&mut backend, 0, &indices).err(),
-                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+                Some(TensorError::DTypeNotFloat)
             ),
             "index_select rejects a u32 table on Metal"
         );
         assert!(
             matches!(
                 Tensor::cat(&mut backend, [&values, &values], 0).err(),
-                Some(TensorError::Validation(CoreError::DTypeNotFloat))
+                Some(TensorError::DTypeNotFloat)
             ),
             "cat rejects u32 on Metal"
         );

@@ -12,7 +12,6 @@ use crate::nn::primitive::{
 };
 use crate::nn::{
     Backend,
-    CoreError,
     DType,
     Layout,
     Shape,
@@ -63,7 +62,7 @@ impl<B: Backend> Tensor<B> {
         bytes: &[u8],
         dtype: DType,
         shape: Shape,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let nbytes = shape.nbytes(dtype);
         if bytes.len() != nbytes {
             error!(
@@ -73,7 +72,7 @@ impl<B: Backend> Tensor<B> {
                 ?dtype,
                 dims = ?shape.dims(),
             );
-            return Err(CoreError::ByteLengthMismatch.into());
+            return Err(TensorError::ByteLengthMismatch);
         }
         let storage = backend
             .storage_from_bytes(bytes)
@@ -85,7 +84,7 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         dtype: DType,
         shape: Shape,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let storage = backend
             .zeros(shape.nbytes(dtype))
             .map_err(backend_failed("zeros"))?;
@@ -95,10 +94,10 @@ impl<B: Backend> Tensor<B> {
     pub fn to_bytes(
         &self,
         backend: &mut B,
-    ) -> Result<Vec<u8>, TensorError<B::Error>> {
+    ) -> Result<Vec<u8>, TensorError> {
         if !self.layout.is_contiguous() {
             error!(message = "Reading bytes requires a contiguous layout.", layout = ?self.layout);
-            return Err(CoreError::ToBytesNonContiguous.into());
+            return Err(TensorError::ToBytesNonContiguous);
         }
         backend
             .storage_to_bytes(&self.operand())
@@ -114,14 +113,14 @@ impl<B: Backend> Tensor<B> {
     pub fn reshape(
         &self,
         shape: Shape,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         Ok(self.view(self.layout.reshape(shape)?))
     }
 
     pub fn permute(
         &self,
         dims: &[usize],
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         Ok(self.view(self.layout.permute(dims)?))
     }
 
@@ -130,42 +129,42 @@ impl<B: Backend> Tensor<B> {
         dim: usize,
         start: usize,
         length: usize,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         Ok(self.view(self.layout.narrow(dim, start, length)?))
     }
 
     pub fn expand(
         &self,
         shape: Shape,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         Ok(self.view(self.layout.expand(shape)?))
     }
 
     pub fn neg(
         &self,
         backend: &mut B,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(backend, Op::Unary(UnaryOp::Neg), [self])
     }
 
     pub fn exp(
         &self,
         backend: &mut B,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(backend, Op::Unary(UnaryOp::Exp), [self])
     }
 
     pub fn sqrt(
         &self,
         backend: &mut B,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(backend, Op::Unary(UnaryOp::Sqrt), [self])
     }
 
     pub fn reciprocal(
         &self,
         backend: &mut B,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(backend, Op::Unary(UnaryOp::Reciprocal), [self])
     }
 
@@ -173,7 +172,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         rhs: &Self,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         self.binary(backend, BinaryOp::Add, rhs)
     }
 
@@ -181,7 +180,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         rhs: &Self,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         self.binary(backend, BinaryOp::Sub, rhs)
     }
 
@@ -189,7 +188,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         rhs: &Self,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         self.binary(backend, BinaryOp::Mul, rhs)
     }
 
@@ -197,7 +196,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         rhs: &Self,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         self.binary(backend, BinaryOp::Div, rhs)
     }
 
@@ -205,7 +204,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         dim: usize,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let op = ReduceOp::Sum;
         Self::apply(
             backend,
@@ -221,7 +220,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         dim: usize,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let op = ReduceOp::Amax;
         Self::apply(
             backend,
@@ -237,7 +236,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         dim: usize,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let op = ReduceOp::Argmax;
         Self::apply(
             backend,
@@ -253,14 +252,14 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         rhs: &Self,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(backend, Op::Matmul, [self, rhs])
     }
 
     pub fn contiguous(
         &self,
         backend: &mut B,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         if self.layout.is_contiguous() {
             return Ok(self.view(self.layout));
         }
@@ -271,7 +270,7 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         dtype: DType,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(backend, Op::ToDtype(dtype), [self])
     }
 
@@ -280,7 +279,7 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         dim: usize,
         indices: &Self,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(
             backend,
             Op::IndexSelect {
@@ -294,7 +293,7 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         tensors: [&Self; 2],
         dim: usize,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         Self::apply(
             backend,
             Op::Cat {
@@ -310,7 +309,7 @@ impl<B: Backend> Tensor<B> {
         src: &Self,
         dim: usize,
         start: usize,
-    ) -> Result<(), TensorError<B::Error>> {
+    ) -> Result<(), TensorError> {
         let op = Op::SliceScatter {
             dim,
             start,
@@ -324,11 +323,11 @@ impl<B: Backend> Tensor<B> {
                 message = "Slice scatter requires a contiguous target layout.",
                 layout = ?self.layout,
             );
-            return Err(CoreError::SliceScatterNonContiguous.into());
+            return Err(TensorError::SliceScatterNonContiguous);
         }
         let storage = Rc::get_mut(&mut self.storage).ok_or_else(|| {
             error!(message = "Slice scatter target shares its storage with another tensor.");
-            CoreError::SharedStorage
+            TensorError::SharedStorage
         })?;
         backend
             .run_in_place(
@@ -344,7 +343,7 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         op: BinaryOp,
         rhs: &Self,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let shape = Shape::broadcast(self.shape(), rhs.shape())?;
         Self::apply(
             backend,
@@ -357,7 +356,7 @@ impl<B: Backend> Tensor<B> {
         backend: &mut B,
         op: Op,
         inputs: [&Self; N],
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let (shape, dtype) = output(op, &inputs.map(|input| (input.dtype, *input.shape())))?;
         let storage = backend
             .run(op, &inputs.map(Self::operand), &shape, dtype)
@@ -393,51 +392,26 @@ impl<B: Backend> Tensor<B> {
     }
 }
 
-fn backend_failed<E: Error + 'static>(operation: &'static str) -> impl FnOnce(E) -> TensorError<E> {
-    move |source| TensorError::Backend {
-        operation,
-        source,
+fn backend_failed<E: Error>(operation: &'static str) -> impl FnOnce(E) -> TensorError {
+    move |error| {
+        error!(message = "Backend operation failed.", operation, %error);
+        TensorError::Backend
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::fmt;
 
     use crate::nn::TensorError;
     use crate::nn::tensor::backend_failed;
 
-    #[derive(Debug, thiserror::Error)]
-    #[error("backend diagnostic: {detail}")]
-    struct Failure {
-        detail: String,
-    }
-
     #[test]
-    fn backend_conversion_preserves_operation_and_original_error() {
-        let error = backend_failed("matmul")(Failure {
-            detail: "allocation rejected".to_owned(),
-        });
-        assert!(
-            matches!(
-                &error,
-                TensorError::Backend { operation: "matmul", source }
-                    if source.detail == "allocation rejected"
-            ),
-            "the concrete error and operation are retained"
-        );
-        let source = error.source().expect("the backend failure has a source");
-        let failure = source
-            .downcast_ref::<Failure>()
-            .expect("the original type is retained");
+    fn backend_failure_becomes_the_backend_variant() {
         assert_eq!(
-            failure.detail, "allocation rejected",
-            "the diagnostic is retained without tracing"
-        );
-        assert_eq!(
-            error.to_string(),
-            "Backend operation `matmul` failed.",
-            "display identifies the operation"
+            backend_failed("matmul")(fmt::Error),
+            TensorError::Backend,
+            "the backend cause is logged, not returned"
         );
     }
 }

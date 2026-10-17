@@ -3,9 +3,9 @@ use std::array;
 use tracing::error;
 
 use crate::nn::{
-    CoreError,
     MAX_RANK,
     Shape,
+    TensorError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,14 +33,14 @@ impl Layout {
     pub fn stride(
         &self,
         dim: usize,
-    ) -> Result<usize, CoreError> {
+    ) -> Result<usize, TensorError> {
         self.strides().get(dim).copied().ok_or_else(|| {
             error!(
                 message = "Dimension is out of range.",
                 dim,
                 ndim = self.shape.ndim()
             );
-            CoreError::DimOutOfRange
+            TensorError::DimOutOfRange
         })
     }
 
@@ -56,16 +56,16 @@ impl Layout {
     pub fn reshape(
         &self,
         shape: Shape,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         if !self.is_contiguous() {
             error!(message = "Reshape requires a contiguous layout.", layout = ?self);
-            return Err(CoreError::ReshapeNonContiguous);
+            return Err(TensorError::ReshapeNonContiguous);
         }
         let from = self.shape.numel();
         let to = shape.numel();
         if from != to {
             error!(message = "Element counts do not match.", from, to);
-            return Err(CoreError::NumelMismatch);
+            return Err(TensorError::NumelMismatch);
         }
         Ok(Self {
             storage_offset: self.storage_offset,
@@ -76,7 +76,7 @@ impl Layout {
     pub fn permute(
         &self,
         dims: &[usize],
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         let ndim = self.shape.ndim();
         let invalid = || {
             error!(
@@ -84,7 +84,7 @@ impl Layout {
                 ?dims,
                 ndim
             );
-            CoreError::InvalidPermutation
+            TensorError::InvalidPermutation
         };
         let is_permutation = dims.len() == ndim && (0..ndim).all(|dim| dims.contains(&dim));
         if !is_permutation {
@@ -104,7 +104,7 @@ impl Layout {
         dim: usize,
         start: usize,
         length: usize,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         let size = self.shape.size(dim)?;
         let stride = self.stride(dim)?;
         let out_of_bounds = || {
@@ -112,7 +112,7 @@ impl Layout {
                 message = "Narrow exceeds the dimension.",
                 dim, start, length, size
             );
-            CoreError::NarrowOutOfBounds
+            TensorError::NarrowOutOfBounds
         };
         let end = start.checked_add(length).ok_or_else(out_of_bounds)?;
         if end > size {
@@ -128,7 +128,7 @@ impl Layout {
                     start,
                     stride,
                 );
-                CoreError::OffsetOverflow
+                TensorError::OffsetOverflow
             })?;
         let dims: Vec<usize> = self
             .shape
@@ -147,14 +147,14 @@ impl Layout {
     pub fn expand(
         &self,
         shape: Shape,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, TensorError> {
         let incompatible = || {
             error!(
                 message = "Shape cannot be expanded to the target shape.",
                 from = ?self.shape.dims(),
                 to = ?shape.dims(),
             );
-            CoreError::ExpandIncompatible
+            TensorError::ExpandIncompatible
         };
         let leading = shape
             .ndim()
@@ -177,7 +177,7 @@ impl Layout {
                     _ => Err(incompatible()),
                 }
             })
-            .collect::<Result<Vec<usize>, CoreError>>()?;
+            .collect::<Result<Vec<usize>, TensorError>>()?;
         Ok(Self {
             shape,
             strides: padded(&strides),
@@ -223,9 +223,9 @@ fn padded(values: &[usize]) -> [usize; MAX_RANK] {
 #[cfg(test)]
 mod tests {
     use crate::nn::{
-        CoreError,
         Layout,
         Shape,
+        TensorError,
     };
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
             .for_each(|dims| {
                 assert_eq!(
                     layout.permute(dims),
-                    Err(CoreError::InvalidPermutation),
+                    Err(TensorError::InvalidPermutation),
                     "dims {dims:?}"
                 );
             });
@@ -282,12 +282,12 @@ mod tests {
             Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"));
         assert_eq!(
             layout.narrow(1, 2, 2),
-            Err(CoreError::NarrowOutOfBounds),
+            Err(TensorError::NarrowOutOfBounds),
             "the window ends after the dim"
         );
         assert_eq!(
             layout.narrow(3, 0, 1),
-            Err(CoreError::DimOutOfRange),
+            Err(TensorError::DimOutOfRange),
             "dim 3 does not exist"
         );
     }
@@ -300,7 +300,7 @@ mod tests {
                 usize::MAX,
                 1
             ),
-            Err(CoreError::NarrowOutOfBounds),
+            Err(TensorError::NarrowOutOfBounds),
             "start plus length overflows usize"
         );
     }
@@ -325,7 +325,7 @@ mod tests {
             .expect("valid permutation");
         assert_eq!(
             layout.reshape(Shape::try_from([6].as_slice()).expect("valid shape")),
-            Err(CoreError::ReshapeNonContiguous),
+            Err(TensorError::ReshapeNonContiguous),
             "a transposed layout cannot be reshaped"
         );
     }
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(
             Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
                 .reshape(Shape::try_from([5].as_slice()).expect("valid shape")),
-            Err(CoreError::NumelMismatch),
+            Err(TensorError::NumelMismatch),
             "six elements cannot become five"
         );
     }
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(
             Layout::contiguous(Shape::try_from([3, 2].as_slice()).expect("valid shape"))
                 .expand(Shape::try_from([3, 4].as_slice()).expect("valid shape")),
-            Err(CoreError::ExpandIncompatible),
+            Err(TensorError::ExpandIncompatible),
             "dim 2 cannot become 4"
         );
     }
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(
             Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
                 .expand(Shape::try_from([3].as_slice()).expect("valid shape")),
-            Err(CoreError::ExpandIncompatible),
+            Err(TensorError::ExpandIncompatible),
             "an expand cannot drop a dim"
         );
     }

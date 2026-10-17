@@ -22,10 +22,7 @@ pub use self::dtype::{
     MAX_ITEMSIZE,
     exact_f32,
 };
-pub use self::error::{
-    CoreError,
-    TensorError,
-};
+pub use self::error::TensorError;
 pub use self::kv_cache::StaticCache;
 pub use self::layout::Layout;
 pub use self::linear::{

@@ -4,10 +4,10 @@ use tracing::error;
 
 use crate::nn::{
     AllocatedMemory,
-    CoreError,
     DType,
     Operand,
     Shape,
+    TensorError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,7 +132,7 @@ impl Op {
 pub fn output(
     op: Op,
     inputs: &[(DType, Shape)],
-) -> Result<(Shape, DType), CoreError> {
+) -> Result<(Shape, DType), TensorError> {
     match (op, inputs) {
         (Op::Unary(_), &[(dtype, shape)]) => Ok((shape, require_float(dtype)?)),
         (Op::Binary(_), &[(lhs_dtype, lhs), (rhs_dtype, rhs)]) => {
@@ -187,7 +187,7 @@ pub fn output(
                 ?op,
                 operand_count = inputs.len(),
             );
-            Err(CoreError::OperandCount)
+            Err(TensorError::OperandCount)
         }
     }
 }
@@ -197,7 +197,7 @@ fn reduce_output(
     dim: usize,
     dtype: DType,
     shape: &Shape,
-) -> Result<(Shape, DType), CoreError> {
+) -> Result<(Shape, DType), TensorError> {
     let dtype = require_float(dtype)?;
     let dim_size = shape.size(dim)?;
     let needs_element = matches!(op, ReduceOp::Amax | ReduceOp::Argmax);
@@ -208,7 +208,7 @@ fn reduce_output(
             dim,
             dims = ?shape.dims(),
         );
-        return Err(CoreError::EmptyReduction);
+        return Err(TensorError::EmptyReduction);
     }
     let dtype_output = match op {
         ReduceOp::Sum | ReduceOp::Amax => dtype,
@@ -220,14 +220,14 @@ fn reduce_output(
 fn matmul_output(
     lhs: &Shape,
     rhs: &Shape,
-) -> Result<Shape, CoreError> {
+) -> Result<Shape, TensorError> {
     let incompatible = || {
         error!(
             message = "Shapes cannot be multiplied.",
             lhs = ?lhs.dims(),
             rhs = ?rhs.dims(),
         );
-        CoreError::MatmulIncompatible
+        TensorError::MatmulIncompatible
     };
     let Some((lhs_batch, &[m, lhs_k])) = lhs.dims().split_last_chunk::<2>() else {
         return Err(incompatible());
@@ -248,11 +248,11 @@ fn index_select_output(
     table: &Shape,
     indices_dtype: DType,
     indices: &Shape,
-) -> Result<(Shape, DType), CoreError> {
+) -> Result<(Shape, DType), TensorError> {
     let dtype = require_float(table_dtype)?;
     if indices_dtype != DType::U32 {
         error!(message = "Index select indices are not u32.", dtype = ?indices_dtype);
-        return Err(CoreError::IndicesNotU32);
+        return Err(TensorError::IndicesNotU32);
     }
     let incompatible = || {
         error!(
@@ -261,7 +261,7 @@ fn index_select_output(
             table = ?table.dims(),
             indices = ?indices.dims(),
         );
-        CoreError::IndexSelectIncompatible
+        TensorError::IndexSelectIncompatible
     };
     if dim != 0 {
         return Err(incompatible());
@@ -279,7 +279,7 @@ fn cat_output(
     dim: usize,
     lhs: &Shape,
     rhs: &Shape,
-) -> Result<Shape, CoreError> {
+) -> Result<Shape, TensorError> {
     let incompatible = || {
         error!(
             message = "Shapes cannot be concatenated.",
@@ -287,7 +287,7 @@ fn cat_output(
             lhs = ?lhs.dims(),
             rhs = ?rhs.dims(),
         );
-        CoreError::CatIncompatible
+        TensorError::CatIncompatible
     };
     let lhs_size = lhs.size(dim)?;
     let rhs_size = rhs.size(dim)?;
@@ -303,7 +303,7 @@ fn check_slice_scatter(
     start: usize,
     target: &Shape,
     src: &Shape,
-) -> Result<(), CoreError> {
+) -> Result<(), TensorError> {
     let target_size = target.size(dim)?;
     let src_size = src.size(dim)?;
     let fits = start
@@ -317,17 +317,17 @@ fn check_slice_scatter(
             target = ?target.dims(),
             src = ?src.dims(),
         );
-        return Err(CoreError::SliceScatterOutOfBounds);
+        return Err(TensorError::SliceScatterOutOfBounds);
     }
     Ok(())
 }
 
-fn require_float(dtype: DType) -> Result<DType, CoreError> {
+fn require_float(dtype: DType) -> Result<DType, TensorError> {
     match dtype.float() {
         Some(_) => Ok(dtype),
         None => {
             error!(message = "DType is not a float dtype.", ?dtype);
-            Err(CoreError::DTypeNotFloat)
+            Err(TensorError::DTypeNotFloat)
         }
     }
 }
@@ -335,10 +335,10 @@ fn require_float(dtype: DType) -> Result<DType, CoreError> {
 fn require_same_float(
     lhs: DType,
     rhs: DType,
-) -> Result<DType, CoreError> {
+) -> Result<DType, TensorError> {
     if lhs != rhs {
         error!(message = "DTypes do not match.", ?lhs, ?rhs);
-        return Err(CoreError::DTypeMismatch);
+        return Err(TensorError::DTypeMismatch);
     }
     require_float(lhs)
 }
@@ -347,7 +347,7 @@ fn with_dim(
     shape: &Shape,
     dim: usize,
     size: usize,
-) -> Result<Shape, CoreError> {
+) -> Result<Shape, TensorError> {
     shape.size(dim)?;
     let dims: Vec<usize> = shape
         .dims()
@@ -382,10 +382,10 @@ mod tests {
         output,
     };
     use crate::nn::{
-        CoreError,
         DType,
         Layout,
         Shape,
+        TensorError,
     };
 
     #[test]
@@ -416,7 +416,7 @@ mod tests {
                     Shape::try_from([2].as_slice()).expect("valid shape")
                 )]
             ),
-            Err(CoreError::DTypeNotFloat),
+            Err(TensorError::DTypeNotFloat),
             "unary needs a float dtype"
         );
     }
@@ -448,9 +448,9 @@ mod tests {
                 ),
             ],
             [
-                Err(CoreError::OperandCount),
-                Err(CoreError::OperandCount),
-                Err(CoreError::OperandCount),
+                Err(TensorError::OperandCount),
+                Err(TensorError::OperandCount),
+                Err(TensorError::OperandCount),
             ],
             "no operand, one operand for matmul, two operands for copy"
         );
@@ -496,7 +496,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::DTypeMismatch),
+            Err(TensorError::DTypeMismatch),
             "binary needs equal dtypes"
         );
     }
@@ -517,7 +517,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::DTypeNotFloat),
+            Err(TensorError::DTypeNotFloat),
             "binary needs a float dtype"
         );
     }
@@ -538,7 +538,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::BroadcastIncompatible),
+            Err(TensorError::BroadcastIncompatible),
             "dims 2 and 4 do not broadcast"
         );
     }
@@ -598,7 +598,7 @@ mod tests {
                     Shape::try_from([2, 3].as_slice()).expect("valid shape")
                 )]
             ),
-            Err(CoreError::DTypeNotFloat),
+            Err(TensorError::DTypeNotFloat),
             "reduce needs a float dtype"
         );
     }
@@ -616,7 +616,7 @@ mod tests {
                     Shape::try_from([2, 3].as_slice()).expect("valid shape")
                 )]
             ),
-            Err(CoreError::DimOutOfRange),
+            Err(TensorError::DimOutOfRange),
             "dim 2 does not exist"
         );
     }
@@ -637,7 +637,7 @@ mod tests {
                             Shape::try_from([2, 0].as_slice()).expect("valid shape")
                         )]
                     ),
-                    Err(CoreError::EmptyReduction),
+                    Err(TensorError::EmptyReduction),
                     "{op:?} over an empty dim"
                 );
             });
@@ -704,7 +704,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::MatmulIncompatible),
+            Err(TensorError::MatmulIncompatible),
             "inner dims 3 and 4 differ"
         );
     }
@@ -725,7 +725,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::MatmulIncompatible),
+            Err(TensorError::MatmulIncompatible),
             "batch dims 2 and 5 differ"
         );
     }
@@ -762,8 +762,8 @@ mod tests {
                 ),
             ],
             [
-                Err(CoreError::MatmulIncompatible),
-                Err(CoreError::MatmulIncompatible)
+                Err(TensorError::MatmulIncompatible),
+                Err(TensorError::MatmulIncompatible)
             ],
             "a rank 1 lhs, then a rank 1 rhs"
         );
@@ -785,7 +785,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::DTypeNotFloat),
+            Err(TensorError::DTypeNotFloat),
             "matmul needs a float dtype"
         );
     }
@@ -806,7 +806,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::DTypeMismatch),
+            Err(TensorError::DTypeMismatch),
             "matmul needs equal dtypes"
         );
     }
@@ -827,7 +827,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::NumelOverflow),
+            Err(TensorError::NumelOverflow),
             "the output holds 2^32 elements"
         );
     }
@@ -887,7 +887,10 @@ mod tests {
                     )]
                 ),
             ],
-            [Err(CoreError::DTypeNotFloat), Err(CoreError::DTypeNotFloat)],
+            [
+                Err(TensorError::DTypeNotFloat),
+                Err(TensorError::DTypeNotFloat)
+            ],
             "from u32, then to u32"
         );
     }
@@ -936,7 +939,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::DTypeNotFloat),
+            Err(TensorError::DTypeNotFloat),
             "the table needs a float dtype"
         );
     }
@@ -959,7 +962,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::IndicesNotU32),
+            Err(TensorError::IndicesNotU32),
             "indices must be u32"
         );
     }
@@ -989,7 +992,7 @@ mod tests {
                     },
                     &[(DType::F32, table), (DType::U32, indices)]
                 ),
-                Err(CoreError::IndexSelectIncompatible),
+                Err(TensorError::IndexSelectIncompatible),
                 "table {:?} and indices {:?}",
                 table.dims(),
                 indices.dims()
@@ -1015,7 +1018,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::IndexSelectIncompatible),
+            Err(TensorError::IndexSelectIncompatible),
             "only rows of the table are selected"
         );
     }
@@ -1038,7 +1041,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::NumelOverflow),
+            Err(TensorError::NumelOverflow),
             "the output holds 2^32 elements"
         );
     }
@@ -1087,7 +1090,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::CatIncompatible),
+            Err(TensorError::CatIncompatible),
             "dims 2 and 4 differ outside the dim"
         );
     }
@@ -1110,7 +1113,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::CatIncompatible),
+            Err(TensorError::CatIncompatible),
             "ranks 3 and 2 differ"
         );
     }
@@ -1149,7 +1152,10 @@ mod tests {
                     ]
                 ),
             ],
-            [Err(CoreError::DTypeMismatch), Err(CoreError::DTypeNotFloat)],
+            [
+                Err(TensorError::DTypeMismatch),
+                Err(TensorError::DTypeNotFloat)
+            ],
             "cat needs equal float dtypes"
         );
     }
@@ -1175,7 +1181,7 @@ mod tests {
                     },
                     &[(DType::F32, lhs), (DType::F32, rhs)]
                 ),
-                Err(CoreError::DimOutOfRange),
+                Err(TensorError::DimOutOfRange),
                 "lhs {:?} and rhs {:?}",
                 lhs.dims(),
                 rhs.dims()
@@ -1201,7 +1207,7 @@ mod tests {
                     )
                 ]
             ),
-            Err(CoreError::NumelOverflow),
+            Err(TensorError::NumelOverflow),
             "the output holds 2^31 elements"
         );
     }
@@ -1275,7 +1281,7 @@ mod tests {
                         (DType::F32, src)
                     ]
                 ),
-                Err(CoreError::SliceScatterOutOfBounds),
+                Err(TensorError::SliceScatterOutOfBounds),
                 "src {:?} at start {start}",
                 src.dims()
             );
@@ -1302,7 +1308,10 @@ mod tests {
                     &[(DType::F32, target), (DType::F32, target)]
                 ),
             ],
-            [Err(CoreError::DTypeMismatch), Err(CoreError::DimOutOfRange)],
+            [
+                Err(TensorError::DTypeMismatch),
+                Err(TensorError::DimOutOfRange)
+            ],
             "unequal dtypes, then dim 2 out of range"
         );
     }

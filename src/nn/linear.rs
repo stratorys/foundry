@@ -20,7 +20,7 @@ impl<B: Backend> Linear<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         let weight_t = self.weight.permute(&[1, 0])?;
         let dims = x.shape().dims();
         let in_features = x.shape().size(x.shape().last_dim()?)?;
@@ -35,7 +35,6 @@ impl<B: Backend> Linear<B> {
         x.reshape(Shape::try_from([rows, in_features].as_slice())?)?
             .matmul(backend, &weight_t)?
             .reshape(Shape::try_from(output_dims.as_slice())?)
-            .map_err(TensorError::from)
     }
 }
 
@@ -54,7 +53,7 @@ impl<B: Backend> Embedding<B> {
         &self,
         backend: &mut B,
         input_ids: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         self.weight.index_select(backend, 0, input_ids)
     }
 

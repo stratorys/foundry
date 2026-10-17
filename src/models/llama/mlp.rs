@@ -1,3 +1,4 @@
+use crate::models::llama::error::tensor_failed;
 use crate::models::llama::weights::load_tensor;
 use crate::models::llama::{
     LlamaConfig,
@@ -25,7 +26,7 @@ impl<B: Backend> LlamaMlp<B> {
         config: &LlamaConfig,
         weights: &Weights<S>,
         prefix: &str,
-    ) -> Result<Self, LlamaError<B::Error>> {
+    ) -> Result<Self, LlamaError> {
         let hidden_size = config.hidden_size();
         let intermediate_size = config.intermediate_size();
         let mut linear = |name: &str, dims: [usize; 2]| {
@@ -39,7 +40,7 @@ impl<B: Backend> LlamaMlp<B> {
             gate_proj,
             up_proj,
             down_proj,
-            act_fn: Silu::new(backend)?,
+            act_fn: Silu::new(backend).map_err(tensor_failed)?,
         })
     }
 
@@ -47,7 +48,7 @@ impl<B: Backend> LlamaMlp<B> {
         &self,
         backend: &mut B,
         x: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         let gate = self.gate_proj.forward(backend, x)?;
         let up = self.up_proj.forward(backend, x)?;
         let hidden = self.act_fn.forward(backend, &gate)?.mul(backend, &up)?;

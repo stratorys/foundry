@@ -1,5 +1,6 @@
 use tracing::error;
 
+use crate::models::llama::error::tensor_failed;
 use crate::models::llama::rotary_emb::apply_rotary_pos_emb;
 use crate::models::llama::weights::load_tensor;
 use crate::models::llama::{
@@ -8,7 +9,6 @@ use crate::models::llama::{
 };
 use crate::nn::{
     Backend,
-    CoreError,
     DType,
     Linear,
     Shape,
@@ -41,7 +41,7 @@ impl<B: Backend> LlamaAttention<B> {
         weights: &Weights<S>,
         prefix: &str,
         layer_idx: usize,
-    ) -> Result<Self, LlamaError<B::Error>> {
+    ) -> Result<Self, LlamaError> {
         let hidden_size = config.hidden_size();
         let num_key_value_heads = config.num_key_value_heads();
         let head_dim = config.head_dim();
@@ -60,13 +60,7 @@ impl<B: Backend> LlamaAttention<B> {
         let k_proj = linear("k_proj", [kv_dim, hidden_size])?;
         let v_proj = linear("v_proj", [kv_dim, hidden_size])?;
         let o_proj = linear("o_proj", [hidden_size, hidden_size])?;
-        let head_dim_f32 = exact_f32(head_dim)?;
-        let scaling = Tensor::from_bytes(
-            backend,
-            &head_dim_f32.sqrt().recip().to_le_bytes(),
-            DType::F32,
-            Shape::try_from([1].as_slice())?,
-        )?;
+        let scaling = scaling(backend, head_dim).map_err(tensor_failed)?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -88,13 +82,13 @@ impl<B: Backend> LlamaAttention<B> {
         attention_mask: &Tensor<B>,
         past_key_values: &mut StaticCache<B>,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
+    ) -> Result<Tensor<B>, TensorError> {
         let &[batch_size, seq_len, _] = hidden_states.shape().dims() else {
             error!(
                 message = "Attention input is not [batch, seq, hidden].",
                 dims = ?hidden_states.shape().dims(),
             );
-            return Err(CoreError::AttentionIncompatible.into());
+            return Err(TensorError::AttentionIncompatible);
         };
         let query_shape =
             Shape::try_from([batch_size, seq_len, self.num_heads, self.head_dim].as_slice())?;
@@ -143,4 +137,16 @@ impl<B: Backend> LlamaAttention<B> {
         )?)?;
         self.o_proj.forward(backend, &attn_output)
     }
+}
+
+fn scaling<B: Backend>(
+    backend: &mut B,
+    head_dim: usize,
+) -> Result<Tensor<B>, TensorError> {
+    Tensor::from_bytes(
+        backend,
+        &exact_f32(head_dim)?.sqrt().recip().to_le_bytes(),
+        DType::F32,
+        Shape::try_from([1].as_slice())?,
+    )
 }

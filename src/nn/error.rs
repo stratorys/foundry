@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum CoreError {
+pub enum TensorError {
     #[error("Rank exceeds the maximum rank.")]
     RankTooLarge,
 
@@ -80,19 +80,7 @@ pub enum CoreError {
 
     #[error("Operand count does not match the operation.")]
     OperandCount,
-}
 
-/// A validation failure or a concrete backend failure during a tensor
-/// operation.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum TensorError<E: std::error::Error + 'static> {
-    #[error(transparent)]
-    Validation(#[from] CoreError),
-
-    #[error("Backend operation `{operation}` failed.")]
-    Backend {
-        operation: &'static str,
-        #[source]
-        source: E,
-    },
+    #[error("Backend operation failed.")]
+    Backend,
 }

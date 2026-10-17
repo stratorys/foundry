@@ -1,7 +1,6 @@
-use crate::nn::{
-    CoreError,
-    TensorError,
-};
+use tracing::error;
+
+use crate::nn::TensorError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LlamaConfigError {
@@ -30,8 +29,8 @@ pub enum LlamaConfigError {
     UntiedEmbeddings,
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum LlamaError<E: std::error::Error + 'static> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LlamaError {
     #[error("Tensor is not in the weights.")]
     TensorNotFound,
 
@@ -50,6 +49,9 @@ pub enum LlamaError<E: std::error::Error + 'static> {
     #[error("Head dim is not a positive even number.")]
     HeadDimInvalid,
 
+    #[error("Dimension is too large to convert exactly to f32.")]
+    DimensionTooLargeForF32,
+
     #[error("Forward input holds no token.")]
     EmptyInput,
 
@@ -63,72 +65,29 @@ pub enum LlamaError<E: std::error::Error + 'static> {
     BatchMismatch,
 
     #[error("Tensor operation failed.")]
-    Tensor(#[from] TensorError<E>),
+    Tensor,
+}
 
-    #[error(transparent)]
-    Validation(#[from] CoreError),
+pub fn tensor_failed(error: TensorError) -> LlamaError {
+    error!(message = "Tensor operation failed.", %error);
+    LlamaError::Tensor
 }
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
-    use std::fmt;
-
     use crate::models::llama::LlamaError;
-    use crate::nn::{
-        CoreError,
-        TensorError,
-    };
+    use crate::models::llama::error::tensor_failed;
+    use crate::nn::TensorError;
 
     #[test]
-    fn model_propagation_preserves_tensor_and_backend_sources() {
-        fn propagate() -> Result<(), LlamaError<fmt::Error>> {
-            Err::<(), _>(TensorError::Backend {
-                operation: "from_bytes",
-                source: fmt::Error,
-            })?;
-            Ok(())
-        }
-
-        let error = propagate().expect_err("the backend failure propagates");
-        assert!(
-            matches!(
-                &error,
-                LlamaError::Tensor(TensorError::Backend {
-                    operation: "from_bytes",
-                    source: fmt::Error,
-                })
-            ),
-            "propagation retains the concrete backend error"
-        );
-        let tensor = error
-            .source()
-            .expect("the model failure has a tensor source");
-        assert!(
-            tensor.is::<TensorError<fmt::Error>>(),
-            "the intermediate error type is retained"
-        );
-        let backend = tensor
-            .source()
-            .expect("the tensor failure has a backend source");
+    fn tensor_failures_become_the_tensor_variant() {
         assert_eq!(
-            backend.downcast_ref::<fmt::Error>(),
-            Some(&fmt::Error),
-            "the original backend cause is available without tracing"
-        );
-    }
-
-    #[test]
-    fn model_propagation_preserves_direct_validation_failure() {
-        fn propagate() -> Result<(), LlamaError<fmt::Error>> {
-            Err::<(), _>(CoreError::DimOutOfRange)?;
-            Ok(())
-        }
-
-        let error = propagate().expect_err("the validation failure propagates");
-        assert!(
-            matches!(error, LlamaError::Validation(CoreError::DimOutOfRange)),
-            "pure validation failures do not become backend errors"
+            [
+                tensor_failed(TensorError::Backend),
+                tensor_failed(TensorError::DimOutOfRange)
+            ],
+            [LlamaError::Tensor, LlamaError::Tensor],
+            "backend and validation failures are logged, then reported as a tensor failure"
         );
     }
 }

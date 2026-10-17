@@ -3,9 +3,9 @@ use std::array;
 use tracing::error;
 
 use crate::nn::{
-    CoreError,
     DType,
     MAX_ITEMSIZE,
+    TensorError,
 };
 
 pub const MAX_RANK: usize = 4;
@@ -41,35 +41,35 @@ impl Shape {
     pub fn size(
         &self,
         dim: usize,
-    ) -> Result<usize, CoreError> {
+    ) -> Result<usize, TensorError> {
         self.dims().get(dim).copied().ok_or_else(|| {
             error!(
                 message = "Dimension is out of range.",
                 dim,
                 ndim = self.ndim
             );
-            CoreError::DimOutOfRange
+            TensorError::DimOutOfRange
         })
     }
 
-    pub fn last_dim(&self) -> Result<usize, CoreError> {
+    pub fn last_dim(&self) -> Result<usize, TensorError> {
         self.ndim.checked_sub(1).ok_or_else(|| {
             error!(message = "A scalar has no last dimension.");
-            CoreError::DimOutOfRange
+            TensorError::DimOutOfRange
         })
     }
 
     pub fn broadcast(
         lhs: &Shape,
         rhs: &Shape,
-    ) -> Result<Shape, CoreError> {
+    ) -> Result<Shape, TensorError> {
         let incompatible = || {
             error!(
                 message = "Shapes cannot be broadcast together.",
                 lhs = ?lhs.dims(),
                 rhs = ?rhs.dims(),
             );
-            CoreError::BroadcastIncompatible
+            TensorError::BroadcastIncompatible
         };
         let dims_reversed = (0..lhs.ndim.max(rhs.ndim))
             .map(|dim_from_end| {
@@ -83,14 +83,14 @@ impl Shape {
                     _ => Err(incompatible()),
                 }
             })
-            .collect::<Result<Vec<usize>, CoreError>>()?;
+            .collect::<Result<Vec<usize>, TensorError>>()?;
         let dims: Vec<usize> = dims_reversed.into_iter().rev().collect();
         Shape::try_from(dims.as_slice())
     }
 }
 
 impl TryFrom<&[usize]> for Shape {
-    type Error = CoreError;
+    type Error = TensorError;
 
     fn try_from(dims: &[usize]) -> Result<Self, Self::Error> {
         let ndim = dims.len();
@@ -100,7 +100,7 @@ impl TryFrom<&[usize]> for Shape {
                 ndim,
                 max_rank = MAX_RANK
             );
-            return Err(CoreError::RankTooLarge);
+            return Err(TensorError::RankTooLarge);
         }
         let numel_non_zero = dims
             .iter()
@@ -113,7 +113,7 @@ impl TryFrom<&[usize]> for Shape {
                     ?dims,
                     max_numel = MAX_NUMEL,
                 );
-                CoreError::NumelOverflow
+                TensorError::NumelOverflow
             })?;
         let numel = if dims.contains(&0) { 0 } else { numel_non_zero };
         Ok(Self {
@@ -140,8 +140,8 @@ fn size_from_end(
 #[cfg(test)]
 mod tests {
     use crate::nn::{
-        CoreError,
         Shape,
+        TensorError,
     };
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(CoreError::BroadcastIncompatible),
+            Err(TensorError::BroadcastIncompatible),
             "dims 2 and 4 do not broadcast"
         );
     }
@@ -201,7 +201,7 @@ mod tests {
                 &Shape::try_from([1 << 30, 1].as_slice()).expect("valid shape"),
                 &Shape::try_from([1, 4].as_slice()).expect("valid shape"),
             ),
-            Err(CoreError::NumelOverflow),
+            Err(TensorError::NumelOverflow),
             "two valid shapes can broadcast to an invalid one"
         );
     }
@@ -210,7 +210,7 @@ mod tests {
     fn rank_above_max_is_rejected() {
         assert_eq!(
             Shape::try_from([1, 2, 3, 4, 5].as_slice()),
-            Err(CoreError::RankTooLarge),
+            Err(TensorError::RankTooLarge),
             "rank 5 is rejected"
         );
     }
@@ -237,7 +237,7 @@ mod tests {
     fn numel_overflow_is_rejected() {
         assert_eq!(
             Shape::try_from([usize::MAX, 2].as_slice()),
-            Err(CoreError::NumelOverflow),
+            Err(TensorError::NumelOverflow),
             "the product overflows usize"
         );
     }
@@ -246,7 +246,7 @@ mod tests {
     fn numel_above_i32_max_is_rejected() {
         assert_eq!(
             Shape::try_from([1 << 31].as_slice()),
-            Err(CoreError::NumelOverflow),
+            Err(TensorError::NumelOverflow),
             "one element above i32::MAX"
         );
     }
@@ -274,7 +274,7 @@ mod tests {
         .for_each(|dims| {
             assert_eq!(
                 Shape::try_from(dims.as_slice()),
-                Err(CoreError::NumelOverflow),
+                Err(TensorError::NumelOverflow),
                 "dims {dims:?}"
             );
         });

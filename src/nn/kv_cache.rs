@@ -2,7 +2,6 @@ use tracing::error;
 
 use crate::nn::{
     Backend,
-    CoreError,
     DType,
     Shape,
     Tensor,
@@ -24,7 +23,7 @@ impl<B: Backend> StaticCache<B> {
         num_key_value_heads: usize,
         max_cache_len: usize,
         head_dim: usize,
-    ) -> Result<Self, TensorError<B::Error>> {
+    ) -> Result<Self, TensorError> {
         let shape =
             Shape::try_from([batch_size, num_key_value_heads, max_cache_len, head_dim].as_slice())?;
         let layers = (0..num_layers)
@@ -34,7 +33,7 @@ impl<B: Backend> StaticCache<B> {
                     Tensor::zeros(backend, dtype, shape)?,
                 ))
             })
-            .collect::<Result<Vec<(Tensor<B>, Tensor<B>)>, TensorError<B::Error>>>()?;
+            .collect::<Result<Vec<(Tensor<B>, Tensor<B>)>, TensorError>>()?;
         Ok(Self {
             layers,
         })
@@ -47,14 +46,14 @@ impl<B: Backend> StaticCache<B> {
         value_states: &Tensor<B>,
         layer_idx: usize,
         past_seen_tokens: usize,
-    ) -> Result<[Tensor<B>; 2], TensorError<B::Error>> {
+    ) -> Result<[Tensor<B>; 2], TensorError> {
         if key_states.shape() != value_states.shape() {
             error!(
                 message = "Keys and values do not have the same shape.",
                 keys = ?key_states.shape().dims(),
                 values = ?value_states.shape().dims(),
             );
-            return Err(CoreError::KvIncompatible.into());
+            return Err(TensorError::KvIncompatible);
         }
         if key_states.dtype() != value_states.dtype() {
             error!(
@@ -62,7 +61,7 @@ impl<B: Backend> StaticCache<B> {
                 keys = ?key_states.dtype(),
                 values = ?value_states.dtype(),
             );
-            return Err(CoreError::DTypeMismatch.into());
+            return Err(TensorError::DTypeMismatch);
         }
         let num_layers = self.layers.len();
         let Some((keys, values)) = self.layers.get_mut(layer_idx) else {
@@ -70,7 +69,7 @@ impl<B: Backend> StaticCache<B> {
                 message = "Layer index exceeds the cache layers.",
                 layer_idx, num_layers,
             );
-            return Err(CoreError::CacheLayerOutOfRange.into());
+            return Err(TensorError::CacheLayerOutOfRange);
         };
         keys.slice_scatter(backend, key_states, SEQ_DIM, past_seen_tokens)?;
         values.slice_scatter(backend, value_states, SEQ_DIM, past_seen_tokens)?;
@@ -78,7 +77,7 @@ impl<B: Backend> StaticCache<B> {
             .checked_add(key_states.shape().size(SEQ_DIM)?)
             .ok_or_else(|| {
                 error!(message = "Narrow exceeds the dimension.", past_seen_tokens);
-                CoreError::NarrowOutOfBounds
+                TensorError::NarrowOutOfBounds
             })?;
         Ok([
             keys.narrow(SEQ_DIM, 0, kv_length)?,
