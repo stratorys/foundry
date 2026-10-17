@@ -1,7 +1,6 @@
 use crate::nn::{
     DType,
     Device,
-    Shape,
     Tensor,
     TensorError,
 };
@@ -13,12 +12,7 @@ pub struct Silu<D: Device> {
 impl<D: Device> Silu<D> {
     pub fn new(device: &mut D) -> Result<Self, TensorError> {
         Ok(Self {
-            one: Tensor::from_bytes(
-                device,
-                &1.0_f32.to_le_bytes(),
-                DType::F32,
-                Shape::try_from([1].as_slice())?,
-            )?,
+            one: Tensor::scalar_f32(device, 1.0)?,
         })
     }
 

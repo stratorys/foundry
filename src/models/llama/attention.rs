@@ -8,7 +8,6 @@ use crate::models::llama::{
     LlamaError,
 };
 use crate::nn::{
-    DType,
     Device,
     Linear,
     Module,
@@ -60,7 +59,9 @@ impl<D: Device> LlamaAttention<D> {
         let k_proj = linear("k_proj", [kv_dim, hidden_size])?;
         let v_proj = linear("v_proj", [kv_dim, hidden_size])?;
         let o_proj = linear("o_proj", [hidden_size, hidden_size])?;
-        let scaling = scaling(device, head_dim).map_err(tensor_failed)?;
+        let scaling = exact_f32(head_dim)
+            .and_then(|dim| Tensor::scalar_f32(device, dim.sqrt().recip()))
+            .map_err(tensor_failed)?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -149,16 +150,4 @@ impl<D: Device> LlamaAttention<D> {
             (format!("{prefix}.o_proj"), &self.o_proj),
         ]
     }
-}
-
-fn scaling<D: Device>(
-    device: &mut D,
-    head_dim: usize,
-) -> Result<Tensor<D>, TensorError> {
-    Tensor::from_bytes(
-        device,
-        &exact_f32(head_dim)?.sqrt().recip().to_le_bytes(),
-        DType::F32,
-        Shape::try_from([1].as_slice())?,
-    )
 }

@@ -2,7 +2,6 @@ use crate::nn::{
     DType,
     Device,
     Module,
-    Shape,
     Tensor,
     TensorError,
     exact_f32,
@@ -21,15 +20,9 @@ impl<D: Device> RmsNorm<D> {
         eps: f32,
     ) -> Result<Self, TensorError> {
         let dim_f32 = exact_f32(weight.shape().numel())?;
-        let scalar_shape = Shape::try_from([1].as_slice())?;
         Ok(Self {
-            eps: Tensor::from_bytes(device, &eps.to_le_bytes(), DType::F32, scalar_shape)?,
-            dim_inv: Tensor::from_bytes(
-                device,
-                &dim_f32.recip().to_le_bytes(),
-                DType::F32,
-                scalar_shape,
-            )?,
+            eps: Tensor::scalar_f32(device, eps)?,
+            dim_inv: Tensor::scalar_f32(device, dim_f32.recip())?,
             weight,
         })
     }

@@ -80,6 +80,18 @@ impl<D: Device> Tensor<D> {
         Ok(Self::from_storage(storage, dtype, shape))
     }
 
+    pub fn scalar_f32(
+        device: &mut D,
+        value: f32,
+    ) -> Result<Self, TensorError> {
+        Self::from_bytes(
+            device,
+            &value.to_le_bytes(),
+            DType::F32,
+            Shape::try_from([1].as_slice())?,
+        )
+    }
+
     pub fn zeros(
         device: &mut D,
         dtype: DType,
