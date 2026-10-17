@@ -1,3 +1,8 @@
+use tracing::error;
+
+use crate::nn::DType;
+use crate::nn::primitive::Op;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MetalError {
     #[error("No default Metal device is available.")]
@@ -53,4 +58,14 @@ pub enum MetalError {
 
     #[error("Kernel needs a float dtype.")]
     DTypeNotFloat,
+}
+
+pub fn not_float(dtype: DType) -> MetalError {
+    error!(message = "Kernel needs a float dtype.", ?dtype);
+    MetalError::DTypeNotFloat
+}
+
+pub fn invalid_operation(op: Op) -> MetalError {
+    error!(message = "Operation does not match its operands.", ?op);
+    MetalError::InvalidOperation
 }

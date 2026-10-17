@@ -1,10 +1,9 @@
+mod args;
 mod error;
+mod kernel;
 mod stream;
 
-use std::array;
 use std::collections::HashMap;
-use std::ffi::c_void;
-use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -23,13 +22,32 @@ use objc2_metal::{
 };
 use tracing::error;
 
+use self::args::{
+    IndexSelectArgs,
+    MATMUL_TILE,
+    MatmulDispatch,
+    MatmulGeometry,
+    MatrixLayout,
+    ReduceArgs,
+    StridedArgs,
+    is_matmul_ready,
+    slice_offset,
+};
 pub use self::error::MetalError;
+use self::error::invalid_operation;
+use self::kernel::{
+    Grid,
+    Kernel,
+    KernelArgs,
+    binary_kernel,
+    reduce_kernel,
+    to_dtype_kernel,
+    unary_kernel,
+};
 use self::stream::CommandStream;
 use crate::nn::primitive::{
-    BinaryOp,
     Op,
     ReduceOp,
-    UnaryOp,
 };
 use crate::nn::{
     AllocatedMemory,
@@ -38,7 +56,6 @@ use crate::nn::{
     Device,
     Layout,
     MAX_ITEMSIZE,
-    MAX_RANK,
     Operand,
     Shape,
 };
@@ -55,8 +72,6 @@ const KERNEL_SOURCES: &[&str] = &[
 ];
 
 const REDUCE_THREADS: usize = 256;
-
-const MATMUL_TILE: usize = 16;
 
 type MtlDevice = Retained<ProtocolObject<dyn MTLDevice>>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -84,318 +99,6 @@ pub struct MetalDevice {
 struct BufferView<'buffer> {
     storage: &'buffer MetalStorage,
     layout: &'buffer Layout,
-}
-
-#[repr(C)]
-struct StridedArgs {
-    count: u32,
-    ndim: u32,
-    dims: [u32; MAX_RANK],
-    strides: [u32; MAX_RANK],
-    offset: u32,
-}
-
-#[repr(C)]
-struct ReduceArgs {
-    rows: StridedArgs,
-    dim_size: u32,
-    dim_stride: u32,
-}
-
-#[repr(C)]
-struct MatmulOperand {
-    offset: u32,
-    row_stride: u32,
-    col_stride: u32,
-    batch_strides: [u32; MAX_RANK],
-}
-
-#[repr(C)]
-struct MatmulArgs {
-    m: u32,
-    n: u32,
-    k: u32,
-    batch_ndim: u32,
-    batch_dims: [u32; MAX_RANK],
-    lhs: MatmulOperand,
-    rhs: MatmulOperand,
-}
-
-struct MatmulDispatch {
-    args: MatmulArgs,
-    grid: MTLSize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MatrixLayout {
-    offset: usize,
-    row_stride: usize,
-    col_stride: usize,
-    batch_strides: [usize; MAX_RANK],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MatmulGeometry {
-    batch: Shape,
-    m: usize,
-    k: usize,
-    n: usize,
-    lhs: MatrixLayout,
-    rhs: MatrixLayout,
-}
-
-#[repr(C)]
-struct IndexSelectArgs {
-    count: u32,
-    rows: u32,
-    cols: u32,
-    table_offset: u32,
-    table_row_stride: u32,
-    table_col_stride: u32,
-    indices: StridedArgs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Kernel {
-    op: &'static str,
-    dtype: DType,
-}
-
-enum KernelArgs<'args> {
-    Strided(&'args StridedArgs),
-    Reduce(&'args ReduceArgs),
-    Matmul(&'args MatmulArgs),
-    IndexSelect(&'args IndexSelectArgs),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Grid {
-    Threads(usize),
-    Groups { grid: MTLSize, group: MTLSize },
-}
-
-impl Kernel {
-    fn new(
-        op: &'static str,
-        dtype: DType,
-    ) -> Self {
-        Self {
-            op,
-            dtype,
-        }
-    }
-
-    fn float(
-        op: &'static str,
-        dtype: DType,
-    ) -> Result<Self, MetalError> {
-        match dtype {
-            DType::F32 | DType::BF16 => Ok(Self::new(op, dtype)),
-            DType::U32 => Err(not_float(dtype)),
-        }
-    }
-
-    fn name(&self) -> String {
-        let suffix = match self.dtype {
-            DType::F32 => "f32",
-            DType::BF16 => "bf16",
-            DType::U32 => "u32",
-        };
-        format!("{}_{suffix}", self.op)
-    }
-}
-
-impl KernelArgs<'_> {
-    fn bytes(&self) -> (NonNull<c_void>, usize) {
-        match self {
-            Self::Strided(args) => (NonNull::from(*args).cast(), size_of::<StridedArgs>()),
-            Self::Reduce(args) => (NonNull::from(*args).cast(), size_of::<ReduceArgs>()),
-            Self::Matmul(args) => (NonNull::from(*args).cast(), size_of::<MatmulArgs>()),
-            Self::IndexSelect(args) => (NonNull::from(*args).cast(), size_of::<IndexSelectArgs>()),
-        }
-    }
-}
-
-impl Grid {
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Threads(count) => *count == 0,
-            Self::Groups {
-                grid, ..
-            } => grid.width == 0 || grid.height == 0 || grid.depth == 0,
-        }
-    }
-
-    fn threads_required(&self) -> usize {
-        match self {
-            Self::Threads(_) => 1,
-            Self::Groups {
-                group, ..
-            } => group
-                .width
-                .saturating_mul(group.height)
-                .saturating_mul(group.depth),
-        }
-    }
-
-    fn group(
-        &self,
-        threads_max: usize,
-    ) -> MTLSize {
-        match self {
-            Self::Threads(count) => MTLSize {
-                width: threads_max.min(*count),
-                height: 1,
-                depth: 1,
-            },
-            Self::Groups {
-                group, ..
-            } => *group,
-        }
-    }
-}
-
-impl StridedArgs {
-    fn new(input: &BufferView<'_>) -> Result<Self, MetalError> {
-        Self::with_shape(input.layout, input.layout.shape())
-    }
-
-    fn with_shape(
-        layout: &Layout,
-        shape: &Shape,
-    ) -> Result<Self, MetalError> {
-        Ok(Self {
-            count: index_u32(shape.numel())?,
-            ndim: index_u32(shape.ndim())?,
-            dims: padded_u32(shape.dims())?,
-            strides: padded_u32(layout.strides())?,
-            offset: index_u32(layout.storage_offset())?,
-        })
-    }
-
-    fn window(
-        target: &Layout,
-        shape: &Shape,
-        offset: usize,
-    ) -> Result<Self, MetalError> {
-        Ok(Self {
-            offset: index_u32(offset)?,
-            ..Self::with_shape(target, shape)?
-        })
-    }
-}
-
-impl IndexSelectArgs {
-    fn new(
-        table: &BufferView<'_>,
-        indices: &BufferView<'_>,
-        output: &Shape,
-    ) -> Result<Self, MetalError> {
-        let (&[rows, cols], &[row_stride, col_stride]) =
-            (table.layout.shape().dims(), table.layout.strides())
-        else {
-            return Err(invalid_operation(Op::IndexSelect {
-                dim: 0,
-            }));
-        };
-        Ok(Self {
-            count: index_u32(output.numel())?,
-            rows: index_u32(rows)?,
-            cols: index_u32(cols)?,
-            table_offset: index_u32(table.layout.storage_offset())?,
-            table_row_stride: index_u32(row_stride)?,
-            table_col_stride: index_u32(col_stride)?,
-            indices: StridedArgs::new(indices)?,
-        })
-    }
-}
-
-impl ReduceArgs {
-    fn new(
-        input: &BufferView<'_>,
-        output: &Shape,
-        dim: usize,
-    ) -> Result<Self, MetalError> {
-        let (Some(&dim_size), Some(&dim_stride)) = (
-            input.layout.shape().dims().get(dim),
-            input.layout.strides().get(dim),
-        ) else {
-            return Err(invalid_operation(Op::Reduce {
-                op: ReduceOp::Sum,
-                dim,
-            }));
-        };
-        Ok(Self {
-            rows: StridedArgs::with_shape(input.layout, output)?,
-            dim_size: index_u32(dim_size)?,
-            dim_stride: index_u32(dim_stride)?,
-        })
-    }
-}
-
-impl MatrixLayout {
-    fn of(layout: &Layout) -> Option<Self> {
-        let (batch_strides, [row_stride, col_stride]) = layout.strides().split_last_chunk::<2>()?;
-        Some(Self {
-            offset: layout.storage_offset(),
-            row_stride: *row_stride,
-            col_stride: *col_stride,
-            batch_strides: padded(batch_strides),
-        })
-    }
-}
-
-impl MatmulGeometry {
-    fn of(
-        lhs: &Layout,
-        rhs: &Layout,
-    ) -> Option<Self> {
-        let (batch, &[m, k]) = lhs.shape().dims().split_last_chunk::<2>()?;
-        let &[_, n] = rhs.shape().dims().split_last_chunk::<2>()?.1;
-        Some(Self {
-            batch: Shape::try_from(batch).ok()?,
-            m,
-            k,
-            n,
-            lhs: MatrixLayout::of(lhs)?,
-            rhs: MatrixLayout::of(rhs)?,
-        })
-    }
-}
-
-impl MatmulOperand {
-    fn new(matrix: &MatrixLayout) -> Result<Self, MetalError> {
-        Ok(Self {
-            offset: index_u32(matrix.offset)?,
-            row_stride: index_u32(matrix.row_stride)?,
-            col_stride: index_u32(matrix.col_stride)?,
-            batch_strides: padded_u32(&matrix.batch_strides)?,
-        })
-    }
-}
-
-impl MatmulDispatch {
-    fn new(geometry: &MatmulGeometry) -> Result<Self, MetalError> {
-        let batch_dims = geometry.batch.dims();
-        let args = MatmulArgs {
-            m: index_u32(geometry.m)?,
-            n: index_u32(geometry.n)?,
-            k: index_u32(geometry.k)?,
-            batch_ndim: index_u32(batch_dims.len())?,
-            batch_dims: padded_u32(batch_dims)?,
-            lhs: MatmulOperand::new(&geometry.lhs)?,
-            rhs: MatmulOperand::new(&geometry.rhs)?,
-        };
-        let grid = MTLSize {
-            width: geometry.n.div_ceil(MATMUL_TILE),
-            height: geometry.m.div_ceil(MATMUL_TILE),
-            depth: geometry.batch.numel(),
-        };
-        Ok(Self {
-            args,
-            grid,
-        })
-    }
 }
 
 impl MetalDevice {
@@ -581,7 +284,7 @@ impl MetalDevice {
         window: &StridedArgs,
         output: &mut MetalStorage,
     ) -> Result<(), MetalError> {
-        let input_args = StridedArgs::new(input)?;
+        let input_args = StridedArgs::new(input.layout)?;
         // The output is borrowed mutably, so no other reference to it is live
         // during encoding: either a slice scatter target, which
         // `Tensor::slice_scatter` checked to be contiguous and owned by no
@@ -610,7 +313,7 @@ impl MetalDevice {
         let output = self.allocate(output_shape.nbytes(dtype))?;
         let args = inputs
             .iter()
-            .map(|input| StridedArgs::new(input))
+            .map(|input| StridedArgs::new(input.layout))
             .collect::<Result<Vec<_>, _>>()?;
         let kernel_args: Vec<KernelArgs<'_>> = args.iter().map(KernelArgs::Strided).collect();
         let buffers: Vec<&MetalStorage> = inputs
@@ -657,7 +360,7 @@ impl MetalDevice {
         output_shape: &Shape,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let args = ReduceArgs::new(input, output_shape, dim)?;
+        let args = ReduceArgs::new(input.layout, output_shape, dim)?;
         let output = self.allocate(output_shape.nbytes(dtype))?;
         // One threadgroup per output row.
         self.dispatch(
@@ -735,7 +438,7 @@ impl MetalDevice {
         output_shape: &Shape,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let args = IndexSelectArgs::new(table, indices, output_shape)?;
+        let args = IndexSelectArgs::new(table.layout, indices.layout, output_shape)?;
         let output = self.allocate(output_shape.nbytes(dtype))?;
         // The kernel reads a table row only when its index is below `rows`.
         self.dispatch(
@@ -963,78 +666,6 @@ fn threadgroup_too_small(
     MetalError::ThreadgroupTooSmall
 }
 
-fn to_dtype_kernel(
-    dtype_from: DType,
-    dtype: DType,
-) -> Result<Kernel, MetalError> {
-    let op = match dtype_from {
-        DType::F32 => "to_dtype_f32",
-        DType::BF16 => "to_dtype_bf16",
-        DType::U32 => return Err(not_float(dtype_from)),
-    };
-    Kernel::float(op, dtype)
-}
-
-fn unary_kernel(op: UnaryOp) -> &'static str {
-    match op {
-        UnaryOp::Neg => "unary_neg",
-        UnaryOp::Exp => "unary_exp",
-        UnaryOp::Sqrt => "unary_sqrt",
-        UnaryOp::Reciprocal => "unary_reciprocal",
-    }
-}
-
-fn binary_kernel(op: BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Add => "binary_add",
-        BinaryOp::Sub => "binary_sub",
-        BinaryOp::Mul => "binary_mul",
-        BinaryOp::Div => "binary_div",
-    }
-}
-
-fn reduce_kernel(op: ReduceOp) -> &'static str {
-    match op {
-        ReduceOp::Sum => "reduce_sum",
-        ReduceOp::Amax => "reduce_amax",
-        ReduceOp::Argmax => "reduce_argmax",
-    }
-}
-
-fn is_matmul_ready(
-    matrix: &MatrixLayout,
-    rows: usize,
-    cols: usize,
-) -> bool {
-    let is_row_major = matrix.col_stride == 1 || cols == 1;
-    let is_transposed = matrix.row_stride == 1 || rows == 1;
-    is_row_major || is_transposed
-}
-
-fn not_float(dtype: DType) -> MetalError {
-    error!(message = "Kernel needs a float dtype.", ?dtype);
-    MetalError::DTypeNotFloat
-}
-
-fn invalid_operation(op: Op) -> MetalError {
-    error!(message = "Operation does not match its operands.", ?op);
-    MetalError::InvalidOperation
-}
-
-fn slice_offset(
-    layout: &Layout,
-    dim: usize,
-    start: Option<usize>,
-) -> Option<usize> {
-    start?
-        .checked_mul(*layout.strides().get(dim)?)?
-        .checked_add(layout.storage_offset())
-}
-
-fn padded(values: &[usize]) -> [usize; MAX_RANK] {
-    array::from_fn(|index| values.get(index).copied().unwrap_or(0))
-}
-
 fn allocated_bytes(device: &MtlDevice) -> Result<u64, MetalError> {
     let allocated_bytes = device.currentAllocatedSize();
     u64::try_from(allocated_bytes).map_err(|_| {
@@ -1046,28 +677,6 @@ fn allocated_bytes(device: &MtlDevice) -> Result<u64, MetalError> {
     })
 }
 
-fn index_u32(value: usize) -> Result<u32, MetalError> {
-    u32::try_from(value).map_err(|_| {
-        error!(
-            message = "Value does not fit in a 32-bit kernel index.",
-            value
-        );
-        MetalError::KernelIndexTooLarge
-    })
-}
-
-fn padded_u32(values: &[usize]) -> Result<[u32; MAX_RANK], MetalError> {
-    values
-        .iter()
-        .zip(0..MAX_RANK)
-        .try_fold([0_u32; MAX_RANK], |mut padded, (&value, dim)| {
-            if let Some(slot) = padded.get_mut(dim) {
-                *slot = index_u32(value)?;
-            }
-            Ok(padded)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use std::f32::consts::{
@@ -1075,237 +684,19 @@ mod tests {
         PI,
     };
 
-    use objc2_metal::MTLSize;
-
-    use crate::metal::{
-        Grid,
-        Kernel,
+    use crate::metal::MetalDevice;
+    use crate::metal::args::{
         MatmulGeometry,
-        MatrixLayout,
-        MetalDevice,
-        MetalError,
         is_matmul_ready,
-        slice_offset,
-        to_dtype_kernel,
     };
     use crate::nn::{
         AllocatedMemorySource,
         DType,
         Device,
-        Layout,
         Shape,
         Tensor,
         TensorError,
     };
-
-    #[test]
-    fn kernel_name_joins_op_prefix_and_dtype_suffix() {
-        assert_eq!(
-            [
-                Kernel::new("copy", DType::U32).name(),
-                Kernel::new("unary_neg", DType::F32).name(),
-                Kernel::new("matmul", DType::BF16).name(),
-            ],
-            ["copy_u32", "unary_neg_f32", "matmul_bf16"],
-            "op prefix, underscore, dtype suffix"
-        );
-    }
-
-    #[test]
-    fn to_dtype_kernel_names_source_then_target_dtype() {
-        assert_eq!(
-            [
-                to_dtype_kernel(DType::F32, DType::BF16).map(|kernel| kernel.name()),
-                to_dtype_kernel(DType::BF16, DType::F32).map(|kernel| kernel.name()),
-            ],
-            [
-                Ok(String::from("to_dtype_f32_bf16")),
-                Ok(String::from("to_dtype_bf16_f32")),
-            ],
-            "the prefix names the source dtype, the suffix the target dtype"
-        );
-    }
-
-    #[test]
-    fn float_kernel_rejects_u32() {
-        assert_eq!(
-            [
-                Kernel::float("matmul", DType::U32),
-                to_dtype_kernel(DType::U32, DType::F32),
-                to_dtype_kernel(DType::F32, DType::U32),
-            ],
-            [
-                Err(MetalError::DTypeNotFloat),
-                Err(MetalError::DTypeNotFloat),
-                Err(MetalError::DTypeNotFloat),
-            ],
-            "float kernels have no u32 instance"
-        );
-    }
-
-    #[test]
-    fn grid_without_threads_or_groups_is_empty() {
-        let group = MTLSize {
-            width: 16,
-            height: 16,
-            depth: 1,
-        };
-        assert_eq!(
-            [
-                Grid::Threads(0).is_empty(),
-                Grid::Threads(1).is_empty(),
-                Grid::Groups {
-                    grid: MTLSize {
-                        width: 4,
-                        height: 0,
-                        depth: 1,
-                    },
-                    group,
-                }
-                .is_empty(),
-                Grid::Groups {
-                    grid: MTLSize {
-                        width: 4,
-                        height: 2,
-                        depth: 1,
-                    },
-                    group,
-                }
-                .is_empty(),
-            ],
-            [true, false, true, false],
-            "a grid is empty when it has no thread or a zero group dimension"
-        );
-    }
-
-    #[test]
-    fn grid_threads_required_is_the_group_volume() {
-        assert_eq!(
-            [
-                Grid::Threads(5000).threads_required(),
-                Grid::Groups {
-                    grid: MTLSize {
-                        width: 1,
-                        height: 1,
-                        depth: 1,
-                    },
-                    group: MTLSize {
-                        width: 16,
-                        height: 16,
-                        depth: 1,
-                    },
-                }
-                .threads_required(),
-            ],
-            [1, 256],
-            "a thread grid needs one thread per group, a group grid its group volume"
-        );
-    }
-
-    #[test]
-    fn grid_group_clamps_threads_to_the_pipeline_limit() {
-        let group = MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        };
-        assert_eq!(
-            [
-                Grid::Threads(10).group(1024),
-                Grid::Threads(5000).group(1024),
-                Grid::Groups {
-                    grid: group,
-                    group,
-                }
-                .group(1024),
-            ],
-            [
-                MTLSize {
-                    width: 10,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 1024,
-                    height: 1,
-                    depth: 1,
-                },
-                group,
-            ],
-            "a thread grid uses at most the pipeline limit, a group grid keeps its group"
-        );
-    }
-
-    #[test]
-    fn matmul_geometry_reads_dims_and_operand_strides() {
-        let geometry = MatmulGeometry::of(
-            &Layout::contiguous(Shape::try_from([5, 2, 3].as_slice()).expect("valid shape")),
-            &Layout::contiguous(Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")),
-        );
-        assert_eq!(
-            geometry,
-            Some(MatmulGeometry {
-                batch: Shape::try_from([5].as_slice()).expect("valid shape"),
-                m: 2,
-                k: 3,
-                n: 4,
-                lhs: MatrixLayout {
-                    offset: 0,
-                    row_stride: 3,
-                    col_stride: 1,
-                    batch_strides: [6, 0, 0, 0],
-                },
-                rhs: MatrixLayout {
-                    offset: 0,
-                    row_stride: 4,
-                    col_stride: 1,
-                    batch_strides: [12, 0, 0, 0],
-                },
-            }),
-            "batch, matrix dims and operand strides"
-        );
-    }
-
-    #[test]
-    fn matmul_geometry_reads_transposed_operand_strides() {
-        let rhs = Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape"))
-            .permute(&[1, 0])
-            .expect("valid permutation");
-        assert_eq!(
-            MatmulGeometry::of(
-                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
-                &rhs,
-            )
-            .map(|geometry| geometry.rhs),
-            Some(MatrixLayout {
-                offset: 0,
-                row_stride: 1,
-                col_stride: 3,
-                batch_strides: [0, 0, 0, 0],
-            }),
-            "the transposed rhs walks rows with stride 1"
-        );
-    }
-
-    #[test]
-    fn slice_offset_adds_start_times_stride_to_the_layout_offset() {
-        let target =
-            Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"))
-                .narrow(0, 1, 1)
-                .expect("valid narrow");
-        let cat_output =
-            Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"));
-        assert_eq!(
-            [
-                slice_offset(&target, 1, Some(3)),
-                slice_offset(&cat_output, 1, Some(3)),
-                slice_offset(&target, 3, Some(0)),
-                slice_offset(&target, 1, Some(usize::MAX)),
-            ],
-            [Some(44), Some(12), None, None],
-            "offset 32 plus 3 times 4, then 3 times 4, then a missing dim, then an overflow"
-        );
-    }
 
     #[test]
     fn device_name_is_not_empty() {
