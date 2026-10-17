@@ -75,8 +75,8 @@ pub enum LlamaError<E: std::error::Error + 'static> {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fmt;
 
-    use crate::backend::cpu::CpuError;
     use crate::core::{
         CoreError,
         TensorError,
@@ -85,10 +85,10 @@ mod tests {
 
     #[test]
     fn model_propagation_preserves_tensor_and_backend_sources() {
-        fn propagate() -> Result<(), LlamaError<CpuError>> {
+        fn propagate() -> Result<(), LlamaError<fmt::Error>> {
             Err::<(), _>(TensorError::Backend {
                 operation: "upload",
-                source: CpuError::IndexOutOfStorage,
+                source: fmt::Error,
             })?;
             Ok(())
         }
@@ -99,7 +99,7 @@ mod tests {
                 &error,
                 LlamaError::Tensor(TensorError::Backend {
                     operation: "upload",
-                    source: CpuError::IndexOutOfStorage,
+                    source: fmt::Error,
                 })
             ),
             "propagation retains the concrete backend error"
@@ -108,22 +108,22 @@ mod tests {
             .source()
             .expect("the model failure has a tensor source");
         assert!(
-            tensor.is::<TensorError<CpuError>>(),
+            tensor.is::<TensorError<fmt::Error>>(),
             "the intermediate error type is retained"
         );
         let backend = tensor
             .source()
             .expect("the tensor failure has a backend source");
         assert_eq!(
-            backend.downcast_ref::<CpuError>(),
-            Some(&CpuError::IndexOutOfStorage),
+            backend.downcast_ref::<fmt::Error>(),
+            Some(&fmt::Error),
             "the original backend cause is available without tracing"
         );
     }
 
     #[test]
     fn model_propagation_preserves_direct_validation_failure() {
-        fn propagate() -> Result<(), LlamaError<CpuError>> {
+        fn propagate() -> Result<(), LlamaError<fmt::Error>> {
             Err::<(), _>(CoreError::AxisOutOfRange)?;
             Ok(())
         }

@@ -23,9 +23,7 @@ use clap::{
     Args,
     Parser,
     Subcommand,
-    ValueEnum,
 };
-use foundry::backend::cpu::CpuBackend;
 #[cfg(target_os = "macos")]
 use foundry::backend::metal::MetalBackend;
 use foundry::bench::{
@@ -59,6 +57,7 @@ use tracing::{
 const GIB_BYTES: usize = 1024 * 1024 * 1024;
 const LABEL_WIDTH: usize = 14;
 const FIELD_WIDTH: usize = 12;
+const BACKEND_NAME: &str = "metal";
 
 #[derive(Parser)]
 #[command(about = "Foundry LLM inference engine.")]
@@ -80,19 +79,12 @@ enum Command {
         tensors: bool,
     },
     #[command(
-        about = "Generate token IDs greedily from prompt token IDs on the selected backend and \
-                 print them as JSON."
+        about = "Generate token IDs greedily from prompt token IDs on Metal and print them as \
+                 JSON."
     )]
     Run {
         #[arg(long, help = "Hugging Face repository id, as owner/name.")]
         model: ModelId,
-        #[arg(
-            long,
-            value_enum,
-            default_value_t = BackendKind::Cpu,
-            help = "Backend that runs the model."
-        )]
-        backend: BackendKind,
         #[arg(
             long,
             value_delimiter = ',',
@@ -113,13 +105,6 @@ enum Command {
 struct BenchArgs {
     #[arg(long, help = "Hugging Face repository id, as owner/name.")]
     model: ModelId,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = BackendKind::Cpu,
-        help = "Backend that runs the model."
-    )]
-    backend: BackendKind,
     #[arg(
         long,
         help = "Prompt tokens processed in one prefill; 0 benchmarks generation only."
@@ -158,13 +143,6 @@ struct BenchArgs {
     out: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum BackendKind {
-    Cpu,
-    #[cfg(target_os = "macos")]
-    Metal,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelId {
     owner: String,
@@ -198,6 +176,10 @@ enum CliError {
     #[cfg(target_os = "macos")]
     #[error("Creating the Metal backend failed.")]
     Backend,
+
+    #[cfg(not(target_os = "macos"))]
+    #[error("No backend is available on this platform.")]
+    BackendUnavailable,
 
     #[error("Loading the model weights failed.")]
     Load,
@@ -251,16 +233,6 @@ struct TensorRow {
     bytes: usize,
 }
 
-impl BackendKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            #[cfg(target_os = "macos")]
-            Self::Metal => "metal",
-        }
-    }
-}
-
 impl FromStr for ModelId {
     type Err = ModelIdError;
 
@@ -301,10 +273,9 @@ fn main() -> ExitCode {
         } => inspect(&model, tensors),
         Command::Run {
             model,
-            backend,
             prompt_ids,
             max_new_tokens,
-        } => run(&model, backend, &prompt_ids, max_new_tokens),
+        } => run(&model, &prompt_ids, max_new_tokens),
         Command::Bench(args) => bench_command(&args),
     };
     match result {
@@ -370,39 +341,17 @@ fn open_weights(directory: &Path) -> Result<Weights, CliError> {
 
 fn run(
     model: &ModelId,
-    backend: BackendKind,
     prompt_ids: &[u32],
     max_new_tokens: usize,
 ) -> Result<(), CliError> {
     let directory = resolve_snapshot(model)?;
     let config = open_config(&directory)?;
     let weights = open_weights(&directory)?;
-    let generation = match backend {
-        BackendKind::Cpu => generate_on(
-            &mut CpuBackend::new(),
-            model,
-            &config,
-            &weights,
-            prompt_ids,
-            max_new_tokens,
-        ),
-        #[cfg(target_os = "macos")]
-        BackendKind::Metal => generate_on(
-            &mut MetalBackend::new().map_err(|error| {
-                error!(message = "Creating the Metal backend failed.", %error);
-                CliError::Backend
-            })?,
-            model,
-            &config,
-            &weights,
-            prompt_ids,
-            max_new_tokens,
-        ),
-    }?;
+    let generation = generate_on_platform(model, &config, &weights, prompt_ids, max_new_tokens)?;
     let token_ids = generation.token_ids.concat();
     info!(
         message = "Generated tokens.",
-        ?backend,
+        backend = BACKEND_NAME,
         prompt_tokens = prompt_ids.len(),
         generated_tokens = token_ids.len(),
         prefill_ms = %generation.prefill.as_millis(),
@@ -454,33 +403,13 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
         batch_size: args.batch_size,
         seed: args.seed,
     };
-    let (device, report) = match args.backend {
-        BackendKind::Cpu => bench_on(
-            &mut CpuBackend::new(),
-            &args.model,
-            &config,
-            &weights,
-            vocab_size,
-            &bench_config,
-        ),
-        #[cfg(target_os = "macos")]
-        BackendKind::Metal => bench_on(
-            &mut MetalBackend::new().map_err(|error| {
-                error!(message = "Creating the Metal backend failed.", %error);
-                CliError::Backend
-            })?,
-            &args.model,
-            &config,
-            &weights,
-            vocab_size,
-            &bench_config,
-        ),
-    }?;
+    let (device, report) =
+        bench_on_platform(&args.model, &config, &weights, vocab_size, &bench_config)?;
     let record = BenchRecord {
         metadata: Metadata {
             git_commit,
             test_time,
-            backend: args.backend.name().to_owned(),
+            backend: BACKEND_NAME.to_owned(),
             device,
             model_id: args.model.to_string(),
             model_bytes,
@@ -491,7 +420,7 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
     let report_path = write_bench_report(&args.out, &record)?;
     info!(
         message = "Benchmarked the model.",
-        backend = args.backend.name(),
+        backend = BACKEND_NAME,
         device = %record.metadata.device,
         git_commit = ?record.metadata.git_commit,
         mode = ?record.report.mode,
@@ -572,6 +501,78 @@ fn parameter_count<S: AsRef<[u8]>>(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn metal_backend() -> Result<MetalBackend, CliError> {
+    MetalBackend::new().map_err(|error| {
+        error!(message = "Creating the Metal backend failed.", %error);
+        CliError::Backend
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn generate_on_platform(
+    model: &ModelId,
+    config: &LlamaConfig,
+    weights: &Weights,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+) -> Result<Generation, CliError> {
+    generate_on(
+        &mut metal_backend()?,
+        model,
+        config,
+        weights,
+        prompt_ids,
+        max_new_tokens,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn generate_on_platform(
+    _model: &ModelId,
+    _config: &LlamaConfig,
+    _weights: &Weights,
+    _prompt_ids: &[u32],
+    _max_new_tokens: usize,
+) -> Result<Generation, CliError> {
+    error!(message = "No backend is available on this platform.");
+    Err(CliError::BackendUnavailable)
+}
+
+#[cfg(target_os = "macos")]
+fn bench_on_platform(
+    model: &ModelId,
+    config: &LlamaConfig,
+    weights: &Weights,
+    vocab_size: NonZeroU32,
+    bench_config: &BenchConfig,
+) -> Result<(String, Report), CliError> {
+    bench_on(
+        &mut metal_backend()?,
+        model,
+        config,
+        weights,
+        vocab_size,
+        bench_config,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bench_on_platform(
+    _model: &ModelId,
+    _config: &LlamaConfig,
+    _weights: &Weights,
+    _vocab_size: NonZeroU32,
+    _bench_config: &BenchConfig,
+) -> Result<(String, Report), CliError> {
+    error!(message = "No backend is available on this platform.");
+    Err(CliError::BackendUnavailable)
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no backend on this platform")
+)]
 fn bench_on<B: Backend>(
     backend: &mut B,
     model: &ModelId,
@@ -631,6 +632,10 @@ fn write_bench_report(
     Ok(report_path)
 }
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no backend on this platform")
+)]
 fn load_llama<B: Backend>(
     backend: &mut B,
     model: &ModelId,
@@ -657,6 +662,10 @@ fn load_llama<B: Backend>(
     Ok(llama)
 }
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no backend on this platform")
+)]
 fn generate_on<B: Backend>(
     backend: &mut B,
     model: &ModelId,
@@ -942,7 +951,6 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        BackendKind,
         BenchArgs,
         Cli,
         CliError,
@@ -1098,16 +1106,15 @@ mod tests {
                     owner: "a".to_owned(),
                     name: "b".to_owned(),
                 },
-                backend: BackendKind::Cpu,
                 prompt_ids: vec![1, 2, 3],
                 max_new_tokens: 4,
             }),
-            "comma-separated prompt IDs on the default cpu backend"
+            "comma-separated prompt IDs"
         );
     }
 
     #[test]
-    fn run_parses_the_cpu_backend() {
+    fn run_rejects_the_backend_option() {
         assert_eq!(
             Cli::try_parse_from([
                 "foundry",
@@ -1115,7 +1122,7 @@ mod tests {
                 "--model",
                 "a/b",
                 "--backend",
-                "cpu",
+                "metal",
                 "--prompt-ids",
                 "1",
                 "--max-new-tokens",
@@ -1123,38 +1130,8 @@ mod tests {
             ])
             .map(|cli| cli.command)
             .map_err(|error| error.kind()),
-            Ok(Command::Run {
-                model: ModelId {
-                    owner: "a".to_owned(),
-                    name: "b".to_owned(),
-                },
-                backend: BackendKind::Cpu,
-                prompt_ids: vec![1],
-                max_new_tokens: 1,
-            }),
-            "explicit cpu backend"
-        );
-    }
-
-    #[test]
-    fn run_rejects_an_unknown_backend() {
-        assert_eq!(
-            Cli::try_parse_from([
-                "foundry",
-                "run",
-                "--model",
-                "a/b",
-                "--backend",
-                "gpu",
-                "--prompt-ids",
-                "1",
-                "--max-new-tokens",
-                "1",
-            ])
-            .map(|cli| cli.command)
-            .map_err(|error| error.kind()),
-            Err(ErrorKind::InvalidValue),
-            "gpu is not a backend"
+            Err(ErrorKind::UnknownArgument),
+            "the backend is not selectable"
         );
     }
 
@@ -1222,7 +1199,6 @@ mod tests {
                     owner: "a".to_owned(),
                     name: "b".to_owned(),
                 },
-                backend: BackendKind::Cpu,
                 prompt_tokens: 512,
                 gen_tokens: 128,
                 depth: 0,
