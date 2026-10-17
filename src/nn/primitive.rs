@@ -323,13 +323,11 @@ fn check_slice_scatter(
 }
 
 fn require_float(dtype: DType) -> Result<DType, TensorError> {
-    match dtype.float() {
-        Some(_) => Ok(dtype),
-        None => {
-            error!(message = "DType is not a float dtype.", ?dtype);
-            Err(TensorError::DTypeNotFloat)
-        }
+    if !dtype.is_float() {
+        error!(message = "DType is not a float dtype.", ?dtype);
+        return Err(TensorError::DTypeNotFloat);
     }
+    Ok(dtype)
 }
 
 fn require_same_float(

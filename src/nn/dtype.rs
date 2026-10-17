@@ -10,13 +10,6 @@ pub enum DType {
     U32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FloatDType {
-    F32,
-    F16,
-    BF16,
-}
-
 pub const MAX_ITEMSIZE: usize = 4;
 
 impl DType {
@@ -27,30 +20,7 @@ impl DType {
         }
     }
 
-    pub const fn float(self) -> Option<FloatDType> {
-        match self {
-            Self::F32 => Some(FloatDType::F32),
-            Self::F16 => Some(FloatDType::F16),
-            Self::BF16 => Some(FloatDType::BF16),
-            Self::U32 => None,
-        }
-    }
-
-    const fn from_float(dtype: FloatDType) -> Self {
-        match dtype {
-            FloatDType::F32 => Self::F32,
-            FloatDType::F16 => Self::F16,
-            FloatDType::BF16 => Self::BF16,
-        }
-    }
-}
-
-impl FloatDType {
-    pub const fn itemsize(self) -> usize { DType::from_float(self).itemsize() }
-}
-
-impl From<FloatDType> for DType {
-    fn from(dtype: FloatDType) -> Self { Self::from_float(dtype) }
+    pub const fn is_float(self) -> bool { matches!(self, Self::F32 | Self::F16 | Self::BF16) }
 }
 
 pub fn exact_f32(value: usize) -> Result<f32, TensorError> {
@@ -68,7 +38,6 @@ pub fn exact_f32(value: usize) -> Result<f32, TensorError> {
 mod tests {
     use crate::nn::{
         DType,
-        FloatDType,
         TensorError,
         exact_f32,
     };
@@ -76,12 +45,18 @@ mod tests {
     #[test]
     fn size_bytes_matches_each_dtype() {
         assert_eq!(
-            (
-                [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::itemsize),
-                [FloatDType::F32, FloatDType::F16, FloatDType::BF16].map(FloatDType::itemsize),
-            ),
-            ([4, 2, 2, 4], [4, 2, 2]),
+            [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::itemsize),
+            [4, 2, 2, 4],
             "f32 and u32 take four bytes, f16 and bf16 two"
+        );
+    }
+
+    #[test]
+    fn is_float_is_true_for_float_dtypes_only() {
+        assert_eq!(
+            [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::is_float),
+            [true, true, true, false],
+            "u32 is the only non-float dtype"
         );
     }
 

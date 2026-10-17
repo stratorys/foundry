@@ -35,7 +35,6 @@ use crate::nn::{
     AllocatedMemorySource,
     Backend,
     DType,
-    FloatDType,
     Layout,
     MAX_ITEMSIZE,
     MAX_RANK,
@@ -805,7 +804,7 @@ impl MetalBackend {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        self.dispatch_strided(unary_kernel(op, float(dtype)?), &[input], &output)?;
+        self.dispatch_strided(unary_kernel(op, dtype)?, &[input], &output)?;
         Ok(output)
     }
 
@@ -817,7 +816,7 @@ impl MetalBackend {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(lhs.layout.shape().nbytes(dtype))?;
-        self.dispatch_strided(binary_kernel(op, float(dtype)?), &[lhs, rhs], &output)?;
+        self.dispatch_strided(binary_kernel(op, dtype)?, &[lhs, rhs], &output)?;
         Ok(output)
     }
 
@@ -832,7 +831,7 @@ impl MetalBackend {
         let args = ReduceArgs::new(input, output_shape, dim)?;
         let output = self.allocate(output_shape.nbytes(dtype))?;
         self.dispatch_reduce(
-            reduce_kernel(op, float(input_dtype)?),
+            reduce_kernel(op, input_dtype)?,
             input,
             &args,
             output_shape.numel(),
@@ -874,7 +873,7 @@ impl MetalBackend {
         let lhs = copied_view(lhs_input.view, lhs_input.copy.as_ref(), &lhs_layout);
         let rhs = copied_view(rhs_input.view, rhs_input.copy.as_ref(), &rhs_layout);
         self.dispatch_matmul(
-            matmul_kernel(float(dtype)?),
+            matmul_kernel(dtype)?,
             &lhs,
             &rhs,
             &dispatch.args,
@@ -891,7 +890,7 @@ impl MetalBackend {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        let kernel = to_dtype_kernel(float(dtype_from)?, float(dtype)?);
+        let kernel = to_dtype_kernel(dtype_from, dtype)?;
         self.dispatch_strided(kernel, &[input], &output)?;
         Ok(output)
     }
@@ -906,7 +905,7 @@ impl MetalBackend {
         let args = IndexSelectArgs::new(table, indices, output_shape)?;
         let output = self.allocate(output_shape.nbytes(dtype))?;
         self.dispatch_index_select(
-            index_select_kernel(float(dtype)?),
+            index_select_kernel(dtype)?,
             table,
             indices,
             &args,
@@ -924,7 +923,7 @@ impl MetalBackend {
         output_shape: &Shape,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let kernel = slice_scatter_kernel(float(dtype)?);
+        let kernel = slice_scatter_kernel(dtype)?;
         let mut output = self.allocate(output_shape.nbytes(dtype))?;
         let layout = Layout::contiguous(*output_shape);
         let rhs_offset = slice_offset(&layout, dim, lhs.layout.shape().dims().get(dim).copied())
@@ -1094,7 +1093,7 @@ impl Backend for MetalBackend {
         let offset = slice_offset(layout, dim, Some(start)).ok_or_else(|| invalid_operation(op))?;
         let window = StridedArgs::window(layout, src.layout.shape(), offset)?;
         self.dispatch_write(
-            slice_scatter_kernel(float(target.dtype())?),
+            slice_scatter_kernel(target.dtype())?,
             &src,
             &window,
             target.storage_mut(),
@@ -1124,101 +1123,108 @@ fn copy_kernel(dtype: DType) -> &'static str {
 }
 
 fn to_dtype_kernel(
-    dtype_from: FloatDType,
-    dtype_to: FloatDType,
-) -> &'static str {
-    match (dtype_from, dtype_to) {
-        (FloatDType::F32, FloatDType::F32) => "to_dtype_f32_f32",
-        (FloatDType::F32, FloatDType::F16) => "to_dtype_f32_f16",
-        (FloatDType::F32, FloatDType::BF16) => "to_dtype_f32_bf16",
-        (FloatDType::F16, FloatDType::F32) => "to_dtype_f16_f32",
-        (FloatDType::F16, FloatDType::F16) => "to_dtype_f16_f16",
-        (FloatDType::F16, FloatDType::BF16) => "to_dtype_f16_bf16",
-        (FloatDType::BF16, FloatDType::F32) => "to_dtype_bf16_f32",
-        (FloatDType::BF16, FloatDType::F16) => "to_dtype_bf16_f16",
-        (FloatDType::BF16, FloatDType::BF16) => "to_dtype_bf16_bf16",
-    }
+    dtype_from: DType,
+    dtype_to: DType,
+) -> Result<&'static str, MetalError> {
+    Ok(match (dtype_from, dtype_to) {
+        (DType::F32, DType::F32) => "to_dtype_f32_f32",
+        (DType::F32, DType::F16) => "to_dtype_f32_f16",
+        (DType::F32, DType::BF16) => "to_dtype_f32_bf16",
+        (DType::F16, DType::F32) => "to_dtype_f16_f32",
+        (DType::F16, DType::F16) => "to_dtype_f16_f16",
+        (DType::F16, DType::BF16) => "to_dtype_f16_bf16",
+        (DType::BF16, DType::F32) => "to_dtype_bf16_f32",
+        (DType::BF16, DType::F16) => "to_dtype_bf16_f16",
+        (DType::BF16, DType::BF16) => "to_dtype_bf16_bf16",
+        (DType::U32, _) | (_, DType::U32) => return Err(not_float(DType::U32)),
+    })
 }
 
 fn unary_kernel(
     op: UnaryOp,
-    dtype: FloatDType,
-) -> &'static str {
-    match (op, dtype) {
-        (UnaryOp::Neg, FloatDType::F32) => "unary_neg_f32",
-        (UnaryOp::Neg, FloatDType::F16) => "unary_neg_f16",
-        (UnaryOp::Neg, FloatDType::BF16) => "unary_neg_bf16",
-        (UnaryOp::Exp, FloatDType::F32) => "unary_exp_f32",
-        (UnaryOp::Exp, FloatDType::F16) => "unary_exp_f16",
-        (UnaryOp::Exp, FloatDType::BF16) => "unary_exp_bf16",
-        (UnaryOp::Sqrt, FloatDType::F32) => "unary_sqrt_f32",
-        (UnaryOp::Sqrt, FloatDType::F16) => "unary_sqrt_f16",
-        (UnaryOp::Sqrt, FloatDType::BF16) => "unary_sqrt_bf16",
-        (UnaryOp::Reciprocal, FloatDType::F32) => "unary_reciprocal_f32",
-        (UnaryOp::Reciprocal, FloatDType::F16) => "unary_reciprocal_f16",
-        (UnaryOp::Reciprocal, FloatDType::BF16) => "unary_reciprocal_bf16",
-    }
+    dtype: DType,
+) -> Result<&'static str, MetalError> {
+    Ok(match (op, dtype) {
+        (UnaryOp::Neg, DType::F32) => "unary_neg_f32",
+        (UnaryOp::Neg, DType::F16) => "unary_neg_f16",
+        (UnaryOp::Neg, DType::BF16) => "unary_neg_bf16",
+        (UnaryOp::Exp, DType::F32) => "unary_exp_f32",
+        (UnaryOp::Exp, DType::F16) => "unary_exp_f16",
+        (UnaryOp::Exp, DType::BF16) => "unary_exp_bf16",
+        (UnaryOp::Sqrt, DType::F32) => "unary_sqrt_f32",
+        (UnaryOp::Sqrt, DType::F16) => "unary_sqrt_f16",
+        (UnaryOp::Sqrt, DType::BF16) => "unary_sqrt_bf16",
+        (UnaryOp::Reciprocal, DType::F32) => "unary_reciprocal_f32",
+        (UnaryOp::Reciprocal, DType::F16) => "unary_reciprocal_f16",
+        (UnaryOp::Reciprocal, DType::BF16) => "unary_reciprocal_bf16",
+        (_, DType::U32) => return Err(not_float(dtype)),
+    })
 }
 
 fn binary_kernel(
     op: BinaryOp,
-    dtype: FloatDType,
-) -> &'static str {
-    match (op, dtype) {
-        (BinaryOp::Add, FloatDType::F32) => "binary_add_f32",
-        (BinaryOp::Add, FloatDType::F16) => "binary_add_f16",
-        (BinaryOp::Add, FloatDType::BF16) => "binary_add_bf16",
-        (BinaryOp::Sub, FloatDType::F32) => "binary_sub_f32",
-        (BinaryOp::Sub, FloatDType::F16) => "binary_sub_f16",
-        (BinaryOp::Sub, FloatDType::BF16) => "binary_sub_bf16",
-        (BinaryOp::Mul, FloatDType::F32) => "binary_mul_f32",
-        (BinaryOp::Mul, FloatDType::F16) => "binary_mul_f16",
-        (BinaryOp::Mul, FloatDType::BF16) => "binary_mul_bf16",
-        (BinaryOp::Div, FloatDType::F32) => "binary_div_f32",
-        (BinaryOp::Div, FloatDType::F16) => "binary_div_f16",
-        (BinaryOp::Div, FloatDType::BF16) => "binary_div_bf16",
-    }
+    dtype: DType,
+) -> Result<&'static str, MetalError> {
+    Ok(match (op, dtype) {
+        (BinaryOp::Add, DType::F32) => "binary_add_f32",
+        (BinaryOp::Add, DType::F16) => "binary_add_f16",
+        (BinaryOp::Add, DType::BF16) => "binary_add_bf16",
+        (BinaryOp::Sub, DType::F32) => "binary_sub_f32",
+        (BinaryOp::Sub, DType::F16) => "binary_sub_f16",
+        (BinaryOp::Sub, DType::BF16) => "binary_sub_bf16",
+        (BinaryOp::Mul, DType::F32) => "binary_mul_f32",
+        (BinaryOp::Mul, DType::F16) => "binary_mul_f16",
+        (BinaryOp::Mul, DType::BF16) => "binary_mul_bf16",
+        (BinaryOp::Div, DType::F32) => "binary_div_f32",
+        (BinaryOp::Div, DType::F16) => "binary_div_f16",
+        (BinaryOp::Div, DType::BF16) => "binary_div_bf16",
+        (_, DType::U32) => return Err(not_float(dtype)),
+    })
 }
 
 fn reduce_kernel(
     op: ReduceOp,
-    dtype: FloatDType,
-) -> &'static str {
-    match (op, dtype) {
-        (ReduceOp::Sum, FloatDType::F32) => "reduce_sum_f32",
-        (ReduceOp::Sum, FloatDType::F16) => "reduce_sum_f16",
-        (ReduceOp::Sum, FloatDType::BF16) => "reduce_sum_bf16",
-        (ReduceOp::Amax, FloatDType::F32) => "reduce_amax_f32",
-        (ReduceOp::Amax, FloatDType::F16) => "reduce_amax_f16",
-        (ReduceOp::Amax, FloatDType::BF16) => "reduce_amax_bf16",
-        (ReduceOp::Argmax, FloatDType::F32) => "reduce_argmax_f32",
-        (ReduceOp::Argmax, FloatDType::F16) => "reduce_argmax_f16",
-        (ReduceOp::Argmax, FloatDType::BF16) => "reduce_argmax_bf16",
-    }
+    dtype: DType,
+) -> Result<&'static str, MetalError> {
+    Ok(match (op, dtype) {
+        (ReduceOp::Sum, DType::F32) => "reduce_sum_f32",
+        (ReduceOp::Sum, DType::F16) => "reduce_sum_f16",
+        (ReduceOp::Sum, DType::BF16) => "reduce_sum_bf16",
+        (ReduceOp::Amax, DType::F32) => "reduce_amax_f32",
+        (ReduceOp::Amax, DType::F16) => "reduce_amax_f16",
+        (ReduceOp::Amax, DType::BF16) => "reduce_amax_bf16",
+        (ReduceOp::Argmax, DType::F32) => "reduce_argmax_f32",
+        (ReduceOp::Argmax, DType::F16) => "reduce_argmax_f16",
+        (ReduceOp::Argmax, DType::BF16) => "reduce_argmax_bf16",
+        (_, DType::U32) => return Err(not_float(dtype)),
+    })
 }
 
-fn matmul_kernel(dtype: FloatDType) -> &'static str {
-    match dtype {
-        FloatDType::F32 => "matmul_f32",
-        FloatDType::F16 => "matmul_f16",
-        FloatDType::BF16 => "matmul_bf16",
-    }
+fn matmul_kernel(dtype: DType) -> Result<&'static str, MetalError> {
+    Ok(match dtype {
+        DType::F32 => "matmul_f32",
+        DType::F16 => "matmul_f16",
+        DType::BF16 => "matmul_bf16",
+        DType::U32 => return Err(not_float(dtype)),
+    })
 }
 
-fn index_select_kernel(dtype: FloatDType) -> &'static str {
-    match dtype {
-        FloatDType::F32 => "index_select_f32",
-        FloatDType::F16 => "index_select_f16",
-        FloatDType::BF16 => "index_select_bf16",
-    }
+fn index_select_kernel(dtype: DType) -> Result<&'static str, MetalError> {
+    Ok(match dtype {
+        DType::F32 => "index_select_f32",
+        DType::F16 => "index_select_f16",
+        DType::BF16 => "index_select_bf16",
+        DType::U32 => return Err(not_float(dtype)),
+    })
 }
 
-fn slice_scatter_kernel(dtype: FloatDType) -> &'static str {
-    match dtype {
-        FloatDType::F32 => "slice_scatter_f32",
-        FloatDType::F16 => "slice_scatter_f16",
-        FloatDType::BF16 => "slice_scatter_bf16",
-    }
+fn slice_scatter_kernel(dtype: DType) -> Result<&'static str, MetalError> {
+    Ok(match dtype {
+        DType::F32 => "slice_scatter_f32",
+        DType::F16 => "slice_scatter_f16",
+        DType::BF16 => "slice_scatter_bf16",
+        DType::U32 => return Err(not_float(dtype)),
+    })
 }
 
 fn is_matmul_ready(
@@ -1231,11 +1237,9 @@ fn is_matmul_ready(
     is_row_major || is_transposed
 }
 
-fn float(dtype: DType) -> Result<FloatDType, MetalError> {
-    dtype.float().ok_or_else(|| {
-        error!(message = "Kernel needs a float dtype.", ?dtype);
-        MetalError::DTypeNotFloat
-    })
+fn not_float(dtype: DType) -> MetalError {
+    error!(message = "Kernel needs a float dtype.", ?dtype);
+    MetalError::DTypeNotFloat
 }
 
 fn invalid_operation(op: Op) -> MetalError {

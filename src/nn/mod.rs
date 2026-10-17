@@ -18,7 +18,6 @@ pub use self::activation::{
 pub use self::attention::scaled_dot_product_attention;
 pub use self::dtype::{
     DType,
-    FloatDType,
     MAX_ITEMSIZE,
     exact_f32,
 };
