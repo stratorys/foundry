@@ -40,9 +40,6 @@ pub enum LlamaError {
     #[error("Tensor dtype is not the model dtype.")]
     TensorDTypeMismatch,
 
-    #[error("Key-value width overflows usize.")]
-    KvDimOverflow,
-
     #[error("Maximum sequence length exceeds the allowed length.")]
     MaxCacheLenTooLarge,
 

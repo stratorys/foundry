@@ -30,20 +30,6 @@ impl Layout {
 
     pub fn storage_offset(&self) -> usize { self.storage_offset }
 
-    pub fn stride(
-        &self,
-        dim: usize,
-    ) -> Result<usize, TensorError> {
-        self.strides().get(dim).copied().ok_or_else(|| {
-            error!(
-                message = "Dimension is out of range.",
-                dim,
-                ndim = self.shape.ndim()
-            );
-            TensorError::DimOutOfRange
-        })
-    }
-
     pub fn is_contiguous(&self) -> bool {
         let expected = contiguous_strides(&self.shape);
         self.shape
@@ -112,7 +98,7 @@ impl Layout {
         length: usize,
     ) -> Result<Self, TensorError> {
         let size = self.shape.size(dim)?;
-        let stride = self.stride(dim)?;
+        let stride = self.strides().get(dim).copied().unwrap_or_default();
         let out_of_bounds = || {
             error!(
                 message = "Narrow exceeds the dimension.",

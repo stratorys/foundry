@@ -9,15 +9,13 @@ kernel void copy_strided(device const T *input [[buffer(0)]],
   output[gid] = input[strided_index(gid, args)];
 }
 
-template [[host_name("copy_f32")]] kernel void
-copy_strided<float>(device const float *, device float *,
-                    constant StridedArgs &, uint);
-template [[host_name("copy_bf16")]] kernel void
-copy_strided<bf16_t>(device const bf16_t *, device bf16_t *,
-                     constant StridedArgs &, uint);
-template [[host_name("copy_u32")]] kernel void
-copy_strided<uint>(device const uint *, device uint *, constant StridedArgs &,
-                   uint);
+#define INSTANTIATE_COPY(name, T)                                              \
+  template [[host_name(name)]] kernel void copy_strided<T>(                    \
+      device const T *, device T *, constant StridedArgs &, uint);
+
+INSTANTIATE_COPY("copy_f32", float)
+INSTANTIATE_COPY("copy_bf16", bf16_t)
+INSTANTIATE_COPY("copy_u32", uint)
 
 template <typename In, typename Out>
 kernel void to_dtype_strided(device const In *input [[buffer(0)]],

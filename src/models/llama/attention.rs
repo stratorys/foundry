@@ -45,13 +45,7 @@ impl<D: Device> LlamaAttention<D> {
         let hidden_size = config.hidden_size();
         let num_key_value_heads = config.num_key_value_heads();
         let head_dim = config.head_dim();
-        let kv_dim = num_key_value_heads.checked_mul(head_dim).ok_or_else(|| {
-            error!(
-                message = "Key-value width overflows usize.",
-                num_key_value_heads, head_dim,
-            );
-            LlamaError::KvDimOverflow
-        })?;
+        let kv_dim = num_key_value_heads.saturating_mul(head_dim);
         let mut linear = |name: &str, dims: [usize; 2]| {
             load_tensor(device, weights, &format!("{prefix}.{name}.weight"), &dims).map(Linear::new)
         };

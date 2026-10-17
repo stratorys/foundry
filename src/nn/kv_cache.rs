@@ -73,12 +73,7 @@ impl<D: Device> StaticCache<D> {
         };
         keys.slice_scatter(device, key_states, SEQ_DIM, past_seen_tokens)?;
         values.slice_scatter(device, value_states, SEQ_DIM, past_seen_tokens)?;
-        let kv_length = past_seen_tokens
-            .checked_add(key_states.shape().size(SEQ_DIM)?)
-            .ok_or_else(|| {
-                error!(message = "Narrow exceeds the dimension.", past_seen_tokens);
-                TensorError::NarrowOutOfBounds
-            })?;
+        let kv_length = past_seen_tokens.saturating_add(key_states.shape().size(SEQ_DIM)?);
         Ok([
             keys.narrow(SEQ_DIM, 0, kv_length)?,
             values.narrow(SEQ_DIM, 0, kv_length)?,

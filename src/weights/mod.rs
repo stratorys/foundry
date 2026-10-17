@@ -60,13 +60,6 @@ struct TensorEntry {
     byte_range: Range<usize>,
 }
 
-struct ShardTensor {
-    name: String,
-    dtype: DType,
-    shape: Shape,
-    byte_range: Range<usize>,
-}
-
 #[derive(Deserialize)]
 struct IndexFile {
     #[serde(default)]
@@ -88,15 +81,9 @@ impl Weights {
         } else {
             None
         };
-        let shard_names: Vec<String> = match &index {
-            Some(index) => index
-                .weight_map
-                .values()
-                .cloned()
-                .collect::<BTreeSet<String>>()
-                .into_iter()
-                .collect(),
-            None => vec![SINGLE_FILE.to_owned()],
+        let shard_names: BTreeSet<String> = match &index {
+            Some(index) => index.weight_map.values().cloned().collect(),
+            None => BTreeSet::from([SINGLE_FILE.to_owned()]),
         };
         let shards = shard_names
             .into_iter()
@@ -203,11 +190,13 @@ impl<S: AsRef<[u8]>> Weights<S> {
                 .iter()
                 .zip(0..)
                 .try_fold(HashMap::new(), |tensors, (shard, shard_index)| {
-                    parse_shard(&directory.join(&shard.name), shard.bytes.as_ref())?
-                        .into_iter()
-                        .try_fold(tensors, |tensors, tensor| {
-                            insert_tensor(tensors, shard_index, tensor)
-                        })
+                    parse_shard(
+                        &directory.join(&shard.name),
+                        shard.bytes.as_ref(),
+                        shard_index,
+                    )?
+                    .into_iter()
+                    .try_fold(tensors, insert_tensor)
                 })?;
         if let Some(index) = &index {
             check_index(&index.weight_map, &shards, &tensors)?;
@@ -292,7 +281,8 @@ fn open_shard(
 fn parse_shard(
     path: &Path,
     bytes: &[u8],
-) -> Result<Vec<ShardTensor>, WeightsError> {
+    shard_index: usize,
+) -> Result<Vec<(String, TensorEntry)>, WeightsError> {
     let (header_bytes, metadata) = SafeTensors::read_metadata(bytes).map_err(|error| {
         error!(
             message = "Safetensors header is invalid.",
@@ -307,7 +297,7 @@ fn parse_shard(
     metadata
         .tensors()
         .into_iter()
-        .map(|(name, info)| parse_tensor(name, info, data_start))
+        .map(|(name, info)| parse_tensor(name, info, data_start, shard_index))
         .collect()
 }
 
@@ -315,7 +305,8 @@ fn parse_tensor(
     name: String,
     info: &TensorInfo,
     data_start: usize,
-) -> Result<ShardTensor, WeightsError> {
+    shard_index: usize,
+) -> Result<(String, TensorEntry), WeightsError> {
     let Some(dtype) = parse_dtype(info.dtype) else {
         error!(
             message = "Tensor has an unknown dtype.",
@@ -333,20 +324,22 @@ fn parse_tensor(
     else {
         return Err(WeightsError::InvalidHeader);
     };
-    Ok(ShardTensor {
+    Ok((
         name,
-        dtype,
-        shape,
-        byte_range: start..stop,
-    })
+        TensorEntry {
+            dtype,
+            shape,
+            shard_index,
+            byte_range: start..stop,
+        },
+    ))
 }
 
 fn insert_tensor(
     mut tensors: HashMap<String, TensorEntry>,
-    shard_index: usize,
-    tensor: ShardTensor,
+    (name, tensor): (String, TensorEntry),
 ) -> Result<HashMap<String, TensorEntry>, WeightsError> {
-    match tensors.entry(tensor.name) {
+    match tensors.entry(name) {
         Entry::Occupied(occupied) => {
             error!(
                 message = "Tensor appears in more than one shard.",
@@ -355,12 +348,7 @@ fn insert_tensor(
             return Err(WeightsError::DuplicateTensor);
         }
         Entry::Vacant(vacant) => {
-            vacant.insert(TensorEntry {
-                dtype: tensor.dtype,
-                shape: tensor.shape,
-                shard_index,
-                byte_range: tensor.byte_range,
-            });
+            vacant.insert(tensor);
         }
     }
     Ok(tensors)
