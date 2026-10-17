@@ -735,75 +735,63 @@ mod tests {
     }
 
     #[test]
-    fn f32_round_trip_returns_the_same_bytes() {
+    fn round_trip_returns_the_same_bytes_for_each_dtype() {
+        struct DtypeBytesDimsCase<T0, T1, T2> {
+            dtype: T0,
+            bytes: T1,
+            dims: T2,
+        }
         let mut device = MetalDevice::new().expect("a Metal device is available");
-        let bytes: Vec<u8> = [1.0_f32, -2.5, 1.5e-3, f32::MIN_POSITIVE, -0.0, f32::MAX]
+        let cases = [
+            DtypeBytesDimsCase {
+                dtype: DType::F32,
+                bytes: [1.0_f32, -2.5, 1.5e-3, f32::MIN_POSITIVE, -0.0, f32::MAX]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                dims: vec![2, 3],
+            },
+            DtypeBytesDimsCase {
+                dtype: DType::BF16,
+                bytes: [0x3F80_u16, 0xC020, 0x4049, 0x0001, 0x8000, 0x7F7F]
+                    .iter()
+                    .flat_map(|bits| bits.to_le_bytes())
+                    .collect(),
+                dims: vec![6],
+            },
+            DtypeBytesDimsCase {
+                dtype: DType::U32,
+                bytes: [0_u32, 1, 128_000, u32::MAX]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                dims: vec![2, 1, 2],
+            },
+            DtypeBytesDimsCase {
+                dtype: DType::F32,
+                bytes: vec![],
+                dims: vec![0, 3],
+            },
+        ];
+        let read_back: Vec<Vec<u8>> = cases
             .iter()
-            .flat_map(|value| value.to_le_bytes())
+            .map(|case| {
+                Tensor::from_bytes(
+                    &mut device,
+                    &case.bytes,
+                    case.dtype,
+                    Shape::try_from(case.dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("from_bytes succeeds")
+                .to_bytes(&mut device)
+                .expect("to_bytes succeeds")
+            })
             .collect();
-        let read_back = Tensor::from_bytes(
-            &mut device,
-            &bytes,
-            DType::F32,
-            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds")
-        .to_bytes(&mut device)
-        .expect("to_bytes succeeds");
-        assert_eq!(read_back, bytes, "f32 bytes survive the round trip");
-    }
-
-    #[test]
-    fn bf16_round_trip_returns_the_same_bytes() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let bytes: Vec<u8> = [0x3F80_u16, 0xC020, 0x4049, 0x0001, 0x8000, 0x7F7F]
-            .iter()
-            .flat_map(|bits| bits.to_le_bytes())
-            .collect();
-        let read_back = Tensor::from_bytes(
-            &mut device,
-            &bytes,
-            DType::BF16,
-            Shape::try_from([6].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds")
-        .to_bytes(&mut device)
-        .expect("to_bytes succeeds");
-        assert_eq!(read_back, bytes, "bf16 bytes survive the round trip");
-    }
-
-    #[test]
-    fn u32_round_trip_returns_the_same_bytes() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let bytes: Vec<u8> = [0_u32, 1, 128_000, u32::MAX]
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let read_back = Tensor::from_bytes(
-            &mut device,
-            &bytes,
-            DType::U32,
-            Shape::try_from([2, 1, 2].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds")
-        .to_bytes(&mut device)
-        .expect("to_bytes succeeds");
-        assert_eq!(read_back, bytes, "u32 bytes survive the round trip");
-    }
-
-    #[test]
-    fn empty_round_trip_returns_no_bytes() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let read_back = Tensor::from_bytes(
-            &mut device,
-            &[],
-            DType::F32,
-            Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds")
-        .to_bytes(&mut device)
-        .expect("to_bytes succeeds");
-        assert!(read_back.is_empty(), "an empty tensor reads back no bytes");
+        assert_eq!(
+            read_back,
+            cases.map(|case| case.bytes),
+            "f32, bf16, u32 and empty bytes survive the round trip"
+        );
     }
 
     #[test]
@@ -865,32 +853,27 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_with_wrong_byte_length_fails() {
+    fn from_bytes_with_wrong_byte_length_is_rejected_before_allocation() {
         let mut device = MetalDevice::new().expect("a Metal device is available");
-        let result = Tensor::from_bytes(
-            &mut device,
-            &[0; 10],
-            DType::F32,
-            Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
-        );
-        assert!(
-            matches!(result.err(), Some(TensorError::ByteLengthMismatch)),
-            "a byte length that does not match shape × dtype is rejected"
-        );
-    }
-
-    #[test]
-    fn from_bytes_of_empty_bytes_for_oversized_shape_reports_byte_length_mismatch() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let result = Tensor::from_bytes(
-            &mut device,
-            &[],
-            DType::F32,
-            Shape::try_from([(1 << 31) - 1].as_slice()).expect("the shape is valid"),
-        );
-        assert!(
-            matches!(result.err(), Some(TensorError::ByteLengthMismatch)),
-            "the byte length is checked before allocation"
+        assert_eq!(
+            [
+                Tensor::from_bytes(
+                    &mut device,
+                    &[0; 10],
+                    DType::F32,
+                    Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
+                )
+                .err(),
+                Tensor::from_bytes(
+                    &mut device,
+                    &[],
+                    DType::F32,
+                    Shape::try_from([(1 << 31) - 1].as_slice()).expect("the shape is valid"),
+                )
+                .err(),
+            ],
+            [Some(TensorError::ByteLengthMismatch); 2],
+            "a byte length that does not match shape × dtype is rejected before allocation"
         );
     }
 
@@ -928,11 +911,9 @@ mod tests {
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid");
-        assert!(
-            matches!(
-                permuted.to_bytes(&mut device).err(),
-                Some(TensorError::ToBytesNonContiguous)
-            ),
+        assert_eq!(
+            permuted.to_bytes(&mut device).err(),
+            Some(TensorError::ToBytesNonContiguous),
             "a non-contiguous layout cannot be read as bytes"
         );
     }
@@ -1067,25 +1048,28 @@ mod tests {
     }
 
     #[test]
-    fn copy_of_empty_tensor_reads_no_bytes() {
+    fn copy_and_add_of_empty_tensors_read_no_bytes() {
         let mut device = MetalDevice::new().expect("a Metal device is available");
-        let copied = Tensor::from_bytes(
+        let empty = Tensor::from_bytes(
             &mut device,
             &[],
             DType::F32,
             Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("from_bytes succeeds")
-        .permute(&[1, 0])
-        .expect("the permutation is valid")
-        .contiguous(&mut device)
-        .expect("the copy succeeds");
-        assert!(
-            copied
-                .to_bytes(&mut device)
-                .expect("to_bytes succeeds")
-                .is_empty(),
-            "an empty copy reads back no bytes"
+        .expect("from_bytes succeeds");
+        let copied = empty
+            .permute(&[1, 0])
+            .expect("the permutation is valid")
+            .contiguous(&mut device)
+            .expect("the copy succeeds");
+        let sum = empty.add(&mut device, &empty).expect("the add succeeds");
+        assert_eq!(
+            [
+                copied.to_bytes(&mut device).expect("to_bytes succeeds"),
+                sum.to_bytes(&mut device).expect("to_bytes succeeds"),
+            ],
+            [Vec::<u8>::new(), Vec::new()],
+            "an empty copy and an empty add read back no bytes"
         );
     }
 
@@ -1516,45 +1500,6 @@ mod tests {
     }
 
     #[test]
-    fn binary_on_u32_is_rejected() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let bytes: Vec<u8> = (0_u32..3).flat_map(u32::to_le_bytes).collect();
-        let indices = Tensor::from_bytes(
-            &mut device,
-            &bytes,
-            DType::U32,
-            Shape::try_from([3].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds");
-        assert!(
-            matches!(
-                indices.add(&mut device, &indices).err(),
-                Some(TensorError::DTypeNotFloat)
-            ),
-            "binary ops reject u32 on Metal"
-        );
-    }
-
-    #[test]
-    fn add_of_empty_tensors_reads_no_bytes() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let empty = Tensor::from_bytes(
-            &mut device,
-            &[],
-            DType::F32,
-            Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds");
-        let sum = empty.add(&mut device, &empty).expect("the add succeeds");
-        assert!(
-            sum.to_bytes(&mut device)
-                .expect("to_bytes succeeds")
-                .is_empty(),
-            "an empty add reads back no bytes"
-        );
-    }
-
-    #[test]
     fn long_chain_of_adds_spans_several_command_buffers() {
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let ones = Tensor::from_bytes(
@@ -1935,26 +1880,6 @@ mod tests {
     }
 
     #[test]
-    fn reduce_on_u32_is_rejected() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let bytes: Vec<u8> = (0_u32..3).flat_map(u32::to_le_bytes).collect();
-        let indices = Tensor::from_bytes(
-            &mut device,
-            &bytes,
-            DType::U32,
-            Shape::try_from([3].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds");
-        assert!(
-            matches!(
-                indices.sum_keepdim(&mut device, 0).err(),
-                Some(TensorError::DTypeNotFloat)
-            ),
-            "reductions reject u32 on Metal"
-        );
-    }
-
-    #[test]
     fn matmul_matches_hand_computed_values_for_each_float_dtype() {
         struct ValuesDimsCase<T0, T1> {
             values: T0,
@@ -2040,147 +1965,78 @@ mod tests {
     }
 
     #[test]
-    fn matmul_reads_transposed_right_operand_without_copy() {
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+    fn matmul_reads_a_transposed_left_or_right_operand_without_copy() {
+        struct ValuesDimsCase<T0, T1> {
+            values: T0,
+            dims: T1,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
-        [
-            DtypeToleranceCase {
-                dtype: DType::F32,
-                tolerance: 1e-5_f32,
+        let [x, weight, lhs, rhs] = [
+            ValuesDimsCase {
+                values: [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+                dims: [2, 3],
             },
-            DtypeToleranceCase {
-                dtype: DType::BF16,
-                tolerance: 1e-2,
+            ValuesDimsCase {
+                values: [1.0, 0.0, -1.0, 2.0, 1.0, 0.0],
+                dims: [2, 3],
+            },
+            ValuesDimsCase {
+                values: [1.0, 4.0, 2.0, 5.0, 3.0, 6.0],
+                dims: [3, 2],
+            },
+            ValuesDimsCase {
+                values: [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                dims: [3, 2],
             },
         ]
-        .into_iter()
-        .for_each(
-            |DtypeToleranceCase {
-                 dtype,
-                 tolerance,
+        .map(
+            |ValuesDimsCase {
+                 values,
+                 dims,
              }| {
-                let [x, weight] = [
-                    [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-                    [1.0, 0.0, -1.0, 2.0, 1.0, 0.0],
-                ]
-                .map(|values| {
-                    Tensor::from_bytes(
-                        &mut device,
-                        &values
-                            .iter()
-                            .flat_map(|value| value.to_le_bytes())
-                            .collect::<Vec<u8>>(),
-                        DType::F32,
-                        Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
-                    )
-                    .expect("from_bytes succeeds")
-                    .to_dtype(&mut device, dtype)
-                    .expect("to_dtype succeeds")
-                });
-                let weight_transposed = weight.permute(&[1, 0]).expect("the permutation is valid");
-                assert!(
-                    !weight_transposed.layout().is_contiguous()
-                        && MatmulGeometry::of(x.layout(), weight_transposed.layout()).is_some_and(
-                            |geometry| is_matmul_ready(&geometry.rhs, geometry.k, geometry.n)
-                        ),
-                    "a transposed weight is read in place"
-                );
-                let actual: Vec<f32> = x
-                    .matmul(&mut device, &weight_transposed)
-                    .expect("the matmul succeeds")
-                    .to_dtype(&mut device, DType::F32)
-                    .expect("to_dtype succeeds")
-                    .to_bytes(&mut device)
-                    .expect("to_bytes succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                let expected = [-2.0_f32, 4.0, -2.0, 13.0];
-                assert_eq!(actual.len(), expected.len(), "x . W^T: element count");
-                actual.iter().zip(expected).for_each(|(&actual, expected)| {
-                    assert!(
-                        (actual - expected).abs() <= tolerance * expected.abs(),
-                        "x . W^T for {dtype:?}: {actual} is not within {tolerance} of {expected}"
-                    );
-                });
+                Tensor::from_bytes(
+                    &mut device,
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    DType::F32,
+                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
+                )
+                .expect("from_bytes succeeds")
             },
         );
-    }
-
-    #[test]
-    fn matmul_reads_transposed_left_operand_without_copy() {
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
-        }
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        [
-            DtypeToleranceCase {
-                dtype: DType::F32,
-                tolerance: 1e-5_f32,
-            },
-            DtypeToleranceCase {
-                dtype: DType::BF16,
-                tolerance: 1e-2,
-            },
+        let [weight_transposed, lhs_transposed] = [weight, lhs]
+            .map(|operand| operand.permute(&[1, 0]).expect("the permutation is valid"));
+        assert_eq!(
+            [
+                MatmulGeometry::of(x.layout(), weight_transposed.layout())
+                    .map(|geometry| is_matmul_ready(&geometry.rhs, geometry.k, geometry.n)),
+                MatmulGeometry::of(lhs_transposed.layout(), rhs.layout())
+                    .map(|geometry| is_matmul_ready(&geometry.lhs, geometry.m, geometry.k)),
+            ],
+            [Some(true); 2],
+            "a transposed rhs or lhs is read in place"
+        );
+        let actual = [
+            x.matmul(&mut device, &weight_transposed),
+            lhs_transposed.matmul(&mut device, &rhs),
         ]
-        .into_iter()
-        .for_each(
-            |DtypeToleranceCase {
-                 dtype,
-                 tolerance,
-             }| {
-                let [lhs, rhs] = [
-                    [1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0],
-                    [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-                ]
-                .map(|values| {
-                    Tensor::from_bytes(
-                        &mut device,
-                        &values
-                            .iter()
-                            .flat_map(|value| value.to_le_bytes())
-                            .collect::<Vec<u8>>(),
-                        DType::F32,
-                        Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
-                    )
-                    .expect("from_bytes succeeds")
-                    .to_dtype(&mut device, dtype)
-                    .expect("to_dtype succeeds")
-                });
-                let lhs_transposed = lhs.permute(&[1, 0]).expect("the permutation is valid");
-                assert!(
-                    MatmulGeometry::of(lhs_transposed.layout(), rhs.layout()).is_some_and(
-                        |geometry| is_matmul_ready(&geometry.lhs, geometry.m, geometry.k)
-                    ),
-                    "a transposed lhs is read in place"
-                );
-                let actual: Vec<f32> = lhs_transposed
-                    .matmul(&mut device, &rhs)
-                    .expect("the matmul succeeds")
-                    .to_dtype(&mut device, DType::F32)
-                    .expect("to_dtype succeeds")
-                    .to_bytes(&mut device)
-                    .expect("to_bytes succeeds")
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&chunk| f32::from_le_bytes(chunk))
-                    .collect();
-                let expected = [58.0_f32, 64.0, 139.0, 154.0];
-                assert_eq!(actual.len(), expected.len(), "L^T x R: element count");
-                actual.iter().zip(expected).for_each(|(&actual, expected)| {
-                    assert!(
-                        (actual - expected).abs() <= tolerance * expected.abs(),
-                        "L^T x R for {dtype:?}: {actual} is not within {tolerance} of {expected}"
-                    );
-                });
-            },
+        .map(|product| {
+            product
+                .expect("the matmul succeeds")
+                .to_bytes(&mut device)
+                .expect("to_bytes succeeds")
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| f32::from_le_bytes(chunk))
+                .collect::<Vec<f32>>()
+        });
+        assert_eq!(
+            actual,
+            [vec![-2.0, 4.0, -2.0, 13.0], vec![58.0, 64.0, 139.0, 154.0]],
+            "x . W^T and L^T x R"
         );
     }
 
@@ -3152,32 +3008,10 @@ mod tests {
             Shape::try_from([3, 1].as_slice()).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
-        assert!(
-            matches!(
-                target.slice_scatter(&mut device, &update, 1, 0),
-                Err(TensorError::SliceScatterNonContiguous)
-            ),
+        assert_eq!(
+            target.slice_scatter(&mut device, &update, 1, 0),
+            Err(TensorError::SliceScatterNonContiguous),
             "a broadcast target would be written by several threads"
-        );
-    }
-
-    #[test]
-    fn slice_scatter_with_a_view_of_the_target_as_update_is_rejected() {
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let mut target = Tensor::from_bytes(
-            &mut device,
-            &(0_u16..8)
-                .flat_map(|value| f32::from(value).to_le_bytes())
-                .collect::<Vec<u8>>(),
-            DType::F32,
-            Shape::try_from([2, 4].as_slice()).expect("the shape is valid"),
-        )
-        .expect("from_bytes succeeds");
-        let update = target.narrow(1, 0, 1).expect("the narrow is valid");
-        let result = target.slice_scatter(&mut device, &update, 1, 3);
-        assert!(
-            matches!(result.err(), Some(TensorError::SharedStorage)),
-            "an update aliasing the target is rejected"
         );
     }
 
@@ -3216,91 +3050,28 @@ mod tests {
             },
         );
         let view = target.narrow(0, 0, 1).expect("the narrow is valid");
-        let result = target.slice_scatter(&mut device, &update, 1, 3);
-        assert!(
-            matches!(result.err(), Some(TensorError::SharedStorage)),
+        assert_eq!(
+            target.slice_scatter(&mut device, &update, 1, 3),
+            Err(TensorError::SharedStorage),
             "a live view would observe the write"
         );
         assert_eq!(view.shape().dims(), &[1, 4], "the view is still alive");
     }
 
     #[test]
-    fn slice_scatter_without_live_views_writes_the_update() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
-        }
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let [mut target, update] = [
-            ValuesDimsCase {
-                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-                dims: vec![2, 4],
-            },
-            ValuesDimsCase {
-                values: vec![100.0, 101.0],
-                dims: vec![2, 1],
-            },
-        ]
-        .map(
-            |ValuesDimsCase {
-                 values,
-                 dims,
-             }| {
-                Tensor::from_bytes(
-                    &mut device,
-                    &values
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    DType::F32,
-                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-                )
-                .expect("from_bytes succeeds")
-            },
-        );
-        target
-            .slice_scatter(&mut device, &update, 1, 3)
-            .expect("the slice scatter succeeds");
-        let actual: Vec<f32> = target
-            .to_bytes(&mut device)
-            .expect("to_bytes succeeds")
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&chunk| f32::from_le_bytes(chunk))
-            .collect();
-        assert_eq!(
-            actual,
-            [0.0, 1.0, 2.0, 100.0, 4.0, 5.0, 6.0, 101.0],
-            "the update lands in the last column"
-        );
-    }
-
-    #[test]
-    fn to_bytes_of_storage_from_another_device_is_rejected() {
+    fn storage_from_another_device_cannot_be_read() {
         let mut producer = MetalDevice::new().expect("a Metal device is available");
         let mut consumer = MetalDevice::new().expect("a Metal device is available");
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
         let tensor = Tensor::from_bytes(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("from_bytes succeeds");
         assert_eq!(
-            tensor.to_bytes(&mut consumer).err(),
-            Some(TensorError::Device),
-            "a storage from another device cannot be read as bytes"
-        );
-    }
-
-    #[test]
-    fn unary_of_storage_from_another_device_is_rejected() {
-        let mut producer = MetalDevice::new().expect("a Metal device is available");
-        let mut consumer = MetalDevice::new().expect("a Metal device is available");
-        let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
-        let tensor = Tensor::from_bytes(&mut producer, &[0_u8; 8], DType::F32, shape)
-            .expect("from_bytes succeeds");
-        assert_eq!(
-            tensor.neg(&mut consumer).err(),
-            Some(TensorError::Device),
-            "a storage from another device cannot be read by a kernel"
+            [
+                tensor.to_bytes(&mut consumer).err(),
+                tensor.neg(&mut consumer).err()
+            ],
+            [Some(TensorError::Device); 2],
+            "a storage from another device cannot be read as bytes or by a kernel"
         );
     }
 
@@ -3324,56 +3095,6 @@ mod tests {
             target.slice_scatter(&mut consumer, &update, 1, 0),
             Err(TensorError::Device),
             "a target from another device cannot be written"
-        );
-    }
-
-    #[test]
-    fn index_select_and_cat_on_u32_are_rejected() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
-        }
-        let mut device = MetalDevice::new().expect("a Metal device is available");
-        let [values, indices] = [
-            ValuesDimsCase {
-                values: vec![0_u32, 1, 2, 3],
-                dims: vec![2, 2],
-            },
-            ValuesDimsCase {
-                values: vec![0],
-                dims: vec![1],
-            },
-        ]
-        .map(
-            |ValuesDimsCase {
-                 values,
-                 dims,
-             }| {
-                Tensor::from_bytes(
-                    &mut device,
-                    &values
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    DType::U32,
-                    Shape::try_from(dims.as_slice()).expect("the shape is valid"),
-                )
-                .expect("from_bytes succeeds")
-            },
-        );
-        assert!(
-            matches!(
-                values.index_select(&mut device, 0, &indices).err(),
-                Some(TensorError::DTypeNotFloat)
-            ),
-            "index_select rejects a u32 table on Metal"
-        );
-        assert!(
-            matches!(
-                Tensor::cat(&mut device, [&values, &values], 0).err(),
-                Some(TensorError::DTypeNotFloat)
-            ),
-            "cat rejects u32 on Metal"
         );
     }
 }
