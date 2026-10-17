@@ -140,6 +140,40 @@ impl<S: AsRef<[u8]>> Weights<S> {
 
     pub fn total_size(&self) -> Option<u64> { self.total_size }
 
+    pub fn nbytes(&self) -> Result<u64, WeightsError> {
+        let nbytes = self.tensors().try_fold(0_u64, |nbytes, view| {
+            u64::try_from(view.bytes.len())
+                .ok()
+                .and_then(|tensor_nbytes| nbytes.checked_add(tensor_nbytes))
+                .ok_or_else(|| {
+                    error!(message = "Total tensor byte count overflows u64.");
+                    WeightsError::ByteCountOverflow
+                })
+        })?;
+        if let Some(total_size) = self.total_size
+            && nbytes != total_size
+        {
+            error!(
+                message = "Tensor byte count does not match the index declaration.",
+                nbytes, total_size,
+            );
+            return Err(WeightsError::ByteCountMismatch);
+        }
+        Ok(nbytes)
+    }
+
+    pub fn numel(&self) -> Result<u64, WeightsError> {
+        self.tensors().try_fold(0_u64, |numel, view| {
+            u64::try_from(view.shape.numel())
+                .ok()
+                .and_then(|tensor_numel| numel.checked_add(tensor_numel))
+                .ok_or_else(|| {
+                    error!(message = "Parameter count overflows u64.");
+                    WeightsError::ParameterCountOverflow
+                })
+        })
+    }
+
     fn view<'weights>(
         &'weights self,
         name: &'weights str,
@@ -428,6 +462,98 @@ mod tests {
         assert_eq!(weights.tensors().count(), 2, "metadata is not a tensor");
         assert_eq!(weights.shard_count(), 1, "single file is one shard");
         assert_eq!(weights.total_size(), None, "no index, no declared size");
+    }
+
+    #[test]
+    fn nbytes_sums_tensor_bytes() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] },
+            "b": { "dtype": "F32", "shape": [1], "data_offsets": [4, 8] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..8)
+            .collect();
+        let index = serde_json::to_vec(&json!({
+            "metadata": { "total_size": 8 },
+            "weight_map": { "a": "s1.safetensors", "b": "s1.safetensors" },
+        }))
+        .expect("the index serializes");
+        let weights = Weights::from_shards(
+            Some(&index),
+            vec![Shard {
+                name: "s1.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the shard is valid");
+        assert_eq!(
+            weights.nbytes(),
+            Ok(8),
+            "two tensors of four bytes matching the declared size"
+        );
+    }
+
+    #[test]
+    fn nbytes_rejects_a_declared_size_mismatch() {
+        let header = serde_json::to_vec(
+            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+        )
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..4)
+            .collect();
+        let index = serde_json::to_vec(&json!({
+            "metadata": { "total_size": 5 },
+            "weight_map": { "a": "s1.safetensors" },
+        }))
+        .expect("the index serializes");
+        let weights = Weights::from_shards(
+            Some(&index),
+            vec![Shard {
+                name: "s1.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the shard is valid");
+        assert_eq!(
+            weights.nbytes(),
+            Err(WeightsError::ByteCountMismatch),
+            "the index declares one byte more than the tensors hold"
+        );
+    }
+
+    #[test]
+    fn numel_sums_the_elements_of_every_tensor() {
+        let header = serde_json::to_vec(&json!({
+            "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 12] },
+            "b": { "dtype": "F32", "shape": [2], "data_offsets": [12, 20] },
+        }))
+        .expect("the header serializes");
+        let file: Vec<u8> = u64::try_from(header.len())
+            .expect("the header length fits in u64")
+            .to_le_bytes()
+            .into_iter()
+            .chain(header)
+            .chain(0..20)
+            .collect();
+        let weights = Weights::from_shards(
+            None,
+            vec![Shard {
+                name: "model.safetensors".to_owned(),
+                bytes: file,
+            }],
+        )
+        .expect("the file is valid");
+        assert_eq!(weights.numel(), Ok(8), "six bf16 and two f32 elements");
     }
 
     #[test]

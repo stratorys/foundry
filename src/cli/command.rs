@@ -353,14 +353,18 @@ fn metadata(
     test_time: String,
     git_commit: Option<String>,
 ) -> Result<Metadata, CliError> {
+    let size_error = |error| {
+        error!(message = "Measuring the model weights failed.", %model, %error);
+        CliError::WeightsSize
+    };
     Ok(Metadata {
         git_commit,
         test_time,
         device: DEVICE.to_owned(),
         device_name: String::new(),
         model_id: model.to_string(),
-        model_bytes: model_bytes(model, weights)?,
-        model_parameter_count: parameter_count(model, weights)?,
+        model_bytes: weights.nbytes().map_err(size_error)?,
+        model_parameter_count: weights.numel().map_err(size_error)?,
     })
 }
 
@@ -405,48 +409,6 @@ fn read_git_commit() -> Option<String> {
     commit
 }
 
-fn model_bytes<S: AsRef<[u8]>>(
-    model: &ModelId,
-    weights: &Weights<S>,
-) -> Result<u64, CliError> {
-    let bytes = weights.tensors().try_fold(0_u64, |bytes, view| {
-        u64::try_from(view.bytes.len())
-            .ok()
-            .and_then(|tensor_bytes| bytes.checked_add(tensor_bytes))
-            .ok_or_else(|| {
-                error!(message = "Total tensor byte count overflows u64.", %model);
-                CliError::TotalByteCountOverflow
-            })
-    })?;
-    if let Some(total_size) = weights.total_size()
-        && bytes != total_size
-    {
-        error!(
-            message = "Tensor byte count does not match the index declaration.",
-            %model,
-            bytes,
-            total_size,
-        );
-        return Err(CliError::BytesMismatch);
-    }
-    Ok(bytes)
-}
-
-fn parameter_count<S: AsRef<[u8]>>(
-    model: &ModelId,
-    weights: &Weights<S>,
-) -> Result<u64, CliError> {
-    weights.tensors().try_fold(0_u64, |parameter_count, view| {
-        u64::try_from(view.shape.numel())
-            .ok()
-            .and_then(|numel| parameter_count.checked_add(numel))
-            .ok_or_else(|| {
-                error!(message = "Parameter count overflows u64.", %model);
-                CliError::ParameterCountOverflow
-            })
-    })
-}
-
 fn write_report(
     out: &Path,
     file_name: &str,
@@ -485,19 +447,7 @@ fn write_token_ids(
 
 #[cfg(test)]
 mod tests {
-    use foundry::weights::{
-        Shard,
-        Weights,
-    };
-    use serde_json::json;
-
-    use crate::cli::ModelId;
-    use crate::cli::command::{
-        model_bytes,
-        parameter_count,
-        write_token_ids,
-    };
-    use crate::cli::error::CliError;
+    use crate::cli::command::write_token_ids;
 
     #[test]
     fn write_token_ids_prints_a_json_array() {
@@ -507,120 +457,6 @@ mod tests {
             String::from_utf8(out),
             Ok("[1,2,3]\n".to_owned()),
             "token IDs as a JSON array"
-        );
-    }
-
-    #[test]
-    fn model_bytes_sums_tensor_bytes() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] },
-            "b": { "dtype": "F32", "shape": [1], "data_offsets": [4, 8] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..8)
-            .collect();
-        let index = serde_json::to_vec(&json!({
-            "metadata": { "total_size": 8 },
-            "weight_map": { "a": "s1.safetensors", "b": "s1.safetensors" },
-        }))
-        .expect("the index serializes");
-        let weights = Weights::from_shards(
-            Some(&index),
-            vec![Shard {
-                name: "s1.safetensors".to_owned(),
-                bytes: file,
-            }],
-        )
-        .expect("the shard is valid");
-        assert_eq!(
-            model_bytes(
-                &ModelId {
-                    owner: "a".to_owned(),
-                    name: "b".to_owned(),
-                },
-                &weights,
-            ),
-            Ok(8),
-            "two tensors of four bytes matching the declared size"
-        );
-    }
-
-    #[test]
-    fn model_bytes_rejects_a_declared_size_mismatch() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
-        )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
-        let index = serde_json::to_vec(&json!({
-            "metadata": { "total_size": 5 },
-            "weight_map": { "a": "s1.safetensors" },
-        }))
-        .expect("the index serializes");
-        let weights = Weights::from_shards(
-            Some(&index),
-            vec![Shard {
-                name: "s1.safetensors".to_owned(),
-                bytes: file,
-            }],
-        )
-        .expect("the shard is valid");
-        assert_eq!(
-            model_bytes(
-                &ModelId {
-                    owner: "a".to_owned(),
-                    name: "b".to_owned(),
-                },
-                &weights,
-            ),
-            Err(CliError::BytesMismatch),
-            "the index declares one byte more than the tensors hold"
-        );
-    }
-
-    #[test]
-    fn parameter_count_sums_the_elements_of_every_tensor() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 12] },
-            "b": { "dtype": "F32", "shape": [2], "data_offsets": [12, 20] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..20)
-            .collect();
-        let weights = Weights::from_shards(
-            None,
-            vec![Shard {
-                name: "model.safetensors".to_owned(),
-                bytes: file,
-            }],
-        )
-        .expect("the file is valid");
-        assert_eq!(
-            parameter_count(
-                &ModelId {
-                    owner: "a".to_owned(),
-                    name: "b".to_owned(),
-                },
-                &weights,
-            ),
-            Ok(8),
-            "six bf16 and two f32 elements"
         );
     }
 }

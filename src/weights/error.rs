@@ -29,4 +29,13 @@ pub enum WeightsError {
 
     #[error("Index maps a tensor to a shard that does not contain it.")]
     IndexMismatch,
+
+    #[error("Total tensor byte count overflows u64.")]
+    ByteCountOverflow,
+
+    #[error("Tensor byte count does not match the index declaration.")]
+    ByteCountMismatch,
+
+    #[error("Parameter count overflows u64.")]
+    ParameterCountOverflow,
 }

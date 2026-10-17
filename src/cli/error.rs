@@ -13,11 +13,8 @@ pub enum CliError {
     #[error("Opening the model config failed.")]
     Config,
 
-    #[error("Total tensor byte count overflows usize.")]
-    TotalByteCountOverflow,
-
-    #[error("Tensor byte count does not match the index declaration.")]
-    BytesMismatch,
+    #[error("Measuring the model weights failed.")]
+    WeightsSize,
 
     #[error("Writing the report to stdout failed.")]
     Output,
@@ -62,7 +59,4 @@ pub enum CliError {
 
     #[error("System clock cannot be formatted as an RFC 3339 time.")]
     Timestamp,
-
-    #[error("Parameter count overflows u64.")]
-    ParameterCountOverflow,
 }
