@@ -64,6 +64,7 @@ pub fn parse_generation(bytes: &[u8]) -> Result<ReferenceGeneration, EvalError> 
     })?;
     let invalid_prompt = generation.prompts.iter().position(|prompt| {
         prompt.prompt_ids.is_empty()
+            || prompt.output_ids.is_empty()
             || prompt.output_ids.len() > generation.max_tokens
             || prompt.top_logprobs.len() != prompt.output_ids.len()
             || prompt
@@ -71,11 +72,16 @@ pub fn parse_generation(bytes: &[u8]) -> Result<ReferenceGeneration, EvalError> 
                 .iter()
                 .any(|top| top.len() != generation.top_k)
     });
-    if generation.prompts.is_empty() || generation.top_k == 0 || invalid_prompt.is_some() {
+    if generation.prompts.is_empty()
+        || generation.max_tokens == 0
+        || generation.top_k == 0
+        || invalid_prompt.is_some()
+    {
         error!(
             message = "Reference generation is inconsistent.",
             engine = generation.engine,
             prompt_count = generation.prompts.len(),
+            max_tokens = generation.max_tokens,
             top_k = generation.top_k,
             ?invalid_prompt,
         );
@@ -140,10 +146,11 @@ pub fn compare_generation(
             .zip(token_id)
             .is_some_and(|(top, &token_id)| top.iter().any(|entry| entry.id == token_id))
     };
-    let close = first_divergence.is_none_or(|step| {
-        in_top_k(expected, step, actual.token_ids.get(step))
-            && in_top_k(actual, step, expected.token_ids.get(step))
-    });
+    let close = compared_tokens > 0
+        && first_divergence.is_none_or(|step| {
+            in_top_k(expected, step, actual.token_ids.get(step))
+                && in_top_k(actual, step, expected.token_ids.get(step))
+        });
     let matched_tokens = first_divergence.unwrap_or(compared_tokens);
     let max_logprob_abs_diff = actual
         .top_logprobs
@@ -392,6 +399,34 @@ mod tests {
     }
 
     #[test]
+    fn compare_generation_without_compared_tokens_is_not_close() {
+        let tops = [vec![TokenLogprob {
+            id: 4,
+            logprob: -0.1,
+        }]];
+        assert_eq!(
+            compare_generation(
+                Steps {
+                    token_ids: &[4],
+                    top_logprobs: &tops,
+                },
+                Steps {
+                    token_ids: &[],
+                    top_logprobs: &[],
+                },
+            ),
+            GenerationReport {
+                compared_tokens: 0,
+                matched_tokens: 0,
+                first_divergence: None,
+                close: false,
+                max_logprob_abs_diff: None,
+            },
+            "an empty reference proves nothing"
+        );
+    }
+
+    #[test]
     fn first_step_measures_kl_and_logit_difference() {
         let kl_e6 = first_step(&[0.0, 3.0_f32.ln()], &[0.0, 0.0])
             .map(|report| ((report.kl * 1e6).round(), report.max_abs_logit_diff));
@@ -455,29 +490,43 @@ mod tests {
 
     #[test]
     fn parse_generation_rejects_missing_fields_and_inconsistent_steps() {
-        let generation = |top_k, top_logprobs| {
+        let generation = |max_tokens, top_k, output_ids, top_logprobs| {
             serde_json::to_vec(&json!({
                 "engine": "mlx",
-                "max_tokens": 2,
+                "max_tokens": max_tokens,
                 "top_k": top_k,
-                "prompts": [{ "prompt_ids": [1], "output_ids": [4], "top_logprobs": top_logprobs }],
+                "prompts": [{
+                    "prompt_ids": [1],
+                    "output_ids": output_ids,
+                    "top_logprobs": top_logprobs,
+                }],
             }))
             .expect("the generation serializes")
         };
         assert_eq!(
             [
                 parse_generation(br#"{ "engine": "mlx" }"#),
-                parse_generation(&generation(1, json!([]))),
-                parse_generation(&generation(2, json!([[{ "id": 4, "logprob": -0.5 }]]))),
-                parse_generation(&generation(0, json!([[]]))),
+                parse_generation(&generation(2, 1, json!([4]), json!([]))),
+                parse_generation(&generation(
+                    2,
+                    2,
+                    json!([4]),
+                    json!([[{ "id": 4, "logprob": -0.5 }]])
+                )),
+                parse_generation(&generation(2, 0, json!([4]), json!([[]]))),
+                parse_generation(&generation(0, 1, json!([]), json!([]))),
+                parse_generation(&generation(2, 1, json!([]), json!([]))),
             ],
             [
                 Err(EvalError::GenerationJson),
                 Err(EvalError::GenerationInvalid),
                 Err(EvalError::GenerationInvalid),
                 Err(EvalError::GenerationInvalid),
+                Err(EvalError::GenerationInvalid),
+                Err(EvalError::GenerationInvalid),
             ],
-            "missing fields, no step for a token, a top-k shorter than declared, top_k of zero"
+            "missing fields, no step for a token, a top-k shorter than declared, top_k of zero, \
+             max_tokens of zero, no generated token"
         );
     }
 }
