@@ -3,6 +3,7 @@ mod stream;
 
 use std::array;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
@@ -57,8 +58,6 @@ const REDUCE_THREADS: usize = 256;
 
 const MATMUL_TILE: usize = 16;
 
-const MATMUL_THREADS: usize = MATMUL_TILE * MATMUL_TILE;
-
 type MtlDevice = Retained<ProtocolObject<dyn MTLDevice>>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Queue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
@@ -76,7 +75,7 @@ pub struct MetalStorage {
 pub struct MetalDevice {
     device: MtlDevice,
     library: Library,
-    pipelines: HashMap<&'static str, Pipeline>,
+    pipelines: HashMap<Kernel, Pipeline>,
     stream: CommandStream,
     allocated_bytes_baseline: u64,
     allocated_bytes_peak: u64,
@@ -165,6 +164,106 @@ struct IndexSelectArgs {
     table_row_stride: u32,
     table_col_stride: u32,
     indices: StridedArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Kernel {
+    op: &'static str,
+    dtype: DType,
+}
+
+enum KernelArgs<'args> {
+    Strided(&'args StridedArgs),
+    Reduce(&'args ReduceArgs),
+    Matmul(&'args MatmulArgs),
+    IndexSelect(&'args IndexSelectArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Grid {
+    Threads(usize),
+    Groups { grid: MTLSize, group: MTLSize },
+}
+
+impl Kernel {
+    fn new(
+        op: &'static str,
+        dtype: DType,
+    ) -> Self {
+        Self {
+            op,
+            dtype,
+        }
+    }
+
+    fn float(
+        op: &'static str,
+        dtype: DType,
+    ) -> Result<Self, MetalError> {
+        match dtype {
+            DType::F32 | DType::BF16 => Ok(Self::new(op, dtype)),
+            DType::U32 => Err(not_float(dtype)),
+        }
+    }
+
+    fn name(&self) -> String {
+        let suffix = match self.dtype {
+            DType::F32 => "f32",
+            DType::BF16 => "bf16",
+            DType::U32 => "u32",
+        };
+        format!("{}_{suffix}", self.op)
+    }
+}
+
+impl KernelArgs<'_> {
+    fn bytes(&self) -> (NonNull<c_void>, usize) {
+        match self {
+            Self::Strided(args) => (NonNull::from(*args).cast(), size_of::<StridedArgs>()),
+            Self::Reduce(args) => (NonNull::from(*args).cast(), size_of::<ReduceArgs>()),
+            Self::Matmul(args) => (NonNull::from(*args).cast(), size_of::<MatmulArgs>()),
+            Self::IndexSelect(args) => (NonNull::from(*args).cast(), size_of::<IndexSelectArgs>()),
+        }
+    }
+}
+
+impl Grid {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Threads(count) => *count == 0,
+            Self::Groups {
+                grid, ..
+            } => grid.width == 0 || grid.height == 0 || grid.depth == 0,
+        }
+    }
+
+    fn threads_required(&self) -> usize {
+        match self {
+            Self::Threads(_) => 1,
+            Self::Groups {
+                group, ..
+            } => group
+                .width
+                .saturating_mul(group.height)
+                .saturating_mul(group.depth),
+        }
+    }
+
+    fn group(
+        &self,
+        threads_max: usize,
+    ) -> MTLSize {
+        match self {
+            Self::Threads(count) => MTLSize {
+                width: threads_max.min(*count),
+                height: 1,
+                depth: 1,
+            },
+            Self::Groups {
+                group, ..
+            } => *group,
+        }
+    }
 }
 
 impl StridedArgs {
@@ -429,16 +528,17 @@ impl MetalDevice {
 
     fn pipeline(
         &mut self,
-        name: &'static str,
+        kernel: Kernel,
     ) -> Result<Pipeline, MetalError> {
-        if let Some(pipeline) = self.pipelines.get(name) {
+        if let Some(pipeline) = self.pipelines.get(&kernel) {
             return Ok(pipeline.clone());
         }
+        let name = kernel.name();
         let function = self
             .library
-            .newFunctionWithName(&NSString::from_str(name))
+            .newFunctionWithName(&NSString::from_str(&name))
             .ok_or_else(|| {
-                error!(message = "Kernel is not in the Metal library.", name);
+                error!(message = "Kernel is not in the Metal library.", %name);
                 MetalError::KernelNotFound
             })?;
         let pipeline = self
@@ -447,321 +547,100 @@ impl MetalDevice {
             .map_err(|error| {
                 error!(
                     message = "Metal pipeline creation failed.",
-                    name,
+                    %name,
                     error = %error.localizedDescription(),
                 );
                 MetalError::PipelineCreation
             })?;
-        self.pipelines.insert(name, pipeline.clone());
+        self.pipelines.insert(kernel, pipeline.clone());
         Ok(pipeline)
     }
 
-    fn encode(
+    fn dispatch(
         &mut self,
-        pipeline: &Pipeline,
-        bind: impl FnOnce(&ComputeEncoder),
+        kernel: Kernel,
+        buffers: &[&MetalStorage],
+        args: &[KernelArgs<'_>],
+        grid: Grid,
     ) -> Result<(), MetalError> {
-        self.stream.compute(pipeline, bind)
-    }
-
-    fn dispatch_strided(
-        &mut self,
-        kernel: &'static str,
-        inputs: &[&BufferView<'_>],
-        output: &MetalStorage,
-    ) -> Result<(), MetalError> {
-        let count = inputs
-            .first()
-            .map_or(0, |input| input.layout.shape().numel());
-        if count == 0 {
+        if grid.is_empty() {
             return Ok(());
         }
-        let args = inputs
-            .iter()
-            .map(|input| StridedArgs::new(input))
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_index = inputs.len();
         let pipeline = self.pipeline(kernel)?;
-        let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
-        self.encode(&pipeline, |encoder| {
-            inputs.iter().enumerate().for_each(|(index, input)| {
-                // SAFETY: the input buffer is alive for the whole call and the
-                // command buffer retains it. The view comes from a `Tensor`
-                // operand, which only `crate::nn` can build, or from a
-                // buffer this device allocated with a contiguous layout of
-                // its shape, so every index its layout addresses stays inside
-                // its storage. Every `Shape` has at most `i32::MAX` non-zero
-                // elements, so the storage size and every address its layout
-                // produces stay below `u32::MAX` and do not wrap. Every
-                // input has the dispatch shape: `count` is the first input's
-                // element count, and `Tensor` broadcasts both binary operands
-                // to the same shape before calling the device, so the kernel
-                // reads each input, `rhs` included, only for `gid < count`
-                // inside its layout. The storage was produced on this serial
-                // queue, so every earlier write to it is ordered before this
-                // dispatch.
-                unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, index) };
-            });
-            // SAFETY: the output buffer holds `count` elements of the kernel's
-            // output type, one per dispatched thread.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, output_index) };
-            args.iter()
-                .zip(output_index.saturating_add(1)..)
-                .for_each(|(input_args, index)| {
-                    // SAFETY: `input_args` is a `#[repr(C)]` struct of `u32`
-                    // that matches the layout of
-                    // `StridedArgs` in `common.metal`; Metal
-                    // copies the bytes before the call returns.
-                    unsafe {
-                        encoder.setBytes_length_atIndex(
-                            NonNull::from(input_args).cast(),
-                            size_of::<StridedArgs>(),
-                            index,
-                        )
-                    };
+        let threads_max = pipeline.maxTotalThreadsPerThreadgroup();
+        let threads_required = grid.threads_required();
+        if threads_max < threads_required {
+            return Err(threadgroup_too_small(kernel, threads_max, threads_required));
+        }
+        let group = grid.group(threads_max);
+        self.stream.compute(&pipeline, |encoder| {
+            // SAFETY: every buffer is borrowed for the whole call and the
+            // command buffer retains it. Each one was produced on this
+            // device's serial queue, since `view` and `owns` reject foreign
+            // storage, so every earlier access to it is ordered before this
+            // dispatch. Each caller builds `args` from the views it binds: a
+            // view comes from a `Tensor` operand, which only `crate::nn` can
+            // build, or from a buffer this device allocated with a contiguous
+            // layout of its shape, so every index its layout addresses stays
+            // inside its storage, and each output holds one element of the
+            // kernel's output type per index the kernel writes. Every `Shape`
+            // has at most `i32::MAX` non-zero elements, so addresses and
+            // kernel loop counters stay below `u32::MAX` and do not wrap.
+            // Each `KernelArgs` points to a `#[repr(C)]` struct of `u32` that
+            // matches the struct of the same name in `common.metal`,
+            // `reduce.metal`, `matmul.metal` or `index_select.metal`, and Metal
+            // copies the bytes before the call returns.
+            unsafe {
+                buffers.iter().zip(0..).for_each(|(storage, index)| {
+                    encoder.setBuffer_offset_atIndex(Some(&storage.buffer), 0, index);
                 });
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: count,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+                args.iter()
+                    .zip(buffers.len()..)
+                    .for_each(|(kernel_args, index)| {
+                        let (bytes, length) = kernel_args.bytes();
+                        encoder.setBytes_length_atIndex(bytes, length, index);
+                    });
+            };
+            match grid {
+                Grid::Threads(count) => encoder.dispatchThreads_threadsPerThreadgroup(
+                    MTLSize {
+                        width: count,
+                        height: 1,
+                        depth: 1,
+                    },
+                    group,
+                ),
+                Grid::Groups {
+                    grid, ..
+                } => encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group),
+            }
         })
     }
 
-    fn dispatch_reduce(
+    fn scatter_window(
         &mut self,
-        kernel: &'static str,
-        input: &BufferView<'_>,
-        args: &ReduceArgs,
-        rows: usize,
-        output: &MetalStorage,
-    ) -> Result<(), MetalError> {
-        if rows == 0 {
-            return Ok(());
-        }
-        let pipeline = self.pipeline(kernel)?;
-        let threads = pipeline.maxTotalThreadsPerThreadgroup();
-        if threads < REDUCE_THREADS {
-            return Err(threadgroup_too_small(kernel, threads, REDUCE_THREADS));
-        }
-        self.encode(&pipeline, |encoder| {
-            // SAFETY: the input buffer is alive for the whole call and the
-            // command buffer retains it. The view comes from a `Tensor`
-            // operand, which only `crate::nn` can build, so every index its
-            // layout addresses stays inside its storage. Every `Shape` has at
-            // most `i32::MAX` non-zero elements, so addresses and the loop
-            // counter `k += 256` stay below `u32::MAX` and do not wrap. The
-            // storage was produced on this serial queue, so every earlier
-            // write to it is ordered before this dispatch.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
-            // SAFETY: the output buffer holds one element of the kernel's
-            // output type per dispatched threadgroup.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 1) };
-            // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
-            // layout of `ReduceArgs` in `reduce.metal`; Metal copies the bytes
-            // before the call returns.
-            unsafe {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(args).cast(),
-                    size_of::<ReduceArgs>(),
-                    2,
-                )
-            };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: rows,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: REDUCE_THREADS,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        })
-    }
-
-    fn dispatch_matmul(
-        &mut self,
-        kernel: &'static str,
-        lhs: &BufferView<'_>,
-        rhs: &BufferView<'_>,
-        args: &MatmulArgs,
-        grid: MTLSize,
-        output: &MetalStorage,
-    ) -> Result<(), MetalError> {
-        let pipeline = self.pipeline(kernel)?;
-        let threads = pipeline.maxTotalThreadsPerThreadgroup();
-        if threads < MATMUL_THREADS {
-            return Err(threadgroup_too_small(kernel, threads, MATMUL_THREADS));
-        }
-        self.encode(&pipeline, |encoder| {
-            // SAFETY: both input buffers are alive for the whole call and the
-            // command buffer retains them. Each view comes from a `Tensor`
-            // operand, which only `crate::nn` can build, or from a copy this
-            // device allocated with a contiguous layout of its shape, so every
-            // index its layout addresses stays inside its storage. Every
-            // `Shape` has at most `i32::MAX` non-zero elements, so addresses
-            // and the loop counter `k_start += 16` stay below `u32::MAX` and do
-            // not wrap. Both storages were produced on this serial queue, so
-            // every earlier write to them is ordered before this dispatch.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(&lhs.storage.buffer), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&rhs.storage.buffer), 0, 1);
-            };
-            // SAFETY: the output buffer holds `batch * m * n` elements of the
-            // kernel's type, and the kernel writes only inside `[m, n]` of each
-            // batch.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 2) };
-            // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
-            // layout of `MatmulArgs` in `matmul.metal`; Metal copies the bytes
-            // before the call returns.
-            unsafe {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(args).cast(),
-                    size_of::<MatmulArgs>(),
-                    3,
-                )
-            };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                grid,
-                MTLSize {
-                    width: MATMUL_TILE,
-                    height: MATMUL_TILE,
-                    depth: 1,
-                },
-            );
-        })
-    }
-
-    fn dispatch_index_select(
-        &mut self,
-        kernel: &'static str,
-        table: &BufferView<'_>,
-        indices: &BufferView<'_>,
-        args: &IndexSelectArgs,
-        count: usize,
-        output: &MetalStorage,
-    ) -> Result<(), MetalError> {
-        if count == 0 {
-            return Ok(());
-        }
-        let pipeline = self.pipeline(kernel)?;
-        let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
-        self.encode(&pipeline, |encoder| {
-            // SAFETY: both input buffers are alive for the whole call and the
-            // command buffer retains them. Both views come from `Tensor`
-            // operands, which only `crate::nn` can build, so every index
-            // their layouts address stays inside their storage. Every `Shape`
-            // has at most `i32::MAX` non-zero elements, so addresses stay below
-            // `u32::MAX` and do not wrap, and the kernel reads a table row only
-            // when its index is below `rows`. Both storages were produced on
-            // this serial queue, so every earlier write to them is ordered
-            // before this dispatch.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(&table.storage.buffer), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&indices.storage.buffer), 0, 1);
-            };
-            // SAFETY: the output buffer holds `count` elements of the kernel's
-            // type, one per dispatched thread.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 2) };
-            // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
-            // layout of `IndexSelectArgs` in `index_select.metal`; Metal copies
-            // the bytes before the call returns.
-            unsafe {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(args).cast(),
-                    size_of::<IndexSelectArgs>(),
-                    3,
-                )
-            };
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: count,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        })
-    }
-
-    fn dispatch_write(
-        &mut self,
-        kernel: &'static str,
+        kernel: Kernel,
         input: &BufferView<'_>,
         window: &StridedArgs,
         output: &mut MetalStorage,
     ) -> Result<(), MetalError> {
-        let count = input.layout.shape().numel();
-        if count == 0 {
-            return Ok(());
-        }
         let input_args = StridedArgs::new(input)?;
-        let pipeline = self.pipeline(kernel)?;
-        let width = pipeline.maxTotalThreadsPerThreadgroup().min(count);
-        self.encode(&pipeline, |encoder| {
-            // SAFETY: the input buffer is alive for the whole call and the
-            // command buffer retains it. The view comes from a `Tensor`
-            // operand, which only `crate::nn` can build, so every index its
-            // layout addresses stays inside its storage. Every `Shape` has at
-            // most `i32::MAX` non-zero elements, so addresses stay below
-            // `u32::MAX` and do not wrap. The storage was produced on this
-            // serial queue, so every earlier write to it is ordered before
-            // this dispatch.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&input.storage.buffer), 0, 0) };
-            // SAFETY: the output buffer is alive for the whole call and the
-            // command buffer retains it. It was produced on this serial queue,
-            // so this write is ordered after every earlier access to it. It is
-            // borrowed mutably, so no other reference to it is live
-            // during encoding: either a slice scatter target, which
-            // `Tensor::slice_scatter` checked to be contiguous
-            // and owned by no other tensor before building its `OperandMut`,
-            // or a fresh cat output with a contiguous layout. The shape rule
-            // bounds `window` inside that layout, so every written
-            // index stays inside the storage and is written by one
-            // thread only.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 1) };
-            // SAFETY: `input_args` and `window` are `#[repr(C)]` structs of
-            // `u32` that match the layout of `StridedArgs` in `common.metal`;
-            // Metal copies the bytes before the call returns.
-            unsafe {
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(&input_args).cast(),
-                    size_of::<StridedArgs>(),
-                    2,
-                );
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(window).cast(),
-                    size_of::<StridedArgs>(),
-                    3,
-                );
-            };
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: count,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        })
+        // The output is borrowed mutably, so no other reference to it is live
+        // during encoding: either a slice scatter target, which
+        // `Tensor::slice_scatter` checked to be contiguous and owned by no
+        // other tensor before building its `OperandMut`, or a fresh cat output
+        // with a contiguous layout. The shape rule bounds `window` inside that
+        // layout, so every written index stays inside the storage and is
+        // written by one thread only.
+        self.dispatch(
+            kernel,
+            &[input.storage, &*output],
+            &[
+                KernelArgs::Strided(&input_args),
+                KernelArgs::Strided(window),
+            ],
+            Grid::Threads(input.layout.shape().numel()),
+        )
     }
 
     fn copy_view(
@@ -770,7 +649,13 @@ impl MetalDevice {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        self.dispatch_strided(copy_kernel(dtype), &[input], &output)?;
+        let args = StridedArgs::new(input)?;
+        self.dispatch(
+            Kernel::new("copy", dtype),
+            &[input.storage, &output],
+            &[KernelArgs::Strided(&args)],
+            Grid::Threads(input.layout.shape().numel()),
+        )?;
         Ok(output)
     }
 
@@ -804,7 +689,13 @@ impl MetalDevice {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        self.dispatch_strided(unary_kernel(op, dtype)?, &[input], &output)?;
+        let args = StridedArgs::new(input)?;
+        self.dispatch(
+            Kernel::float(unary_kernel(op), dtype)?,
+            &[input.storage, &output],
+            &[KernelArgs::Strided(&args)],
+            Grid::Threads(input.layout.shape().numel()),
+        )?;
         Ok(output)
     }
 
@@ -816,7 +707,20 @@ impl MetalDevice {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(lhs.layout.shape().nbytes(dtype))?;
-        self.dispatch_strided(binary_kernel(op, dtype)?, &[lhs, rhs], &output)?;
+        let lhs_args = StridedArgs::new(lhs)?;
+        let rhs_args = StridedArgs::new(rhs)?;
+        // `Tensor` broadcasts both operands to the same shape before calling
+        // the device, so the kernel reads `rhs` only for `gid < count`, inside
+        // its layout.
+        self.dispatch(
+            Kernel::float(binary_kernel(op), dtype)?,
+            &[lhs.storage, rhs.storage, &output],
+            &[
+                KernelArgs::Strided(&lhs_args),
+                KernelArgs::Strided(&rhs_args),
+            ],
+            Grid::Threads(lhs.layout.shape().numel()),
+        )?;
         Ok(output)
     }
 
@@ -830,12 +734,23 @@ impl MetalDevice {
     ) -> Result<MetalStorage, MetalError> {
         let args = ReduceArgs::new(input, output_shape, dim)?;
         let output = self.allocate(output_shape.nbytes(dtype))?;
-        self.dispatch_reduce(
-            reduce_kernel(op, input_dtype)?,
-            input,
-            &args,
-            output_shape.numel(),
-            &output,
+        // One threadgroup per output row.
+        self.dispatch(
+            Kernel::float(reduce_kernel(op), input_dtype)?,
+            &[input.storage, &output],
+            &[KernelArgs::Reduce(&args)],
+            Grid::Groups {
+                grid: MTLSize {
+                    width: output_shape.numel(),
+                    height: 1,
+                    depth: 1,
+                },
+                group: MTLSize {
+                    width: REDUCE_THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            },
         )?;
         Ok(output)
     }
@@ -872,13 +787,20 @@ impl MetalDevice {
         let dispatch = MatmulDispatch::new(&geometry, &lhs_input.layout, &rhs_input.layout)?;
         let lhs = copied_view(lhs_input.view, lhs_input.copy.as_ref(), &lhs_layout);
         let rhs = copied_view(rhs_input.view, rhs_input.copy.as_ref(), &rhs_layout);
-        self.dispatch_matmul(
-            matmul_kernel(dtype)?,
-            &lhs,
-            &rhs,
-            &dispatch.args,
-            dispatch.grid,
-            &output,
+        // The output holds `batch * m * n` elements, and the kernel writes
+        // only inside `[m, n]` of each batch.
+        self.dispatch(
+            Kernel::float("matmul", dtype)?,
+            &[lhs.storage, rhs.storage, &output],
+            &[KernelArgs::Matmul(&dispatch.args)],
+            Grid::Groups {
+                grid: dispatch.grid,
+                group: MTLSize {
+                    width: MATMUL_TILE,
+                    height: MATMUL_TILE,
+                    depth: 1,
+                },
+            },
         )?;
         Ok(output)
     }
@@ -890,8 +812,13 @@ impl MetalDevice {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        let kernel = to_dtype_kernel(dtype_from, dtype)?;
-        self.dispatch_strided(kernel, &[input], &output)?;
+        let args = StridedArgs::new(input)?;
+        self.dispatch(
+            to_dtype_kernel(dtype_from, dtype)?,
+            &[input.storage, &output],
+            &[KernelArgs::Strided(&args)],
+            Grid::Threads(input.layout.shape().numel()),
+        )?;
         Ok(output)
     }
 
@@ -904,13 +831,12 @@ impl MetalDevice {
     ) -> Result<MetalStorage, MetalError> {
         let args = IndexSelectArgs::new(table, indices, output_shape)?;
         let output = self.allocate(output_shape.nbytes(dtype))?;
-        self.dispatch_index_select(
-            index_select_kernel(dtype)?,
-            table,
-            indices,
-            &args,
-            output_shape.numel(),
-            &output,
+        // The kernel reads a table row only when its index is below `rows`.
+        self.dispatch(
+            Kernel::float("index_select", dtype)?,
+            &[table.storage, indices.storage, &output],
+            &[KernelArgs::IndexSelect(&args)],
+            Grid::Threads(output_shape.numel()),
         )?;
         Ok(output)
     }
@@ -923,7 +849,7 @@ impl MetalDevice {
         output_shape: &Shape,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let kernel = slice_scatter_kernel(dtype)?;
+        let kernel = Kernel::float("slice_scatter", dtype)?;
         let mut output = self.allocate(output_shape.nbytes(dtype))?;
         let layout = Layout::contiguous(*output_shape);
         let rhs_offset = slice_offset(&layout, dim, lhs.layout.shape().dims().get(dim).copied())
@@ -934,8 +860,8 @@ impl MetalDevice {
             })?;
         let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), 0)?;
         let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), rhs_offset)?;
-        self.dispatch_write(kernel, lhs, &lhs_window, &mut output)?;
-        self.dispatch_write(kernel, rhs, &rhs_window, &mut output)?;
+        self.scatter_window(kernel, lhs, &lhs_window, &mut output)?;
+        self.scatter_window(kernel, rhs, &rhs_window, &mut output)?;
         Ok(output)
     }
 }
@@ -1092,8 +1018,8 @@ impl Device for MetalDevice {
         let src = self.view(src)?;
         let offset = slice_offset(layout, dim, Some(start)).ok_or_else(|| invalid_operation(op))?;
         let window = StridedArgs::window(layout, src.layout.shape(), offset)?;
-        self.dispatch_write(
-            slice_scatter_kernel(target.dtype())?,
+        self.scatter_window(
+            Kernel::float("slice_scatter", target.dtype())?,
             &src,
             &window,
             target.storage_mut(),
@@ -1102,109 +1028,55 @@ impl Device for MetalDevice {
 }
 
 fn threadgroup_too_small(
-    name: &'static str,
+    kernel: Kernel,
     threads: usize,
     threads_required: usize,
 ) -> MetalError {
     error!(
         message = "Kernel allows too few threads per threadgroup.",
-        name, threads, threads_required,
+        name = %kernel.name(),
+        threads,
+        threads_required,
     );
     MetalError::ThreadgroupTooSmall
 }
 
-fn copy_kernel(dtype: DType) -> &'static str {
-    match dtype {
-        DType::F32 => "copy_f32",
-        DType::BF16 => "copy_bf16",
-        DType::U32 => "copy_u32",
+fn to_dtype_kernel(
+    dtype_from: DType,
+    dtype: DType,
+) -> Result<Kernel, MetalError> {
+    let op = match dtype_from {
+        DType::F32 => "to_dtype_f32",
+        DType::BF16 => "to_dtype_bf16",
+        DType::U32 => return Err(not_float(dtype_from)),
+    };
+    Kernel::float(op, dtype)
+}
+
+fn unary_kernel(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Neg => "unary_neg",
+        UnaryOp::Exp => "unary_exp",
+        UnaryOp::Sqrt => "unary_sqrt",
+        UnaryOp::Reciprocal => "unary_reciprocal",
     }
 }
 
-fn to_dtype_kernel(
-    dtype_from: DType,
-    dtype_to: DType,
-) -> Result<&'static str, MetalError> {
-    Ok(match (dtype_from, dtype_to) {
-        (DType::F32, DType::F32) => "to_dtype_f32_f32",
-        (DType::F32, DType::BF16) => "to_dtype_f32_bf16",
-        (DType::BF16, DType::F32) => "to_dtype_bf16_f32",
-        (DType::BF16, DType::BF16) => "to_dtype_bf16_bf16",
-        (DType::U32, _) | (_, DType::U32) => return Err(not_float(DType::U32)),
-    })
+fn binary_kernel(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "binary_add",
+        BinaryOp::Sub => "binary_sub",
+        BinaryOp::Mul => "binary_mul",
+        BinaryOp::Div => "binary_div",
+    }
 }
 
-fn unary_kernel(
-    op: UnaryOp,
-    dtype: DType,
-) -> Result<&'static str, MetalError> {
-    Ok(match (op, dtype) {
-        (UnaryOp::Neg, DType::F32) => "unary_neg_f32",
-        (UnaryOp::Neg, DType::BF16) => "unary_neg_bf16",
-        (UnaryOp::Exp, DType::F32) => "unary_exp_f32",
-        (UnaryOp::Exp, DType::BF16) => "unary_exp_bf16",
-        (UnaryOp::Sqrt, DType::F32) => "unary_sqrt_f32",
-        (UnaryOp::Sqrt, DType::BF16) => "unary_sqrt_bf16",
-        (UnaryOp::Reciprocal, DType::F32) => "unary_reciprocal_f32",
-        (UnaryOp::Reciprocal, DType::BF16) => "unary_reciprocal_bf16",
-        (_, DType::U32) => return Err(not_float(dtype)),
-    })
-}
-
-fn binary_kernel(
-    op: BinaryOp,
-    dtype: DType,
-) -> Result<&'static str, MetalError> {
-    Ok(match (op, dtype) {
-        (BinaryOp::Add, DType::F32) => "binary_add_f32",
-        (BinaryOp::Add, DType::BF16) => "binary_add_bf16",
-        (BinaryOp::Sub, DType::F32) => "binary_sub_f32",
-        (BinaryOp::Sub, DType::BF16) => "binary_sub_bf16",
-        (BinaryOp::Mul, DType::F32) => "binary_mul_f32",
-        (BinaryOp::Mul, DType::BF16) => "binary_mul_bf16",
-        (BinaryOp::Div, DType::F32) => "binary_div_f32",
-        (BinaryOp::Div, DType::BF16) => "binary_div_bf16",
-        (_, DType::U32) => return Err(not_float(dtype)),
-    })
-}
-
-fn reduce_kernel(
-    op: ReduceOp,
-    dtype: DType,
-) -> Result<&'static str, MetalError> {
-    Ok(match (op, dtype) {
-        (ReduceOp::Sum, DType::F32) => "reduce_sum_f32",
-        (ReduceOp::Sum, DType::BF16) => "reduce_sum_bf16",
-        (ReduceOp::Amax, DType::F32) => "reduce_amax_f32",
-        (ReduceOp::Amax, DType::BF16) => "reduce_amax_bf16",
-        (ReduceOp::Argmax, DType::F32) => "reduce_argmax_f32",
-        (ReduceOp::Argmax, DType::BF16) => "reduce_argmax_bf16",
-        (_, DType::U32) => return Err(not_float(dtype)),
-    })
-}
-
-fn matmul_kernel(dtype: DType) -> Result<&'static str, MetalError> {
-    Ok(match dtype {
-        DType::F32 => "matmul_f32",
-        DType::BF16 => "matmul_bf16",
-        DType::U32 => return Err(not_float(dtype)),
-    })
-}
-
-fn index_select_kernel(dtype: DType) -> Result<&'static str, MetalError> {
-    Ok(match dtype {
-        DType::F32 => "index_select_f32",
-        DType::BF16 => "index_select_bf16",
-        DType::U32 => return Err(not_float(dtype)),
-    })
-}
-
-fn slice_scatter_kernel(dtype: DType) -> Result<&'static str, MetalError> {
-    Ok(match dtype {
-        DType::F32 => "slice_scatter_f32",
-        DType::BF16 => "slice_scatter_bf16",
-        DType::U32 => return Err(not_float(dtype)),
-    })
+fn reduce_kernel(op: ReduceOp) -> &'static str {
+    match op {
+        ReduceOp::Sum => "reduce_sum",
+        ReduceOp::Amax => "reduce_amax",
+        ReduceOp::Argmax => "reduce_argmax",
+    }
 }
 
 fn is_matmul_ready(
@@ -1295,12 +1167,18 @@ mod tests {
         PI,
     };
 
+    use objc2_metal::MTLSize;
+
     use crate::metal::{
+        Grid,
+        Kernel,
         MatmulGeometry,
         MatrixLayout,
         MetalDevice,
+        MetalError,
         is_matmul_ready,
         slice_offset,
+        to_dtype_kernel,
     };
     use crate::nn::{
         AllocatedMemorySource,
@@ -1311,6 +1189,144 @@ mod tests {
         Tensor,
         TensorError,
     };
+
+    #[test]
+    fn kernel_name_joins_op_prefix_and_dtype_suffix() {
+        assert_eq!(
+            [
+                Kernel::new("copy", DType::U32).name(),
+                Kernel::new("unary_neg", DType::F32).name(),
+                Kernel::new("matmul", DType::BF16).name(),
+            ],
+            ["copy_u32", "unary_neg_f32", "matmul_bf16"],
+            "op prefix, underscore, dtype suffix"
+        );
+    }
+
+    #[test]
+    fn to_dtype_kernel_names_source_then_target_dtype() {
+        assert_eq!(
+            [
+                to_dtype_kernel(DType::F32, DType::BF16).map(|kernel| kernel.name()),
+                to_dtype_kernel(DType::BF16, DType::F32).map(|kernel| kernel.name()),
+            ],
+            [
+                Ok(String::from("to_dtype_f32_bf16")),
+                Ok(String::from("to_dtype_bf16_f32")),
+            ],
+            "the prefix names the source dtype, the suffix the target dtype"
+        );
+    }
+
+    #[test]
+    fn float_kernel_rejects_u32() {
+        assert_eq!(
+            [
+                Kernel::float("matmul", DType::U32),
+                to_dtype_kernel(DType::U32, DType::F32),
+                to_dtype_kernel(DType::F32, DType::U32),
+            ],
+            [
+                Err(MetalError::DTypeNotFloat),
+                Err(MetalError::DTypeNotFloat),
+                Err(MetalError::DTypeNotFloat),
+            ],
+            "float kernels have no u32 instance"
+        );
+    }
+
+    #[test]
+    fn grid_without_threads_or_groups_is_empty() {
+        let group = MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        };
+        assert_eq!(
+            [
+                Grid::Threads(0).is_empty(),
+                Grid::Threads(1).is_empty(),
+                Grid::Groups {
+                    grid: MTLSize {
+                        width: 4,
+                        height: 0,
+                        depth: 1,
+                    },
+                    group,
+                }
+                .is_empty(),
+                Grid::Groups {
+                    grid: MTLSize {
+                        width: 4,
+                        height: 2,
+                        depth: 1,
+                    },
+                    group,
+                }
+                .is_empty(),
+            ],
+            [true, false, true, false],
+            "a grid is empty when it has no thread or a zero group dimension"
+        );
+    }
+
+    #[test]
+    fn grid_threads_required_is_the_group_volume() {
+        assert_eq!(
+            [
+                Grid::Threads(5000).threads_required(),
+                Grid::Groups {
+                    grid: MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    group: MTLSize {
+                        width: 16,
+                        height: 16,
+                        depth: 1,
+                    },
+                }
+                .threads_required(),
+            ],
+            [1, 256],
+            "a thread grid needs one thread per group, a group grid its group volume"
+        );
+    }
+
+    #[test]
+    fn grid_group_clamps_threads_to_the_pipeline_limit() {
+        let group = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        assert_eq!(
+            [
+                Grid::Threads(10).group(1024),
+                Grid::Threads(5000).group(1024),
+                Grid::Groups {
+                    grid: group,
+                    group,
+                }
+                .group(1024),
+            ],
+            [
+                MTLSize {
+                    width: 10,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+                group,
+            ],
+            "a thread grid uses at most the pipeline limit, a group grid keeps its group"
+        );
+    }
 
     #[test]
     fn matmul_geometry_reads_dims_and_operand_strides() {
