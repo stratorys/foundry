@@ -7,6 +7,7 @@ mod layout;
 mod linear;
 mod masking;
 mod memory;
+mod module;
 mod norm;
 pub mod primitive;
 mod shape;
@@ -37,6 +38,7 @@ pub use self::memory::{
     AllocatedMemory,
     AllocatedMemorySource,
 };
+pub use self::module::Module;
 pub use self::norm::RmsNorm;
 pub use self::primitive::Device;
 pub use self::shape::{

@@ -692,18 +692,21 @@ fn eval_on<D: Device>(
     let device_name = device.device_name();
     info!(message = "Selected the device.", %device_name);
     let llama = load_llama(device, model, config, weights, max_cache_len)?;
+    let modules = llama.named_modules();
     let reports = references
         .iter()
         .map(|reference| {
-            eval_reference(device, &llama, config.eos_token_id(), reference).map_err(|error| {
-                error!(
-                    message = "Evaluation failed.",
-                    %model,
-                    dir = %reference.dir.display(),
-                    %error,
-                );
-                CliError::Eval
-            })
+            eval_reference(device, &llama, &modules, config.eos_token_id(), reference).map_err(
+                |error| {
+                    error!(
+                        message = "Evaluation failed.",
+                        %model,
+                        dir = %reference.dir.display(),
+                        %error,
+                    );
+                    CliError::Eval
+                },
+            )
         })
         .collect::<Result<Vec<ReferenceReport>, CliError>>()?;
     Ok((device_name, reports))

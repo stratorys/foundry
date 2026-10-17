@@ -7,6 +7,7 @@ use crate::models::llama::{
 use crate::nn::{
     Device,
     Linear,
+    Module,
     Silu,
     Tensor,
     TensorError,
@@ -42,8 +43,10 @@ impl<D: Device> LlamaMlp<D> {
             act_fn: Silu::new(device).map_err(tensor_failed)?,
         })
     }
+}
 
-    pub fn forward(
+impl<D: Device> Module<D> for LlamaMlp<D> {
+    fn forward(
         &self,
         device: &mut D,
         x: &Tensor<D>,

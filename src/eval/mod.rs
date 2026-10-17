@@ -42,12 +42,10 @@ use crate::generate::{
     Decoder,
     GenerateError,
 };
-use crate::models::{
-    CausalLm,
-    Submodules,
-};
+use crate::models::CausalLm;
 use crate::nn::{
     Device,
+    Module,
     Tensor,
 };
 use crate::weights::Weights;
@@ -173,16 +171,17 @@ pub fn baselines(references: &[Reference]) -> Result<Vec<BaselineReport>, EvalEr
         .collect()
 }
 
-pub fn eval_reference<D: Device, M: Submodules<D> + CausalLm<D>>(
+pub fn eval_reference<D: Device, M: CausalLm<D>>(
     device: &mut D,
     model: &M,
+    modules: &[(String, &dyn Module<D>)],
     eos_token_id: &[u32],
     reference: &Reference,
 ) -> Result<ReferenceReport, EvalError> {
     let layers = reference
         .activations
         .as_ref()
-        .map(|activations| eval_layers(device, model, activations))
+        .map(|activations| eval_layers(device, modules, activations))
         .transpose()?;
     let generation = reference
         .generation
@@ -209,20 +208,20 @@ pub fn eval_reference<D: Device, M: Submodules<D> + CausalLm<D>>(
     })
 }
 
-pub fn eval_layers<D: Device, M: Submodules<D>, S: AsRef<[u8]>>(
+pub fn eval_layers<D: Device, S: AsRef<[u8]>>(
     device: &mut D,
-    model: &M,
+    modules: &[(String, &dyn Module<D>)],
     weights: &Weights<S>,
 ) -> Result<Vec<LayerReport>, EvalError> {
     activations(weights)?
         .iter()
-        .map(|activation| eval_layer(device, model, activation))
+        .map(|activation| eval_layer(device, modules, activation))
         .collect()
 }
 
-fn eval_layer<D: Device, M: Submodules<D>>(
+fn eval_layer<D: Device>(
     device: &mut D,
-    model: &M,
+    modules: &[(String, &dyn Module<D>)],
     activation: &Activation<'_>,
 ) -> Result<LayerReport, EvalError> {
     let Activation {
@@ -230,25 +229,23 @@ fn eval_layer<D: Device, M: Submodules<D>>(
         input,
         output: expected,
     } = *activation;
-    let input =
-        Tensor::from_bytes(device, input.bytes, input.dtype, input.shape).map_err(|error| {
-            error!(message = "Creating a submodule input tensor failed.", name, %error);
-            EvalError::Input
-        })?;
-    let actual = model
-        .forward_submodule(device, name, &input)
-        .map_err(|error| {
-            error!(message = "Submodule forward failed.", name, %error);
-            EvalError::Forward
-        })?;
     let report = |outcome| LayerReport {
         name: name.to_owned(),
         tolerance: tolerance(name),
         outcome,
     };
-    let Some(actual) = actual else {
+    let Some((_, module)) = modules.iter().find(|(module_name, _)| module_name == name) else {
         return Ok(report(LayerOutcome::Skipped));
     };
+    let input =
+        Tensor::from_bytes(device, input.bytes, input.dtype, input.shape).map_err(|error| {
+            error!(message = "Creating a submodule input tensor failed.", name, %error);
+            EvalError::Input
+        })?;
+    let actual = module.forward(device, &input).map_err(|error| {
+        error!(message = "Submodule forward failed.", name, %error);
+        EvalError::Forward
+    })?;
     if actual.dtype() != expected.dtype || *actual.shape() != expected.shape {
         return Ok(report(LayerOutcome::Mismatch {
             expected_dtype: format!("{:?}", expected.dtype),

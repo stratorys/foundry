@@ -11,6 +11,7 @@ use crate::nn::{
     DType,
     Device,
     Linear,
+    Module,
     Shape,
     StaticCache,
     Tensor,
@@ -137,20 +138,16 @@ impl<D: Device> LlamaAttention<D> {
         self.o_proj.forward(device, &attn_output)
     }
 
-    pub fn forward_submodule(
+    pub fn named_modules(
         &self,
-        device: &mut D,
-        target: &str,
-        input: &Tensor<D>,
-    ) -> Result<Option<Tensor<D>>, TensorError> {
-        let proj = match target {
-            "q_proj" => &self.q_proj,
-            "k_proj" => &self.k_proj,
-            "v_proj" => &self.v_proj,
-            "o_proj" => &self.o_proj,
-            _ => return Ok(None),
-        };
-        proj.forward(device, input).map(Some)
+        prefix: &str,
+    ) -> [(String, &dyn Module<D>); 4] {
+        [
+            (format!("{prefix}.q_proj"), &self.q_proj),
+            (format!("{prefix}.k_proj"), &self.k_proj),
+            (format!("{prefix}.v_proj"), &self.v_proj),
+            (format!("{prefix}.o_proj"), &self.o_proj),
+        ]
     }
 }
 

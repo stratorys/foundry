@@ -1,5 +1,6 @@
 use crate::nn::{
     Device,
+    Module,
     Shape,
     Tensor,
     TensorError,
@@ -15,8 +16,10 @@ impl<D: Device> Linear<D> {
             weight,
         }
     }
+}
 
-    pub fn forward(
+impl<D: Device> Module<D> for Linear<D> {
+    fn forward(
         &self,
         device: &mut D,
         x: &Tensor<D>,
@@ -49,13 +52,26 @@ impl<D: Device> Embedding<D> {
         }
     }
 
-    pub fn forward(
+    pub fn weight(&self) -> &Tensor<D> { &self.weight }
+}
+
+impl<D: Device> Module<D> for Embedding<D> {
+    fn forward(
         &self,
         device: &mut D,
         input_ids: &Tensor<D>,
     ) -> Result<Tensor<D>, TensorError> {
-        self.weight.index_select(device, 0, input_ids)
+        let flat_ids =
+            input_ids.reshape(Shape::try_from([input_ids.shape().numel()].as_slice())?)?;
+        let embeds = self.weight.index_select(device, 0, &flat_ids)?;
+        let hidden_size = embeds.shape().size(embeds.shape().last_dim()?)?;
+        let dims: Vec<usize> = input_ids
+            .shape()
+            .dims()
+            .iter()
+            .copied()
+            .chain([hidden_size])
+            .collect();
+        embeds.reshape(Shape::try_from(dims.as_slice())?)
     }
-
-    pub fn weight(&self) -> &Tensor<D> { &self.weight }
 }

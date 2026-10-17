@@ -2,6 +2,7 @@ use std::num::NonZeroUsize;
 
 use tracing::error;
 
+use crate::models::CausalLm;
 use crate::models::llama::attention::LlamaAttention;
 use crate::models::llama::error::tensor_failed;
 use crate::models::llama::mlp::LlamaMlp;
@@ -11,15 +12,12 @@ use crate::models::llama::{
     LlamaConfig,
     LlamaError,
 };
-use crate::models::{
-    CausalLm,
-    Submodules,
-};
 use crate::nn::{
     DType,
     Device,
     Embedding,
     Linear,
+    Module,
     RmsNorm,
     Shape,
     StaticCache,
@@ -115,25 +113,11 @@ impl<D: Device> CausalLm<D> for LlamaForCausalLm<D> {
     }
 }
 
-impl<D: Device> Submodules<D> for LlamaForCausalLm<D> {
-    type Error = LlamaError;
-
-    fn forward_submodule(
-        &self,
-        device: &mut D,
-        target: &str,
-        input: &Tensor<D>,
-    ) -> Result<Option<Tensor<D>>, Self::Error> {
-        let Some(target) = target.strip_prefix("model.") else {
-            return Ok(None);
-        };
-        self.model
-            .forward_submodule(device, target, input)
-            .map_err(tensor_failed)
-    }
-}
-
 impl<D: Device> LlamaForCausalLm<D> {
+    pub fn named_modules(&self) -> Vec<(String, &dyn Module<D>)> {
+        self.model.named_modules("model")
+    }
+
     fn last_token_logits(
         &self,
         device: &mut D,
@@ -200,7 +184,7 @@ impl<D: Device> LlamaModel<D> {
         let seq_len = input_ids.shape().size(SEQ_DIM)?;
         let position_ids = position_ids(device, past_seen_tokens, seq_len)?;
         let attention_mask = create_causal_mask(device, past_seen_tokens, seq_len)?;
-        let inputs_embeds = self.embed(device, input_ids)?;
+        let inputs_embeds = self.embed_tokens.forward(device, input_ids)?;
         let [cos, sin] = self.rotary_emb.forward(device, &position_ids)?;
         let hidden_states =
             self.layers
@@ -220,43 +204,23 @@ impl<D: Device> LlamaModel<D> {
 }
 
 impl<D: Device> LlamaModel<D> {
-    fn forward_submodule(
+    fn named_modules(
         &self,
-        device: &mut D,
-        target: &str,
-        input: &Tensor<D>,
-    ) -> Result<Option<Tensor<D>>, TensorError> {
-        if target == "embed_tokens" {
-            return self.embed(device, input).map(Some);
-        }
-        let Some((layer_idx, target)) = layer_target(target) else {
-            return Ok(None);
-        };
-        match self.layers.get(layer_idx) {
-            Some(layer) => layer.forward_submodule(device, target, input),
-            None => Ok(None),
-        }
-    }
-
-    fn embed(
-        &self,
-        device: &mut D,
-        input_ids: &Tensor<D>,
-    ) -> Result<Tensor<D>, TensorError> {
-        let flat_ids =
-            input_ids.reshape(Shape::try_from([input_ids.shape().numel()].as_slice())?)?;
-        let inputs_embeds = self.embed_tokens.forward(device, &flat_ids)?;
-        let hidden_size = inputs_embeds
-            .shape()
-            .size(inputs_embeds.shape().last_dim()?)?;
-        let dims: Vec<usize> = input_ids
-            .shape()
-            .dims()
-            .iter()
-            .copied()
-            .chain([hidden_size])
-            .collect();
-        inputs_embeds.reshape(Shape::try_from(dims.as_slice())?)
+        prefix: &str,
+    ) -> Vec<(String, &dyn Module<D>)> {
+        let embed_tokens: (String, &dyn Module<D>) =
+            (format!("{prefix}.embed_tokens"), &self.embed_tokens);
+        [embed_tokens]
+            .into_iter()
+            .chain(
+                self.layers
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(layer_idx, layer)| {
+                        layer.named_modules(&format!("{prefix}.layers.{layer_idx}"))
+                    }),
+            )
+            .collect()
     }
 }
 
@@ -324,30 +288,25 @@ impl<D: Device> LlamaDecoderLayer<D> {
 }
 
 impl<D: Device> LlamaDecoderLayer<D> {
-    fn forward_submodule(
+    fn named_modules(
         &self,
-        device: &mut D,
-        target: &str,
-        input: &Tensor<D>,
-    ) -> Result<Option<Tensor<D>>, TensorError> {
-        match target {
-            "input_layernorm" => self.input_layernorm.forward(device, input).map(Some),
-            "post_attention_layernorm" => self
-                .post_attention_layernorm
-                .forward(device, input)
-                .map(Some),
-            "mlp" => self.mlp.forward(device, input).map(Some),
-            _ => match target.strip_prefix("self_attn.") {
-                Some(target) => self.self_attn.forward_submodule(device, target, input),
-                None => Ok(None),
-            },
-        }
+        prefix: &str,
+    ) -> Vec<(String, &dyn Module<D>)> {
+        let input_layernorm: [(String, &dyn Module<D>); 1] =
+            [(format!("{prefix}.input_layernorm"), &self.input_layernorm)];
+        let post_attention: [(String, &dyn Module<D>); 2] = [
+            (
+                format!("{prefix}.post_attention_layernorm"),
+                &self.post_attention_layernorm,
+            ),
+            (format!("{prefix}.mlp"), &self.mlp),
+        ];
+        input_layernorm
+            .into_iter()
+            .chain(self.self_attn.named_modules(&format!("{prefix}.self_attn")))
+            .chain(post_attention)
+            .collect()
     }
-}
-
-fn layer_target(target: &str) -> Option<(usize, &str)> {
-    let (layer_idx, target) = target.strip_prefix("layers.")?.split_once('.')?;
-    Some((layer_idx.parse().ok()?, target))
 }
 
 fn load_rms_norm<D: Device, S: AsRef<[u8]>>(
@@ -401,31 +360,7 @@ fn check_forward(
 #[cfg(test)]
 mod tests {
     use crate::models::llama::LlamaError;
-    use crate::models::llama::model::{
-        check_forward,
-        layer_target,
-    };
-
-    #[test]
-    fn layer_target_splits_the_layer_index_from_the_submodule() {
-        assert_eq!(
-            [
-                layer_target("layers.0.mlp"),
-                layer_target("layers.27.self_attn.q_proj"),
-                layer_target("layers.x.mlp"),
-                layer_target("layers.0"),
-                layer_target("norm"),
-            ],
-            [
-                Some((0, "mlp")),
-                Some((27, "self_attn.q_proj")),
-                None,
-                None,
-                None,
-            ],
-            "a layer submodule, a nested one, a non-numeric index, no submodule, no layer"
-        );
-    }
+    use crate::models::llama::model::check_forward;
 
     #[test]
     fn check_forward_accepts_whole_batches_that_fit_the_cache() {

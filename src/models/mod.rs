@@ -25,14 +25,3 @@ pub trait CausalLm<D: Device> {
         past_seen_tokens: usize,
     ) -> Result<Tensor<D>, Self::Error>;
 }
-
-pub trait Submodules<D: Device> {
-    type Error: std::error::Error;
-
-    fn forward_submodule(
-        &self,
-        device: &mut D,
-        target: &str,
-        input: &Tensor<D>,
-    ) -> Result<Option<Tensor<D>>, Self::Error>;
-}

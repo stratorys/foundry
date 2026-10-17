@@ -1,6 +1,7 @@
 use crate::nn::{
     DType,
     Device,
+    Module,
     Shape,
     Tensor,
     TensorError,
@@ -32,8 +33,10 @@ impl<D: Device> RmsNorm<D> {
             weight,
         })
     }
+}
 
-    pub fn forward(
+impl<D: Device> Module<D> for RmsNorm<D> {
+    fn forward(
         &self,
         device: &mut D,
         x: &Tensor<D>,
