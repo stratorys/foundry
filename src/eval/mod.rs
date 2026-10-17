@@ -39,9 +39,12 @@ pub use self::generation::{
     top_k,
 };
 use crate::generate::{
-    CausalLm,
     Decoder,
     GenerateError,
+};
+use crate::models::{
+    CausalLm,
+    Submodules,
 };
 use crate::nn::{
     Device,
@@ -84,17 +87,6 @@ pub struct PromptReport {
 pub struct BaselineReport {
     pub engines: [String; 2],
     pub prompts: Vec<GenerationReport>,
-}
-
-pub trait Submodules<D: Device> {
-    type Error: std::error::Error;
-
-    fn forward_submodule(
-        &self,
-        device: &mut D,
-        target: &str,
-        input: &Tensor<D>,
-    ) -> Result<Option<Tensor<D>>, Self::Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

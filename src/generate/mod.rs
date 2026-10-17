@@ -9,6 +9,7 @@ use std::time::{
 use tracing::error;
 
 pub use self::error::GenerateError;
+use crate::models::CausalLm;
 use crate::nn::{
     DType,
     Device,
@@ -18,25 +19,6 @@ use crate::nn::{
 
 const VOCAB_DIM: usize = 1;
 const TOKEN_ID_BYTES: usize = 4;
-
-pub trait CausalLm<D: Device> {
-    type Cache;
-    type Error: std::error::Error;
-
-    fn cache(
-        &self,
-        device: &mut D,
-        batch_size: NonZeroUsize,
-    ) -> Result<Self::Cache, Self::Error>;
-
-    fn forward(
-        &self,
-        device: &mut D,
-        input_ids: &Tensor<D>,
-        past_key_values: &mut Self::Cache,
-        past_seen_tokens: usize,
-    ) -> Result<Tensor<D>, Self::Error>;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepLogits {

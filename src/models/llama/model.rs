@@ -2,8 +2,6 @@ use std::num::NonZeroUsize;
 
 use tracing::error;
 
-use crate::eval::Submodules;
-use crate::generate::CausalLm;
 use crate::models::llama::attention::LlamaAttention;
 use crate::models::llama::error::tensor_failed;
 use crate::models::llama::mlp::LlamaMlp;
@@ -12,6 +10,10 @@ use crate::models::llama::weights::load_tensor;
 use crate::models::llama::{
     LlamaConfig,
     LlamaError,
+};
+use crate::models::{
+    CausalLm,
+    Submodules,
 };
 use crate::nn::{
     DType,

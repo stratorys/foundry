@@ -49,10 +49,8 @@ use self::stats::{
     mean,
     ns_to_f64,
 };
-use crate::generate::{
-    CausalLm,
-    Decoder,
-};
+use crate::generate::Decoder;
+use crate::models::CausalLm;
 use crate::nn::Device;
 
 const NS_PER_MS: f64 = 1e6;
