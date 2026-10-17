@@ -1,46 +1,116 @@
-# Reference fixtures
+# Reference fixtures and benchmarks
 
-These scripts run a Hugging Face model with transformers and with MLX. Their outputs are the
-reference that Foundry's model tests compare against. The tests check that Foundry computes the
-same thing as both engines on the same bf16 weights.
+Generate reference outputs with transformers and MLX, check Foundry against them, then measure
+Foundry's speed and memory use. All three engines run on GPU with the same bf16 model weights.
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/). Each script pins its own dependencies.
-- The model must already be in the Hugging Face cache. The scripts never download weights.
+- macOS on Apple Silicon.
+- Rust nightly and [uv](https://docs.astral.sh/uv/).
+- `meta-llama/Llama-3.2-3B-Instruct` already in the Hugging Face cache. These commands do not
+  download model weights. Each Python script pins its dependencies.
 
-## Commands
+Run all commands from the repository root, in the same terminal, one at a time.
+Continue only when the previous command succeeds.
 
-Run from the repository root:
+## 1. Generate the references
+
+The scripts use the eight prompts in `prompts.txt`, generate up to 32 tokens per prompt, and
+record the top 5 token probabilities at each step. Their output files are called fixtures.
+Transformers selects CUDA when available, otherwise MPS. MLX requires a Metal GPU. Both scripts
+fail if their GPU backend is unavailable; inference never falls back to the CPU. Host transfers
+are used to read results and write fixture files.
 
 ```sh
-HF_HUB_OFFLINE=1 uv run --script tools/reference/transformers_fixtures.py --model HuggingFaceTB/SmolLM2-135M-Instruct
-HF_HUB_OFFLINE=1 uv run --script tools/reference/mlx_fixtures.py --model HuggingFaceTB/SmolLM2-135M-Instruct
-HF_HUB_OFFLINE=1 uv run --script tools/reference/transformers_fixtures.py --model meta-llama/Llama-3.2-3B-Instruct
-HF_HUB_OFFLINE=1 uv run --script tools/reference/mlx_fixtures.py --model meta-llama/Llama-3.2-3B-Instruct
+export HF_HUB_OFFLINE=1
+
+uv run --script tools/reference/transformers_fixtures.py --model meta-llama/Llama-3.2-3B-Instruct --max-tokens 32 --top-k 5 --out /tmp/llama-3.2-3B-transformers
+
+uv run --script tools/reference/mlx_fixtures.py --model meta-llama/Llama-3.2-3B-Instruct --max-tokens 32 --top-k 5 --out /tmp/llama-3.2-3B-mlx
 ```
 
-By default, the scripts use the eight prompts in `prompts.txt`, taken from vLLM's
-`tests/prompts/example.txt`. Options:
+Fixtures stay in `/tmp`. Generate them again if they are removed or the cached model changes.
 
-| Option | Default | Purpose |
+## 2. Build and choose a results directory
+
+```sh
+cargo +nightly build --release --locked
+
+export TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+export OUT="benchmarks/${TIMESTAMP}-llama-3.2-3b-metal"
+mkdir -p benchmarks
+mkdir "$OUT"
+echo "$OUT"
+```
+
+The UTC timestamp is generated once for both reports. For example, the directory may be
+`benchmarks/20261017T094813Z-llama-3.2-3b-metal/`. Stop if `mkdir` reports that it already exists.
+For another run, export a new timestamp and output directory.
+
+## 3. Evaluate, then benchmark
+
+Keep the same `OUT` value for these two commands. Run the benchmark only if the evaluation
+succeeds. Keep the machine on power and avoid other heavy workloads while measuring.
+
+```sh
+./target/release/foundry eval --model meta-llama/Llama-3.2-3B-Instruct --reference /tmp/llama-3.2-3B-transformers --reference /tmp/llama-3.2-3B-mlx --out "$OUT"
+
+./target/release/foundry bench --model meta-llama/Llama-3.2-3B-Instruct --prompt-tokens 512 --gen-tokens 128 --depth 0 --batch-size 1 --seed 0 --warmup-runs 1 --warmup-ms 0 --runs 10 --out "$OUT"
+```
+
+The benchmark uses random token IDs with a fixed seed: 512 prompt tokens, 128 decode steps,
+batch size 1 and no initial cache depth. It ignores EOS, runs one warmup, then measures ten runs.
+
+Results are written to `$OUT`:
+
+| File | Contents |
+|---|---|
+| `eval.json` | Module and generation comparisons against transformers and MLX. |
+| `report.json` | Configuration, token IDs, raw timings, statistics, peak Metal memory and source commit. |
+
+All speed measurements are from Foundry. Groups named `mlx`, `llama_cpp`, or other engines
+present those measurements using each engine's metric conventions.
+
+## Record the environment
+
+For later comparisons, also record the machine, toolchain and fixture checksums:
+
+```sh
+date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/environment.txt"
+git rev-parse HEAD >> "$OUT/environment.txt"
+rustc +nightly --version >> "$OUT/environment.txt"
+sw_vers >> "$OUT/environment.txt"
+sysctl hw.model hw.memsize machdep.cpu.brand_string >> "$OUT/environment.txt"
+shasum -a 256 /tmp/llama-3.2-3B-transformers/* /tmp/llama-3.2-3B-mlx/* > "$OUT/reference-sha256.txt"
+```
+
+Use a clean source tree and the same machine, build settings, model snapshot and reference engine
+versions when comparing runs. The recorded Llama benchmark uses snapshot
+`0cb88a4f764b7a12671c53f0838cd831a0843b95`. Timings will still vary between runs.
+
+## Reference options and files
+
+| Script option | Default | Purpose |
 |---|---|---|
-| `--prompt TEXT` | the prompts in `prompts.txt` | Text prompt, tokenized with the model tokenizer. Repeatable. |
-| `--prompt-ids 1,2,3` | none | Raw prompt token IDs, such as the random prompt in a `foundry bench` report. Repeatable. |
-| `--max-tokens N` | 32 | Maximum number of greedy tokens per prompt, as in vLLM's model tests. |
-| `--top-k K` | 5 | Number of top logprobs recorded at each step, as in vLLM's model tests. |
-| `--device DEVICE` | `cpu` | Torch device. transformers only. |
-| `--out DIR` | required | Output directory. |
+| `--model ID` | required | Cached Hugging Face model. Use the same model in Foundry. |
+| `--out DIR` | required | Fixture output directory. |
+| `--prompt TEXT` | eight prompts from `prompts.txt` | Custom text prompt; repeatable. |
+| `--prompt-ids 1,2,3` | none | Custom token IDs; repeatable. |
+| `--max-tokens N` | 32 | Maximum generated tokens per prompt. |
+| `--top-k K` | 5 | Number of token log probabilities recorded per step. |
+| `--device DEVICE` | `auto` | GPU backend: `auto`, `cuda`, or `mps`; transformers only. |
 
-Passing `--prompt` or `--prompt-ids` replaces the default prompts. To keep them, pass them again
-with `--prompt`.
+Custom prompts replace the default prompts. For a smaller model, use
+`HuggingFaceTB/SmolLM2-135M-Instruct` with separate fixture directories under `/tmp`.
 
-## Outputs
+| Fixture | Contents |
+|---|---|
+| `generation.json` | Prompt IDs, generated IDs, top-k log probabilities and engine versions. |
+| `last_logits.safetensors` | Last prompt token's logits, used for first-step metrics. |
+| `activations.safetensors` | Embedding and layer-0 module inputs and outputs; transformers only. |
 
-Fixtures are never committed.
-
-| File | Content | Used to check |
-|---|---|---|
-| `generation.json` | For each prompt: the prompt IDs, the greedy output IDs (generation stops after an EOS ID from `config.json`), and the top-k logprobs at each step. It also records the engine versions, dtype and device. | Generation, using vLLM's rule: equal IDs, or each token is in the other engine's top-k at the step where they diverge. |
-| `last_logits.safetensors` | f32 logits of the last prompt token, one tensor per prompt (`prompt.<index>`). | Logits, using llama.cpp's rule: top 10, max absolute difference, NMSE < 1e-2. |
-| `activations.safetensors` | transformers only. Input and output of the embedding and of each layer 0 submodule, for the first prompt. | Each layer 0 module, as ZML checks it. |
+Evaluation requires activations from at least one reference. A checked module passes when at
+least 99.9% of its elements are within tolerance, with no NaN or Inf. Generation passes when
+token IDs match or, at the first difference, each token is in the other engine's top-k.
+First-step metrics and the transformers/MLX comparison are informational. Any module or
+generation failure makes `foundry eval` exit with an error.

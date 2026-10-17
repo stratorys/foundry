@@ -72,6 +72,10 @@ def generate(model, prompt_ids, args, eos):
 
 def main():
     args = parse_args()
+    if not mx.metal.is_available():
+        raise RuntimeError("A Metal GPU is required to generate MLX references.")
+    mx.set_default_device(mx.gpu)
+    print(f"Selected GPU: {mx.default_device()}.", flush=True)
     snapshot = Path(snapshot_download(args.model, local_files_only=True))
     out = args.out
     out.mkdir(parents=True, exist_ok=True)

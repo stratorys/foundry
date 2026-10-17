@@ -11,8 +11,12 @@
 
 import argparse
 import json
+import os
 from importlib.metadata import version
 from pathlib import Path
+
+# Unsupported MPS operations must fail rather than run on the CPU.
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 
 import torch
 from huggingface_hub import snapshot_download
@@ -40,9 +44,17 @@ def parse_args():
     parser.add_argument("--prompt-ids", action="append", default=[], help="Comma-separated prompt token IDs. Repeatable.")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps"], default="auto", help="GPU backend; auto selects CUDA, then MPS. No CPU fallback.")
     parser.add_argument("--out", type=Path, required=True, help="Output directory.")
     return parser.parse_args()
+
+
+def select_device(requested):
+    if requested in ("auto", "cuda") and torch.cuda.is_available():
+        return "cuda"
+    if requested in ("auto", "mps") and torch.backends.mps.is_available():
+        return "mps"
+    raise RuntimeError(f"No available GPU for --device {requested}; a CUDA or MPS GPU is required.")
 
 
 def eos_token_ids(snapshot):
@@ -102,6 +114,8 @@ def layer_0_activations(model, prompt_ids, device):
 
 def main():
     args = parse_args()
+    args.device = select_device(args.device)
+    print(f"Selected GPU: {args.device}.", flush=True)
     snapshot = Path(snapshot_download(args.model, local_files_only=True))
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
