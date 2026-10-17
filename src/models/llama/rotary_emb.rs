@@ -18,21 +18,14 @@ use crate::models::llama::{
 };
 
 const MAX_POSITION_COUNT: usize = 1 << f32::MANTISSA_DIGITS;
-const LAST_DIM: usize = 3;
 
-pub struct LlamaRope<B: Backend> {
-    cos: Tensor<B>,
-    sin: Tensor<B>,
+pub struct LlamaRotaryEmbedding<B: Backend> {
+    cos_cached: Tensor<B>,
+    sin_cached: Tensor<B>,
     head_dim: usize,
 }
 
-pub struct RopeAngles<B: Backend> {
-    cos: Tensor<B>,
-    sin: Tensor<B>,
-    half_dim: usize,
-}
-
-impl<B: Backend> LlamaRope<B> {
+impl<B: Backend> LlamaRotaryEmbedding<B> {
     pub fn new(
         backend: &mut B,
         config: &LlamaConfig,
@@ -40,12 +33,12 @@ impl<B: Backend> LlamaRope<B> {
     ) -> Result<Self, LlamaError<B::Error>> {
         let head_dim = config.head_dim();
         let angles = angles(
-            &inv_frequencies(head_dim, config.rope_theta(), config.rope_scaling())?,
+            &inv_freq(head_dim, config.rope_theta(), config.rope_scaling())?,
             max_cache_len,
             config.max_position_embeddings().min(MAX_POSITION_COUNT),
         )?;
         let functions: [fn(f32) -> f32; 2] = [f32::cos, f32::sin];
-        let [cos, sin] = functions.map(|function| {
+        let [cos_cached, sin_cached] = functions.map(|function| {
             Tensor::from_bytes(
                 backend,
                 &angles
@@ -58,46 +51,52 @@ impl<B: Backend> LlamaRope<B> {
             .to_dtype(backend, DType::BF16)
         });
         Ok(Self {
-            cos: cos?,
-            sin: sin?,
+            cos_cached: cos_cached?,
+            sin_cached: sin_cached?,
             head_dim,
         })
     }
 
-    pub fn at(
+    pub fn forward(
         &self,
         backend: &mut B,
         position_ids: &Tensor<B>,
-    ) -> Result<RopeAngles<B>, TensorError<B::Error>> {
+    ) -> Result<[Tensor<B>; 2], TensorError<B::Error>> {
         let shape = Shape::try_from([position_ids.shape().numel(), 1, self.head_dim].as_slice())?;
-        let [cos, sin] = [&self.cos, &self.sin].map(|table| {
+        let [cos, sin] = [&self.cos_cached, &self.sin_cached].map(|table| {
             Ok::<_, TensorError<B::Error>>(
                 table
                     .index_select(backend, 0, position_ids)?
                     .reshape(shape)?,
             )
         });
-        Ok(RopeAngles {
-            cos: cos?,
-            sin: sin?,
-            half_dim: self.head_dim / 2,
-        })
+        Ok([cos?, sin?])
     }
 }
 
-impl<B: Backend> RopeAngles<B> {
-    pub fn apply(
-        &self,
-        backend: &mut B,
-        x: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        let neg_x2 = x
-            .narrow(LAST_DIM, self.half_dim, self.half_dim)?
-            .neg(backend)?;
-        let x1 = x.narrow(LAST_DIM, 0, self.half_dim)?;
-        let rotated = Tensor::cat(backend, [&neg_x2, &x1], LAST_DIM)?.mul(backend, &self.sin)?;
-        x.mul(backend, &self.cos)?.add(backend, &rotated)
-    }
+pub fn apply_rotary_pos_emb<B: Backend>(
+    backend: &mut B,
+    q: &Tensor<B>,
+    k: &Tensor<B>,
+    cos: &Tensor<B>,
+    sin: &Tensor<B>,
+) -> Result<[Tensor<B>; 2], TensorError<B::Error>> {
+    let [q_embed, k_embed] = [q, k].map(|x| {
+        let rotated = rotate_half(backend, x)?.mul(backend, sin)?;
+        x.mul(backend, cos)?.add(backend, &rotated)
+    });
+    Ok([q_embed?, k_embed?])
+}
+
+fn rotate_half<B: Backend>(
+    backend: &mut B,
+    x: &Tensor<B>,
+) -> Result<Tensor<B>, TensorError<B::Error>> {
+    let last_dim = x.shape().last_dim()?;
+    let half_dim = x.shape().size(last_dim)? / 2;
+    let neg_x2 = x.narrow(last_dim, half_dim, half_dim)?.neg(backend)?;
+    let x1 = x.narrow(last_dim, 0, half_dim)?;
+    Tensor::cat(backend, [&neg_x2, &x1], last_dim)
 }
 
 fn angles<E: std::error::Error + 'static>(
@@ -125,7 +124,7 @@ fn angles<E: std::error::Error + 'static>(
     )
 }
 
-fn inv_frequencies<E: std::error::Error + 'static>(
+fn inv_freq<E: std::error::Error + 'static>(
     head_dim: usize,
     theta: f32,
     scaling: Option<&Llama3RopeScaling>,
@@ -143,13 +142,13 @@ fn inv_frequencies<E: std::error::Error + 'static>(
         .map(|dim_index| {
             let inv_frequency = theta.powf(exact_f32(dim_index)? / head_dim_f32).recip();
             scaling.map_or(Ok(inv_frequency), |scaling| {
-                llama3_scaled(inv_frequency, scaling)
+                llama3_inv_freq(inv_frequency, scaling)
             })
         })
         .collect()
 }
 
-fn llama3_scaled<E: std::error::Error + 'static>(
+fn llama3_inv_freq<E: std::error::Error + 'static>(
     inv_frequency: f32,
     scaling: &Llama3RopeScaling,
 ) -> Result<f32, LlamaError<E>> {
@@ -177,9 +176,9 @@ mod tests {
     use std::convert::Infallible;
     use std::f64::consts::TAU;
 
-    use crate::models::llama::rope::{
+    use crate::models::llama::rotary_emb::{
         angles,
-        inv_frequencies,
+        inv_freq,
     };
     use crate::models::llama::{
         Llama3RopeScaling,
@@ -187,15 +186,15 @@ mod tests {
     };
 
     #[test]
-    fn inv_frequencies_follow_the_llama3_formula_in_each_band() {
+    fn inv_freq_follow_the_llama3_formula_in_each_band() {
         let scaling = Llama3RopeScaling {
             factor: 32.0,
             low_freq_factor: 1.0,
             high_freq_factor: 4.0,
             original_max_position_embeddings: 8192,
         };
-        let inv_frequencies = inv_frequencies::<Infallible>(128, 500_000.0, Some(&scaling))
-            .expect("the head dim is valid");
+        let inv_frequencies =
+            inv_freq::<Infallible>(128, 500_000.0, Some(&scaling)).expect("the head dim is valid");
         assert_eq!(inv_frequencies.len(), 64, "one frequency per rotated pair");
         [0_u8, 32, 63].iter().for_each(|&dim_index| {
             let period = 500_000.0_f64.powf(f64::from(dim_index) * 2.0 / 128.0);
@@ -225,9 +224,9 @@ mod tests {
     }
 
     #[test]
-    fn inv_frequencies_without_scaling_are_powers_of_theta() {
+    fn inv_freq_without_scaling_are_powers_of_theta() {
         let inv_frequencies =
-            inv_frequencies::<Infallible>(64, 100_000.0, None).expect("the head dim is valid");
+            inv_freq::<Infallible>(64, 100_000.0, None).expect("the head dim is valid");
         assert_eq!(inv_frequencies.len(), 32, "one frequency per rotated pair");
         [0_u8, 16, 31].iter().for_each(|&dim_index| {
             let expected = 100_000.0_f64
@@ -246,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn inv_frequencies_reject_an_odd_head_dim() {
+    fn inv_freq_reject_an_odd_head_dim() {
         let scaling = Llama3RopeScaling {
             factor: 32.0,
             low_freq_factor: 1.0,
@@ -254,7 +253,7 @@ mod tests {
             original_max_position_embeddings: 8192,
         };
         assert_eq!(
-            inv_frequencies::<Infallible>(3, 500_000.0, Some(&scaling)),
+            inv_freq::<Infallible>(3, 500_000.0, Some(&scaling)),
             Err(LlamaError::HeadDimInvalid),
             "an odd head dim is rejected"
         );

@@ -72,11 +72,11 @@ pub enum CoreError {
     #[error("Query, keys and values are incompatible for attention.")]
     AttentionIncompatible,
 
-    #[error("Attention head dim does not match.")]
-    AttentionHeadDimMismatch,
-
     #[error("Keys and values do not have the same shape.")]
     KvIncompatible,
+
+    #[error("Layer index exceeds the cache layers.")]
+    CacheLayerOutOfRange,
 }
 
 /// A validation failure or a concrete backend failure during a tensor

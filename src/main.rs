@@ -39,9 +39,8 @@ use foundry::generate::{
     generate,
 };
 use foundry::models::llama::{
-    Llama,
     LlamaConfig,
-    LlamaWeights,
+    LlamaForCausalLm,
 };
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
@@ -166,11 +165,8 @@ enum CliError {
     #[error("No backend is available on this platform.")]
     BackendUnavailable,
 
-    #[error("Loading the model weights failed.")]
+    #[error("Loading the model failed.")]
     Load,
-
-    #[error("Building the model failed.")]
-    Model,
 
     #[error("Prompt and generated token counts overflow usize.")]
     SeqLenOverflow,
@@ -599,17 +595,14 @@ fn load_llama<B: Backend>(
     config: &LlamaConfig,
     weights: &Weights,
     max_cache_len: usize,
-) -> Result<Llama<B>, CliError> {
+) -> Result<LlamaForCausalLm<B>, CliError> {
     info!(message = "Loading the model.", %model);
     let load_start = Instant::now();
-    let llama_weights = LlamaWeights::load(backend, config, weights).map_err(|error| {
-        error!(message = "Loading the model weights failed.", %model, %error);
-        CliError::Load
-    })?;
-    let llama = Llama::new(backend, config, llama_weights, max_cache_len).map_err(|error| {
-        error!(message = "Building the model failed.", %model, max_cache_len, %error);
-        CliError::Model
-    })?;
+    let llama =
+        LlamaForCausalLm::load(backend, config, weights, max_cache_len).map_err(|error| {
+            error!(message = "Loading the model failed.", %model, max_cache_len, %error);
+            CliError::Load
+        })?;
     info!(
         message = "Loaded the model.",
         %model,

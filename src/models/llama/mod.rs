@@ -1,7 +1,9 @@
+mod attention;
 mod config;
 mod error;
+mod mlp;
 mod model;
-mod rope;
+mod rotary_emb;
 mod weights;
 
 pub use self::config::{
@@ -12,8 +14,4 @@ pub use self::error::{
     LlamaConfigError,
     LlamaError,
 };
-pub use self::model::Llama;
-pub use self::weights::{
-    LlamaLayerWeights,
-    LlamaWeights,
-};
+pub use self::model::LlamaForCausalLm;

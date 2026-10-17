@@ -44,9 +44,6 @@ pub enum LlamaError<E: std::error::Error + 'static> {
     #[error("Key-value width overflows usize.")]
     KvDimOverflow,
 
-    #[error("Uploaded byte count overflows usize.")]
-    UploadedBytesOverflow,
-
     #[error("Maximum sequence length exceeds the allowed length.")]
     MaxCacheLenTooLarge,
 

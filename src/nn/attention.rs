@@ -1,5 +1,3 @@
-use std::num::NonZeroUsize;
-
 use tracing::error;
 
 use crate::core::{
@@ -9,19 +7,8 @@ use crate::core::{
     Shape,
     Tensor,
     TensorError,
-    exact_f32,
 };
-use crate::nn::{
-    KvCache,
-    softmax,
-};
-
-const SEQ_DIM: usize = 2;
-
-pub struct Attention<B: Backend> {
-    head_dim: NonZeroUsize,
-    scale: Tensor<B>,
-}
+use crate::nn::softmax;
 
 #[derive(Debug, PartialEq, Eq)]
 struct AttentionDims {
@@ -34,80 +21,50 @@ struct AttentionDims {
     head_dim: usize,
 }
 
-impl<B: Backend> Attention<B> {
-    pub fn new(
-        backend: &mut B,
-        head_dim: NonZeroUsize,
-    ) -> Result<Self, TensorError<B::Error>> {
-        let head_dim_f32 = exact_f32(head_dim.get())?;
-        Ok(Self {
-            head_dim,
-            scale: Tensor::from_bytes(
-                backend,
-                &head_dim_f32.sqrt().recip().to_le_bytes(),
-                DType::F32,
-                Shape::try_from([1].as_slice())?,
-            )?,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        backend: &mut B,
-        query: &Tensor<B>,
-        cache: &KvCache<B>,
-        kv_length: usize,
-        attention_mask: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        let keys = &cache.keys().narrow(SEQ_DIM, 0, kv_length)?;
-        let values = &cache.values().narrow(SEQ_DIM, 0, kv_length)?;
-        let AttentionDims {
-            batch,
-            heads,
-            kv_heads,
-            group,
-            seq_len,
-            kv_length,
-            head_dim,
-        } = attention_dims(self.head_dim, query.shape(), keys.shape(), values.shape())?;
-        let rows = group.saturating_mul(seq_len);
-        let keys_t = keys.permute(&[0, 1, 3, 2])?;
-        let attention_mask_f32 = attention_mask.to_dtype(backend, DType::F32)?;
-        let scores = query
-            .contiguous(backend)?
-            .reshape(Shape::try_from(
-                [batch, kv_heads, rows, head_dim].as_slice(),
-            )?)?
-            .matmul(backend, &keys_t)?
-            .reshape(Shape::try_from(
-                [batch.saturating_mul(kv_heads), group, seq_len, kv_length].as_slice(),
-            )?)?
-            .to_dtype(backend, DType::F32)?
-            .mul(backend, &self.scale)?
-            .add(backend, &attention_mask_f32)?;
-        Ok(softmax(backend, &scores, scores.shape().last_dim()?)?
-            .to_dtype(backend, query.dtype())?
-            .reshape(Shape::try_from(
-                [batch, kv_heads, rows, kv_length].as_slice(),
-            )?)?
-            .matmul(backend, values)?
-            .reshape(Shape::try_from(
-                [batch, heads, seq_len, head_dim].as_slice(),
-            )?)?
-            .permute(&[0, 2, 1, 3])?
-            .contiguous(backend)?
-            .reshape(Shape::try_from(
-                [
-                    batch.saturating_mul(seq_len),
-                    heads.saturating_mul(head_dim),
-                ]
-                .as_slice(),
-            )?)?)
-    }
+pub fn scaled_dot_product_attention<B: Backend>(
+    backend: &mut B,
+    query: &Tensor<B>,
+    key: &Tensor<B>,
+    value: &Tensor<B>,
+    attn_mask: &Tensor<B>,
+    scale: &Tensor<B>,
+) -> Result<Tensor<B>, TensorError<B::Error>> {
+    let AttentionDims {
+        batch,
+        heads,
+        kv_heads,
+        group,
+        seq_len,
+        kv_length,
+        head_dim,
+    } = attention_dims(query.shape(), key.shape(), value.shape())?;
+    let rows = group.saturating_mul(seq_len);
+    let key_t = key.permute(&[0, 1, 3, 2])?;
+    let attn_mask_f32 = attn_mask.to_dtype(backend, DType::F32)?;
+    let scores = query
+        .contiguous(backend)?
+        .reshape(Shape::try_from(
+            [batch, kv_heads, rows, head_dim].as_slice(),
+        )?)?
+        .matmul(backend, &key_t)?
+        .reshape(Shape::try_from(
+            [batch.saturating_mul(kv_heads), group, seq_len, kv_length].as_slice(),
+        )?)?
+        .to_dtype(backend, DType::F32)?
+        .mul(backend, scale)?
+        .add(backend, &attn_mask_f32)?;
+    Ok(softmax(backend, &scores, scores.shape().last_dim()?)?
+        .to_dtype(backend, query.dtype())?
+        .reshape(Shape::try_from(
+            [batch, kv_heads, rows, kv_length].as_slice(),
+        )?)?
+        .matmul(backend, value)?
+        .reshape(Shape::try_from(
+            [batch, heads, seq_len, head_dim].as_slice(),
+        )?)?)
 }
 
 fn attention_dims(
-    head_dim_expected: NonZeroUsize,
     query: &Shape,
     keys: &Shape,
     values: &Shape,
@@ -136,14 +93,6 @@ fn attention_dims(
     if !is_compatible {
         return Err(incompatible());
     }
-    if head_dim != head_dim_expected.get() {
-        error!(
-            message = "Attention head dim does not match.",
-            head_dim,
-            head_dim_expected = head_dim_expected.get(),
-        );
-        return Err(CoreError::AttentionHeadDimMismatch);
-    }
     Ok(AttentionDims {
         batch,
         heads,
@@ -157,8 +106,6 @@ fn attention_dims(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use crate::core::{
         CoreError,
         Shape,
@@ -173,12 +120,7 @@ mod tests {
         let [query, keys] = [[2, 4, 1, 2], [2, 2, 3, 2]]
             .map(|dims| Shape::try_from(dims.as_slice()).expect("the shape is valid"));
         assert_eq!(
-            attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
-                &query,
-                &keys,
-                &keys,
-            ),
+            attention_dims(&query, &keys, &keys,),
             Ok(AttentionDims {
                 batch: 2,
                 heads: 4,
@@ -196,7 +138,6 @@ mod tests {
     fn attention_dims_rejects_rank_other_than_four() {
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
@@ -206,7 +147,6 @@ mod tests {
         );
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
@@ -220,7 +160,6 @@ mod tests {
     fn attention_dims_rejects_zero_kv_heads() {
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 0, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 0, 2, 2].as_slice()).expect("the shape is valid"),
@@ -234,7 +173,6 @@ mod tests {
     fn attention_dims_rejects_heads_not_a_multiple_of_kv_heads() {
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([1, 3, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
@@ -248,7 +186,6 @@ mod tests {
     fn attention_dims_rejects_query_longer_than_keys() {
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([1, 4, 3, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
@@ -262,7 +199,6 @@ mod tests {
     fn attention_dims_rejects_key_head_dim_mismatch() {
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 4].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 4].as_slice()).expect("the shape is valid"),
@@ -276,7 +212,6 @@ mod tests {
     fn attention_dims_rejects_values_shaped_unlike_keys() {
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 3, 2].as_slice()).expect("the shape is valid"),
@@ -290,27 +225,12 @@ mod tests {
     fn attention_dims_rejects_query_and_keys_of_different_batches() {
         assert_eq!(
             attention_dims(
-                NonZeroUsize::new(2).expect("the head dim is non-zero"),
                 &Shape::try_from([2, 4, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
                 &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
             ),
             Err(CoreError::AttentionIncompatible),
             "a query of two sequences over keys of one sequence"
-        );
-    }
-
-    #[test]
-    fn attention_dims_rejects_a_head_dim_other_than_the_expected_one() {
-        assert_eq!(
-            attention_dims(
-                NonZeroUsize::new(4).expect("the head dim is non-zero"),
-                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
-            ),
-            Err(CoreError::AttentionHeadDimMismatch),
-            "head dim 2 where 4 is expected"
         );
     }
 }
