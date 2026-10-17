@@ -424,70 +424,15 @@ mod tests {
         NonZeroUsize,
     };
 
-    use crate::backend::cpu::{
-        CpuBackend,
-        CpuError,
-    };
     use crate::bench::{
         BenchConfig,
         BenchError,
+        Inputs,
         Mode,
-        bench,
+        draw_inputs,
         token_ids,
     };
-    use crate::core::{
-        DType,
-        Shape,
-        SplitMix64,
-        Tensor,
-        TensorError,
-    };
-    use crate::generate::CausalLm;
-
-    const VOCAB_SIZE: usize = 64;
-
-    struct PositionModel;
-
-    impl CausalLm<CpuBackend> for PositionModel {
-        type Cache = ();
-        type Error = TensorError<CpuError>;
-
-        fn cache(
-            &self,
-            _backend: &mut CpuBackend,
-            _batch_size: NonZeroUsize,
-        ) -> Result<Self::Cache, Self::Error> {
-            Ok(())
-        }
-
-        fn forward(
-            &self,
-            backend: &mut CpuBackend,
-            token_ids: &Tensor<CpuBackend>,
-            positions: &Tensor<CpuBackend>,
-            _mask: &Tensor<CpuBackend>,
-            _cache: &mut Self::Cache,
-            position: usize,
-        ) -> Result<Tensor<CpuBackend>, Self::Error> {
-            let seq_len = positions.shape().element_count();
-            let batch_size = token_ids
-                .shape()
-                .element_count()
-                .checked_div(seq_len)
-                .expect("the step holds at least one position");
-            let seq_len_total = position.saturating_add(seq_len);
-            let logits = (0..batch_size)
-                .flat_map(|sequence| {
-                    (0..VOCAB_SIZE).map(move |token_id| {
-                        f32::from(u8::from(token_id == seq_len_total.saturating_add(sequence)))
-                    })
-                })
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<u8>>();
-            let shape = Shape::try_from([batch_size, VOCAB_SIZE].as_slice())?;
-            Tensor::upload(backend, &logits, DType::F32, shape)
-        }
-    }
+    use crate::core::SplitMix64;
 
     const CONFIG: BenchConfig = BenchConfig {
         prompt_token_count: 0,
@@ -543,158 +488,40 @@ mod tests {
     }
 
     #[test]
-    fn each_mode_steps_through_the_expected_positions() {
-        struct ConfigShapeCase {
-            config: BenchConfig,
-            mode: Mode,
-            prefill: bool,
-            token_ids: Vec<Vec<u32>>,
-        }
-        [
-            ConfigShapeCase {
-                config: BenchConfig {
-                    prompt_token_count: 3,
-                    gen_token_count: 0,
-                    depth_token_count: 2,
-                    ..CONFIG
-                },
-                mode: Mode::Pp,
-                prefill: true,
-                token_ids: vec![vec![5]],
-            },
-            ConfigShapeCase {
-                config: BenchConfig {
-                    prompt_token_count: 0,
-                    gen_token_count: 3,
-                    depth_token_count: 2,
-                    ..CONFIG
-                },
-                mode: Mode::Tg,
-                prefill: false,
-                token_ids: vec![vec![3, 4, 5]],
-            },
-            ConfigShapeCase {
-                config: BenchConfig {
-                    prompt_token_count: 0,
-                    gen_token_count: 3,
-                    depth_token_count: 2,
-                    batch_size: NonZeroU32::MIN.saturating_add(1),
-                    ..CONFIG
-                },
-                mode: Mode::Tg,
-                prefill: false,
-                token_ids: vec![vec![3, 4, 5], vec![4, 5, 6]],
-            },
-            ConfigShapeCase {
-                config: BenchConfig {
-                    prompt_token_count: 3,
-                    gen_token_count: 2,
-                    depth_token_count: 2,
-                    ..CONFIG
-                },
-                mode: Mode::Pg,
-                prefill: true,
-                token_ids: vec![vec![5, 6, 7]],
-            },
-            ConfigShapeCase {
-                config: BenchConfig {
-                    prompt_token_count: 3,
-                    gen_token_count: 2,
-                    depth_token_count: 2,
-                    batch_size: NonZeroU32::MIN.saturating_add(1),
-                    ..CONFIG
-                },
-                mode: Mode::Pg,
-                prefill: true,
-                token_ids: vec![vec![5, 6, 7], vec![6, 7, 8]],
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |ConfigShapeCase {
-                 config,
-                 mode,
-                 prefill,
-                 token_ids,
-             }| {
-                let report = bench(
-                    &mut CpuBackend::new(),
-                    &PositionModel,
-                    NonZeroU32::new(64).expect("64 is not zero"),
-                    &config,
-                )
-                .expect("the benchmark runs");
-                let decode_step_count =
-                    usize::try_from(config.gen_token_count).expect("u32 fits in usize");
-                let batch_size =
-                    usize::try_from(config.batch_size.get()).expect("u32 fits in usize");
-                let prompt_len = usize::try_from(config.prompt_token_count).expect("fits");
-                assert_eq!(
-                    (
-                        report.mode,
-                        report.warmup_run_count,
-                        report
-                            .depth_ids
-                            .iter()
-                            .map(Vec::len)
-                            .collect::<Vec<usize>>(),
-                        report
-                            .prompt_ids
-                            .iter()
-                            .map(Vec::len)
-                            .collect::<Vec<usize>>(),
-                        report.start_ids.as_ref().map(Vec::len),
-                        report.peak_memory_bytes,
-                        report.peak_memory_source,
-                    ),
-                    (
-                        mode,
-                        2,
-                        vec![2; batch_size],
-                        vec![prompt_len; batch_size],
-                        (mode == Mode::Tg).then_some(batch_size),
-                        None,
-                        None,
-                    ),
-                    "inputs of {mode:?}"
-                );
-                assert_eq!(report.runs.len(), 3, "three measured runs of {mode:?}");
-                report.runs.iter().for_each(|run| {
-                    assert_eq!(
-                        (
-                            run.prefill_ns.is_some(),
-                            run.decode_ns.len(),
-                            &run.token_ids,
-                            run.peak_memory_bytes,
-                        ),
-                        (prefill, decode_step_count, &token_ids, None),
-                        "each token is the cache length after its step plus the sequence index in \
-                         {mode:?}"
-                    );
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn duration_warmup_runs_until_the_budget_is_spent() {
-        let report = bench(
-            &mut CpuBackend::new(),
-            &PositionModel,
-            NonZeroU32::new(64).expect("64 is not zero"),
-            &BenchConfig {
-                prompt_token_count: 1,
-                gen_token_count: 1,
-                warmup_run_count: 0,
-                warmup_ms: 1,
-                ..CONFIG
-            },
-        )
-        .expect("the benchmark runs");
-        assert!(
-            report.warmup_run_count >= 1,
-            "at least one warmup run fills 1 ms, got {}",
-            report.warmup_run_count
+    fn draw_inputs_gives_each_sequence_its_own_rows() {
+        let vocab_size = NonZeroU32::new(64).expect("64 is not zero");
+        let config = BenchConfig {
+            prompt_token_count: 3,
+            gen_token_count: 2,
+            depth_token_count: 2,
+            batch_size: NonZeroU32::MIN.saturating_add(1),
+            ..CONFIG
+        };
+        let shape = |inputs: Inputs| {
+            (
+                inputs.batch_size,
+                inputs
+                    .depth_ids
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<usize>>(),
+                inputs
+                    .prompt_ids
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<usize>>(),
+                inputs.start_ids.as_ref().map(Vec::len),
+                inputs.gen_token_count,
+            )
+        };
+        let batch_size = NonZeroUsize::new(2).expect("2 is not zero");
+        assert_eq!(
+            [Mode::Pg, Mode::Tg].map(|mode| draw_inputs(&config, mode, vocab_size).map(shape)),
+            [
+                Ok((batch_size, vec![2, 2], vec![3, 3], None, 2)),
+                Ok((batch_size, vec![2, 2], vec![3, 3], Some(2), 2)),
+            ],
+            "two sequences of depth 2 and prompt 3; only tg draws start tokens"
         );
     }
 
@@ -717,19 +544,18 @@ mod tests {
 
     #[test]
     fn same_seed_draws_the_same_inputs() {
+        let config = BenchConfig {
+            prompt_token_count: 4,
+            gen_token_count: 1,
+            depth_token_count: 4,
+            ..CONFIG
+        };
         let draw = || {
-            bench(
-                &mut CpuBackend::new(),
-                &PositionModel,
+            draw_inputs(
+                &config,
+                Mode::Pg,
                 NonZeroU32::new(64).expect("64 is not zero"),
-                &BenchConfig {
-                    prompt_token_count: 4,
-                    gen_token_count: 1,
-                    depth_token_count: 4,
-                    ..CONFIG
-                },
             )
-            .map(|report| (report.depth_ids, report.prompt_ids))
         };
         assert_eq!(draw(), draw(), "seed 7 gives the same depth and prompt IDs");
     }

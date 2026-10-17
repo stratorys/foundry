@@ -30,7 +30,7 @@ pub enum LlamaConfigError {
     UntiedEmbeddings,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LlamaError<E: std::error::Error + 'static> {
     #[error("Tensor is not in the weights.")]
     TensorNotFound,

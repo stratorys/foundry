@@ -305,4 +305,18 @@ mod tests {
             "a query of two sequences over keys of one sequence"
         );
     }
+
+    #[test]
+    fn attention_dims_rejects_a_head_dim_other_than_the_expected_one() {
+        assert_eq!(
+            attention_dims(
+                NonZeroUsize::new(4).expect("the head dim is non-zero"),
+                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+            ),
+            Err(CoreError::AttentionHeadDimMismatch),
+            "head dim 2 where 4 is expected"
+        );
+    }
 }

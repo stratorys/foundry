@@ -38,26 +38,12 @@ impl<B: Backend> LlamaRope<B> {
         config: &LlamaConfig,
         seq_len_max: usize,
     ) -> Result<Self, LlamaError<B::Error>> {
-        let seq_len_max_allowed = config.max_position_embeddings().min(POSITION_COUNT_MAX);
-        if seq_len_max > seq_len_max_allowed {
-            error!(
-                message = "Maximum sequence length exceeds the allowed length.",
-                seq_len_max, seq_len_max_allowed,
-            );
-            return Err(LlamaError::SeqLenMaxTooLarge);
-        }
         let head_dim = config.head_dim();
-        let inv_frequencies =
-            inv_frequencies(head_dim, config.rope_theta(), config.rope_scaling())?;
-        let angles: Vec<f32> = iter::successors(Some(0.0_f32), |position| Some(position + 1.0))
-            .take(seq_len_max)
-            .flat_map(|position| {
-                inv_frequencies
-                    .iter()
-                    .chain(&inv_frequencies)
-                    .map(move |inv_frequency| position * inv_frequency)
-            })
-            .collect();
+        let angles = angles(
+            &inv_frequencies(head_dim, config.rope_theta(), config.rope_scaling())?,
+            seq_len_max,
+            config.max_position_embeddings().min(POSITION_COUNT_MAX),
+        )?;
         let functions: [fn(f32) -> f32; 2] = [f32::cos, f32::sin];
         let [cos, sin] = functions.map(|function| {
             Tensor::upload(
@@ -109,6 +95,31 @@ impl<B: Backend> RopeAngles<B> {
             .mul(backend, &self.sin)?;
         x.mul(backend, &self.cos)?.add(backend, &rotated)
     }
+}
+
+fn angles<E: std::error::Error + 'static>(
+    inv_frequencies: &[f32],
+    seq_len_max: usize,
+    seq_len_max_allowed: usize,
+) -> Result<Vec<f32>, LlamaError<E>> {
+    if seq_len_max > seq_len_max_allowed {
+        error!(
+            message = "Maximum sequence length exceeds the allowed length.",
+            seq_len_max, seq_len_max_allowed,
+        );
+        return Err(LlamaError::SeqLenMaxTooLarge);
+    }
+    Ok(
+        iter::successors(Some(0.0_f32), |position| Some(position + 1.0))
+            .take(seq_len_max)
+            .flat_map(|position| {
+                inv_frequencies
+                    .iter()
+                    .chain(inv_frequencies)
+                    .map(move |inv_frequency| position * inv_frequency)
+            })
+            .collect(),
+    )
 }
 
 fn inv_frequencies<E: std::error::Error + 'static>(
@@ -163,7 +174,10 @@ mod tests {
     use std::convert::Infallible;
     use std::f64::consts::TAU;
 
-    use crate::models::llama::rope::inv_frequencies;
+    use crate::models::llama::rope::{
+        angles,
+        inv_frequencies,
+    };
     use crate::models::llama::{
         Llama3RopeScaling,
         LlamaError,
@@ -236,10 +250,30 @@ mod tests {
             high_freq_factor: 4.0,
             original_max_position_embeddings: 8192,
         };
-        let result = inv_frequencies::<Infallible>(3, 500_000.0, Some(&scaling));
-        assert!(
-            matches!(result, Err(LlamaError::HeadDimInvalid)),
+        assert_eq!(
+            inv_frequencies::<Infallible>(3, 500_000.0, Some(&scaling)),
+            Err(LlamaError::HeadDimInvalid),
             "an odd head dim is rejected"
+        );
+    }
+
+    #[test]
+    fn angles_repeat_the_frequencies_for_both_halves_at_each_position() {
+        assert_eq!(
+            angles::<Infallible>(&[1.0, 0.5], 3, 8),
+            Ok(vec![
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.5, 1.0, 0.5, 2.0, 1.0, 2.0, 1.0
+            ]),
+            "positions 0 to 2 times frequencies 1 and 0.5, twice"
+        );
+    }
+
+    #[test]
+    fn angles_reject_a_cache_beyond_the_allowed_length() {
+        assert_eq!(
+            angles::<Infallible>(&[1.0], 9, 8),
+            Err(LlamaError::SeqLenMaxTooLarge),
+            "9 positions where 8 are allowed"
         );
     }
 }

@@ -62,22 +62,7 @@ pub fn generate<B: Backend, M: CausalLm<B>>(
     max_new_tokens: usize,
     stop_ids: &[u32],
 ) -> Result<Generation, GenerateError> {
-    let Some(batch_size) = NonZeroUsize::new(prompts.len()) else {
-        error!(message = "Batch holds no prompt.");
-        return Err(GenerateError::EmptyBatch);
-    };
-    let prompt_len = prompts.first().map_or(0, |prompt| prompt.len());
-    if prompt_len == 0 {
-        error!(message = "Prompt holds no token.");
-        return Err(GenerateError::EmptyPrompt);
-    }
-    if prompts.iter().any(|prompt| prompt.len() != prompt_len) {
-        error!(
-            message = "Prompts do not have the same length.",
-            prompt_lens = ?prompts.iter().map(|prompt| prompt.len()).collect::<Vec<usize>>(),
-        );
-        return Err(GenerateError::RaggedBatch);
-    }
+    let (batch_size, prompt_len) = batch_dims(prompts)?;
     if max_new_tokens == 0 {
         return Ok(Generation {
             token_ids: vec![Vec::new(); batch_size.get()],
@@ -85,7 +70,6 @@ pub fn generate<B: Backend, M: CausalLm<B>>(
             decode_steps: Vec::new(),
         });
     }
-    let is_stopped = |row: &Vec<u32>| row.last().is_some_and(|token| stop_ids.contains(token));
     let mut decoder = Decoder::new(backend, model, batch_size)?;
     let prefill_start = Instant::now();
     let mut tokens = decoder.step(&prompts.concat(), 0)?;
@@ -96,18 +80,17 @@ pub fn generate<B: Backend, M: CausalLm<B>>(
     };
     let mut position = prompt_len;
     for _ in 1..max_new_tokens {
-        if generation.token_ids.iter().all(is_stopped) {
+        if generation
+            .token_ids
+            .iter()
+            .all(|row| is_stopped(row, stop_ids))
+        {
             break;
         }
         let step_start = Instant::now();
         tokens = decoder.step(&tokens, position)?;
         generation.decode_steps.push(step_start.elapsed());
-        generation
-            .token_ids
-            .iter_mut()
-            .zip(&tokens)
-            .filter(|(row, _)| !is_stopped(row))
-            .for_each(|(row, &token)| row.push(token));
+        generation.token_ids = extend_rows(generation.token_ids, &tokens, stop_ids);
         position = position.checked_add(1).ok_or_else(|| {
             error!(message = "Token position overflows usize.", position);
             GenerateError::PositionOverflow
@@ -140,24 +123,7 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
         position: usize,
     ) -> Result<Vec<u32>, GenerateError> {
         let token_count = token_ids.len();
-        let batch_size = self.batch_size.get();
-        let Some(seq_len) = token_count
-            .checked_div(batch_size)
-            .filter(|seq_len| seq_len.checked_mul(batch_size) == Some(token_count))
-        else {
-            error!(
-                message = "Token count is not a multiple of the batch size.",
-                token_count, batch_size
-            );
-            return Err(GenerateError::BatchMismatch);
-        };
-        let seq_len_total = position.checked_add(seq_len).ok_or_else(|| {
-            error!(
-                message = "Token position overflows usize.",
-                position, seq_len
-            );
-            GenerateError::PositionOverflow
-        })?;
+        let (seq_len, seq_len_total) = step_lens(token_count, self.batch_size, position)?;
         let token_bytes = token_ids
             .iter()
             .flat_map(|token_id| token_id.to_le_bytes())
@@ -212,17 +178,93 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
                 error!(message = "Selecting the next token failed.", %error);
                 GenerateError::NextToken
             })?;
-        let (tokens, remainder) = bytes.as_chunks::<TOKEN_ID_BYTES>();
-        if tokens.len() != self.batch_size.get() || !remainder.is_empty() {
-            error!(
-                message = "Next token download does not hold one u32 per sequence.",
-                bytes = bytes.len(),
-                batch_size = self.batch_size.get(),
-            );
-            return Err(GenerateError::TokenBytes);
-        }
-        Ok(tokens.iter().copied().map(u32::from_le_bytes).collect())
+        decode_token_ids(&bytes, self.batch_size)
     }
+}
+
+fn batch_dims(prompts: &[&[u32]]) -> Result<(NonZeroUsize, usize), GenerateError> {
+    let Some(batch_size) = NonZeroUsize::new(prompts.len()) else {
+        error!(message = "Batch holds no prompt.");
+        return Err(GenerateError::EmptyBatch);
+    };
+    let prompt_len = prompts.first().map_or(0, |prompt| prompt.len());
+    if prompt_len == 0 {
+        error!(message = "Prompt holds no token.");
+        return Err(GenerateError::EmptyPrompt);
+    }
+    if prompts.iter().any(|prompt| prompt.len() != prompt_len) {
+        error!(
+            message = "Prompts do not have the same length.",
+            prompt_lens = ?prompts.iter().map(|prompt| prompt.len()).collect::<Vec<usize>>(),
+        );
+        return Err(GenerateError::RaggedBatch);
+    }
+    Ok((batch_size, prompt_len))
+}
+
+fn step_lens(
+    token_count: usize,
+    batch_size: NonZeroUsize,
+    position: usize,
+) -> Result<(usize, usize), GenerateError> {
+    let batch_size = batch_size.get();
+    let Some(seq_len) = token_count
+        .checked_div(batch_size)
+        .filter(|seq_len| seq_len.checked_mul(batch_size) == Some(token_count))
+    else {
+        error!(
+            message = "Token count is not a multiple of the batch size.",
+            token_count, batch_size
+        );
+        return Err(GenerateError::BatchMismatch);
+    };
+    let seq_len_total = position.checked_add(seq_len).ok_or_else(|| {
+        error!(
+            message = "Token position overflows usize.",
+            position, seq_len
+        );
+        GenerateError::PositionOverflow
+    })?;
+    Ok((seq_len, seq_len_total))
+}
+
+fn decode_token_ids(
+    bytes: &[u8],
+    batch_size: NonZeroUsize,
+) -> Result<Vec<u32>, GenerateError> {
+    let (tokens, remainder) = bytes.as_chunks::<TOKEN_ID_BYTES>();
+    if tokens.len() != batch_size.get() || !remainder.is_empty() {
+        error!(
+            message = "Next token download does not hold one u32 per sequence.",
+            bytes = bytes.len(),
+            batch_size = batch_size.get(),
+        );
+        return Err(GenerateError::TokenBytes);
+    }
+    Ok(tokens.iter().copied().map(u32::from_le_bytes).collect())
+}
+
+fn is_stopped(
+    row: &[u32],
+    stop_ids: &[u32],
+) -> bool {
+    row.last().is_some_and(|token| stop_ids.contains(token))
+}
+
+fn extend_rows(
+    rows: Vec<Vec<u32>>,
+    tokens: &[u32],
+    stop_ids: &[u32],
+) -> Vec<Vec<u32>> {
+    rows.into_iter()
+        .zip(tokens)
+        .map(|(mut row, &token)| {
+            if !is_stopped(&row, stop_ids) {
+                row.push(token);
+            }
+            row
+        })
+        .collect()
 }
 
 fn positions(
@@ -269,115 +311,101 @@ mod tests {
 
     use half::bf16;
 
-    use crate::backend::cpu::{
-        CpuBackend,
-        CpuError,
-    };
-    use crate::core::{
-        DType,
-        Shape,
-        Tensor,
-        TensorError,
-    };
     use crate::generate::{
-        CausalLm,
-        Decoder,
         GenerateError,
+        batch_dims,
         causal_mask,
-        generate,
+        decode_token_ids,
+        extend_rows,
         positions,
+        step_lens,
     };
-
-    const VOCAB_SIZE: usize = 16;
-
-    struct PositionModel;
-
-    impl CausalLm<CpuBackend> for PositionModel {
-        type Cache = ();
-        type Error = TensorError<CpuError>;
-
-        fn cache(
-            &self,
-            _backend: &mut CpuBackend,
-            _batch_size: NonZeroUsize,
-        ) -> Result<Self::Cache, Self::Error> {
-            Ok(())
-        }
-
-        fn forward(
-            &self,
-            backend: &mut CpuBackend,
-            token_ids: &Tensor<CpuBackend>,
-            positions: &Tensor<CpuBackend>,
-            _mask: &Tensor<CpuBackend>,
-            _cache: &mut Self::Cache,
-            position: usize,
-        ) -> Result<Tensor<CpuBackend>, Self::Error> {
-            let seq_len = positions.shape().element_count();
-            let batch_size = token_ids
-                .shape()
-                .element_count()
-                .checked_div(seq_len)
-                .expect("the step holds at least one position");
-            let seq_len_total = position.saturating_add(seq_len);
-            let logits = (0..batch_size)
-                .flat_map(|sequence| {
-                    (0..VOCAB_SIZE).map(move |token_id| {
-                        f32::from(u8::from(token_id == seq_len_total.saturating_add(sequence)))
-                    })
-                })
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<u8>>();
-            let shape = Shape::try_from([batch_size, VOCAB_SIZE].as_slice())?;
-            Tensor::upload(backend, &logits, DType::F32, shape)
-        }
-    }
 
     #[test]
-    fn generate_stops_each_sequence_at_its_own_stop_id() {
-        let generation = generate(
-            &mut CpuBackend::new(),
-            &PositionModel,
-            &[&[1, 2], &[3, 4]],
-            4,
-            &[3],
-        )
-        .expect("the generation runs");
+    fn batch_dims_reads_the_batch_size_and_the_prompt_length() {
         assert_eq!(
-            (generation.token_ids, generation.decode_steps.len()),
-            (vec![vec![2, 3], vec![3]], 1),
-            "sequence 1 stops at the prefill, sequence 0 after one decode step"
+            batch_dims(&[&[1, 2, 3], &[4, 5, 6]]),
+            Ok((NonZeroUsize::new(2).expect("2 is not zero"), 3)),
+            "two prompts of three tokens"
         );
     }
 
     #[test]
-    fn generate_rejects_an_empty_or_ragged_batch() {
+    fn batch_dims_rejects_an_empty_batch_an_empty_prompt_or_a_ragged_batch() {
         let empty: [&[u32]; 0] = [];
         assert_eq!(
-            [&empty[..], &[&[1, 2], &[3]]].map(|prompts| {
-                generate(&mut CpuBackend::new(), &PositionModel, prompts, 2, &[])
-            }),
+            [&empty[..], &[&[], &[]], &[&[1, 2], &[3]]].map(batch_dims),
             [
                 Err(GenerateError::EmptyBatch),
-                Err(GenerateError::RaggedBatch)
+                Err(GenerateError::EmptyPrompt),
+                Err(GenerateError::RaggedBatch),
             ],
-            "no prompt, then prompts of two and one tokens"
+            "no prompt, then empty prompts, then prompts of two and one tokens"
         );
     }
 
     #[test]
-    fn step_rejects_tokens_not_divisible_by_the_batch_size() {
-        let mut backend = CpuBackend::new();
-        let mut decoder = Decoder::new(
-            &mut backend,
-            &PositionModel,
-            NonZeroUsize::new(2).expect("2 is not zero"),
-        )
-        .expect("the decoder is created");
+    fn step_lens_splits_the_tokens_over_the_batch() {
         assert_eq!(
-            decoder.step(&[1, 2, 3], 0),
-            Err(GenerateError::BatchMismatch),
-            "three tokens cannot be split over two sequences"
+            step_lens(6, NonZeroUsize::new(2).expect("2 is not zero"), 4),
+            Ok((3, 7)),
+            "six tokens over two sequences at position 4"
+        );
+    }
+
+    #[test]
+    fn step_lens_rejects_a_ragged_step_or_a_position_overflow() {
+        let batch_size = NonZeroUsize::new(2).expect("2 is not zero");
+        assert_eq!(
+            [
+                step_lens(3, batch_size, 0),
+                step_lens(2, batch_size, usize::MAX)
+            ],
+            [
+                Err(GenerateError::BatchMismatch),
+                Err(GenerateError::PositionOverflow)
+            ],
+            "three tokens over two sequences, then one token past usize::MAX"
+        );
+    }
+
+    #[test]
+    fn decode_token_ids_reads_one_u32_per_sequence() {
+        assert_eq!(
+            decode_token_ids(
+                &[7_u32, 9]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<u8>>(),
+                NonZeroUsize::new(2).expect("2 is not zero"),
+            ),
+            Ok(vec![7, 9]),
+            "tokens 7 and 9"
+        );
+    }
+
+    #[test]
+    fn decode_token_ids_rejects_a_wrong_byte_count() {
+        let batch_size = NonZeroUsize::new(2).expect("2 is not zero");
+        assert_eq!(
+            [
+                decode_token_ids(&[0; 4], batch_size),
+                decode_token_ids(&[0; 9], batch_size)
+            ],
+            [
+                Err(GenerateError::TokenBytes),
+                Err(GenerateError::TokenBytes)
+            ],
+            "one token for two sequences, then a trailing byte"
+        );
+    }
+
+    #[test]
+    fn extend_rows_leaves_stopped_rows_unchanged() {
+        assert_eq!(
+            extend_rows(vec![vec![2], vec![3]], &[4, 5], &[3]),
+            vec![vec![2, 4], vec![3]],
+            "row 1 ended on stop id 3"
         );
     }
 

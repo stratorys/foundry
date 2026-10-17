@@ -63,3 +63,38 @@ pub fn exact_f32(value: usize) -> Result<f32, CoreError> {
         CoreError::DimensionTooLargeForF32
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::core::{
+        CoreError,
+        DType,
+        FloatDType,
+        exact_f32,
+    };
+
+    #[test]
+    fn size_bytes_matches_each_dtype() {
+        assert_eq!(
+            (
+                [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::size_bytes),
+                [FloatDType::F32, FloatDType::F16, FloatDType::BF16].map(FloatDType::size_bytes),
+            ),
+            ([4, 2, 2, 4], [4, 2, 2]),
+            "f32 and u32 take four bytes, f16 and bf16 two"
+        );
+    }
+
+    #[test]
+    fn exact_f32_accepts_values_up_to_u16_max_only() {
+        assert_eq!(
+            [0, 65_535, 65_536].map(exact_f32),
+            [
+                Ok(0.0),
+                Ok(65_535.0),
+                Err(CoreError::DimensionTooLargeForF32)
+            ],
+            "u16::MAX is the largest value converted"
+        );
+    }
+}

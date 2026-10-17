@@ -111,54 +111,67 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
         cache: &mut Self::Cache,
         position: usize,
     ) -> Result<Tensor<B>, Self::Error> {
-        let token_count = token_ids.shape().element_count();
-        if token_count == 0 {
-            error!(message = "Forward input holds no token.");
-            return Err(LlamaError::EmptyInput);
-        }
-        let seq_len = positions.shape().element_count();
-        let Some(batch_size) = token_count
-            .checked_div(seq_len)
-            .filter(|batch_size| batch_size.checked_mul(seq_len) == Some(token_count))
-        else {
-            error!(
-                message = "Token count is not a multiple of the position count.",
-                token_count, seq_len,
-            );
-            return Err(LlamaError::BatchMismatch);
-        };
-        let seq_len_total = position
-            .checked_add(seq_len)
-            .filter(|&seq_len_total| seq_len_total <= self.seq_len_max)
-            .ok_or_else(|| {
-                error!(
-                    message = "Tokens exceed the cache length.",
-                    position,
-                    seq_len,
-                    seq_len_max = self.seq_len_max,
-                );
-                LlamaError::CacheOverflow
-            })?;
-        let layers = self.weights.layers().len();
-        if cache.len() != layers {
-            error!(
-                message = "Layer cache count does not match the layer count.",
-                caches = cache.len(),
-                layers,
-            );
-            return Err(LlamaError::CacheLayerCount);
-        }
+        let (batch_size, seq_len_total) = forward_dims(
+            token_ids.shape().element_count(),
+            positions.shape().element_count(),
+            position,
+            self.seq_len_max,
+            cache.len(),
+            self.weights.layers().len(),
+        )?;
         let step = ForwardStep {
             angles: self.rope.at(backend, positions)?,
             mask,
             position,
             batch_size,
-            seq_len,
+            seq_len: positions.shape().element_count(),
             seq_len_total,
         };
         self.logits(backend, token_ids, cache, &step)
             .map_err(LlamaError::from)
     }
+}
+
+fn forward_dims<E: std::error::Error + 'static>(
+    token_count: usize,
+    seq_len: usize,
+    position: usize,
+    seq_len_max: usize,
+    cache_count: usize,
+    layer_count: usize,
+) -> Result<(usize, usize), LlamaError<E>> {
+    if token_count == 0 {
+        error!(message = "Forward input holds no token.");
+        return Err(LlamaError::EmptyInput);
+    }
+    let Some(batch_size) = token_count
+        .checked_div(seq_len)
+        .filter(|batch_size| batch_size.checked_mul(seq_len) == Some(token_count))
+    else {
+        error!(
+            message = "Token count is not a multiple of the position count.",
+            token_count, seq_len,
+        );
+        return Err(LlamaError::BatchMismatch);
+    };
+    let seq_len_total = position
+        .checked_add(seq_len)
+        .filter(|&seq_len_total| seq_len_total <= seq_len_max)
+        .ok_or_else(|| {
+            error!(
+                message = "Tokens exceed the cache length.",
+                position, seq_len, seq_len_max,
+            );
+            LlamaError::CacheOverflow
+        })?;
+    if cache_count != layer_count {
+        error!(
+            message = "Layer cache count does not match the layer count.",
+            cache_count, layer_count,
+        );
+        return Err(LlamaError::CacheLayerCount);
+    }
+    Ok((batch_size, seq_len_total))
 }
 
 impl<B: Backend> Llama<B> {
@@ -232,5 +245,42 @@ impl<B: Backend> Llama<B> {
         let mlp_input = layer.post_attention_norm().forward(backend, &hidden)?;
         let mlp_output = layer.mlp().forward(backend, &mlp_input)?;
         hidden.add(backend, &mlp_output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::CoreError;
+    use crate::models::llama::LlamaError;
+    use crate::models::llama::model::forward_dims;
+
+    #[test]
+    fn forward_dims_reads_the_batch_size_and_the_cache_length() {
+        assert_eq!(
+            forward_dims::<CoreError>(6, 3, 4, 8, 2, 2),
+            Ok((2, 7)),
+            "six tokens over three positions from position 4, in a cache of 8"
+        );
+    }
+
+    #[test]
+    fn forward_dims_rejects_invalid_steps() {
+        assert_eq!(
+            [
+                forward_dims::<CoreError>(0, 0, 0, 8, 2, 2),
+                forward_dims::<CoreError>(5, 3, 0, 8, 2, 2),
+                forward_dims::<CoreError>(6, 3, 6, 8, 2, 2),
+                forward_dims::<CoreError>(6, 3, usize::MAX, usize::MAX, 2, 2),
+                forward_dims::<CoreError>(6, 3, 0, 8, 1, 2),
+            ],
+            [
+                Err(LlamaError::EmptyInput),
+                Err(LlamaError::BatchMismatch),
+                Err(LlamaError::CacheOverflow),
+                Err(LlamaError::CacheOverflow),
+                Err(LlamaError::CacheLayerCount),
+            ],
+            "no token, ragged step, past the cache end, position overflow, missing layer cache"
+        );
     }
 }

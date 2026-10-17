@@ -81,7 +81,7 @@ pub enum CoreError {
 
 /// A validation failure or a concrete backend failure during a tensor
 /// operation.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TensorError<E: std::error::Error + 'static> {
     #[error(transparent)]
     Validation(#[from] CoreError),
