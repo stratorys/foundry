@@ -600,18 +600,32 @@ impl MetalDevice {
         )
     }
 
-    fn copy_view(
+    fn elementwise(
         &mut self,
-        input: &BufferView<'_>,
+        kernel: Kernel,
+        inputs: &[&BufferView<'_>],
+        output_shape: &Shape,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        let args = StridedArgs::new(input)?;
+        let output = self.allocate(output_shape.nbytes(dtype))?;
+        let args = inputs
+            .iter()
+            .map(|input| StridedArgs::new(input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kernel_args: Vec<KernelArgs<'_>> = args.iter().map(KernelArgs::Strided).collect();
+        let buffers: Vec<&MetalStorage> = inputs
+            .iter()
+            .map(|input| input.storage)
+            .chain([&output])
+            .collect();
+        // `Tensor` broadcasts every input to the output shape before calling
+        // the device, so the kernel reads each input only for `gid < count`,
+        // inside its layout.
         self.dispatch(
-            Kernel::new("copy", dtype),
-            &[input.storage, &output],
-            &[KernelArgs::Strided(&args)],
-            Grid::Threads(input.layout.shape().numel()),
+            kernel,
+            &buffers,
+            &kernel_args,
+            Grid::Threads(output_shape.numel()),
         )?;
         Ok(output)
     }
@@ -626,49 +640,13 @@ impl MetalDevice {
         if is_matmul_ready(matrix, rows, cols) {
             return Ok(None);
         }
-        self.copy_view(operand, dtype).map(Some)
-    }
-
-    fn unary(
-        &mut self,
-        op: UnaryOp,
-        input: &BufferView<'_>,
-        dtype: DType,
-    ) -> Result<MetalStorage, MetalError> {
-        let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        let args = StridedArgs::new(input)?;
-        self.dispatch(
-            Kernel::float(unary_kernel(op), dtype)?,
-            &[input.storage, &output],
-            &[KernelArgs::Strided(&args)],
-            Grid::Threads(input.layout.shape().numel()),
-        )?;
-        Ok(output)
-    }
-
-    fn binary(
-        &mut self,
-        op: BinaryOp,
-        lhs: &BufferView<'_>,
-        rhs: &BufferView<'_>,
-        dtype: DType,
-    ) -> Result<MetalStorage, MetalError> {
-        let output = self.allocate(lhs.layout.shape().nbytes(dtype))?;
-        let lhs_args = StridedArgs::new(lhs)?;
-        let rhs_args = StridedArgs::new(rhs)?;
-        // `Tensor` broadcasts both operands to the same shape before calling
-        // the device, so the kernel reads `rhs` only for `gid < count`, inside
-        // its layout.
-        self.dispatch(
-            Kernel::float(binary_kernel(op), dtype)?,
-            &[lhs.storage, rhs.storage, &output],
-            &[
-                KernelArgs::Strided(&lhs_args),
-                KernelArgs::Strided(&rhs_args),
-            ],
-            Grid::Threads(lhs.layout.shape().numel()),
-        )?;
-        Ok(output)
+        self.elementwise(
+            Kernel::new("copy", dtype),
+            &[operand],
+            operand.layout.shape(),
+            dtype,
+        )
+        .map(Some)
     }
 
     fn reduce(
@@ -746,23 +724,6 @@ impl MetalDevice {
                     depth: 1,
                 },
             },
-        )?;
-        Ok(output)
-    }
-
-    fn convert_dtype(
-        &mut self,
-        input: &BufferView<'_>,
-        dtype_from: DType,
-        dtype: DType,
-    ) -> Result<MetalStorage, MetalError> {
-        let output = self.allocate(input.layout.shape().nbytes(dtype))?;
-        let args = StridedArgs::new(input)?;
-        self.dispatch(
-            to_dtype_kernel(dtype_from, dtype)?,
-            &[input.storage, &output],
-            &[KernelArgs::Strided(&args)],
-            Grid::Threads(input.layout.shape().numel()),
         )?;
         Ok(output)
     }
@@ -908,10 +869,18 @@ impl Device for MetalDevice {
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
         match (op, inputs) {
-            (Op::Unary(unary), [input]) => self.unary(unary, &self.view(input)?, dtype),
-            (Op::Binary(binary), [lhs, rhs]) => {
-                self.binary(binary, &self.view(lhs)?, &self.view(rhs)?, dtype)
-            }
+            (Op::Unary(unary), [input]) => self.elementwise(
+                Kernel::float(unary_kernel(unary), dtype)?,
+                &[&self.view(input)?],
+                output,
+                dtype,
+            ),
+            (Op::Binary(binary), [lhs, rhs]) => self.elementwise(
+                Kernel::float(binary_kernel(binary), dtype)?,
+                &[&self.view(lhs)?, &self.view(rhs)?],
+                output,
+                dtype,
+            ),
             (
                 Op::Reduce {
                     op,
@@ -922,10 +891,18 @@ impl Device for MetalDevice {
             (Op::Matmul, [lhs, rhs]) => {
                 self.matmul(self.view(lhs)?, self.view(rhs)?, output, dtype)
             }
-            (Op::Copy, [input]) => self.copy_view(&self.view(input)?, dtype),
-            (Op::ToDtype(_), [input]) => {
-                self.convert_dtype(&self.view(input)?, input.dtype(), dtype)
-            }
+            (Op::Copy, [input]) => self.elementwise(
+                Kernel::new("copy", dtype),
+                &[&self.view(input)?],
+                output,
+                dtype,
+            ),
+            (Op::ToDtype(_), [input]) => self.elementwise(
+                to_dtype_kernel(input.dtype(), dtype)?,
+                &[&self.view(input)?],
+                output,
+                dtype,
+            ),
             (
                 Op::IndexSelect {
                     ..
