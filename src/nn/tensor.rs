@@ -247,6 +247,9 @@ impl<D: Device> Tensor<D> {
         device: &mut D,
         dtype: DType,
     ) -> Result<Self, TensorError> {
+        if dtype == self.dtype && dtype.is_float() {
+            return Ok(self.view(self.layout));
+        }
         Self::apply(device, Op::ToDtype(dtype), [self])
     }
 

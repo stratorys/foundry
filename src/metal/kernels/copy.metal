@@ -34,7 +34,5 @@ kernel void to_dtype_strided(device const In *input [[buffer(0)]],
   template [[host_name(name)]] kernel void to_dtype_strided<In, Out>(          \
       device const In *, device Out *, constant StridedArgs &, uint);
 
-INSTANTIATE_TO_DTYPE("to_dtype_f32_f32", float, float)
 INSTANTIATE_TO_DTYPE("to_dtype_f32_bf16", float, bf16_t)
 INSTANTIATE_TO_DTYPE("to_dtype_bf16_f32", bf16_t, float)
-INSTANTIATE_TO_DTYPE("to_dtype_bf16_bf16", bf16_t, bf16_t)

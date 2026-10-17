@@ -125,9 +125,10 @@ pub fn to_dtype_kernel(
     dtype: DType,
 ) -> Result<Kernel, MetalError> {
     let op = match dtype_from {
+        DType::U32 => return Err(not_float(dtype_from)),
+        _ if dtype_from == dtype => "copy",
         DType::F32 => "to_dtype_f32",
         DType::BF16 => "to_dtype_bf16",
-        DType::U32 => return Err(not_float(dtype_from)),
     };
     Kernel::float(op, dtype)
 }
@@ -189,12 +190,14 @@ mod tests {
             [
                 to_dtype_kernel(DType::F32, DType::BF16).map(|kernel| kernel.name()),
                 to_dtype_kernel(DType::BF16, DType::F32).map(|kernel| kernel.name()),
+                to_dtype_kernel(DType::BF16, DType::BF16).map(|kernel| kernel.name()),
             ],
             [
                 Ok(String::from("to_dtype_f32_bf16")),
                 Ok(String::from("to_dtype_bf16_f32")),
+                Ok(String::from("copy_bf16")),
             ],
-            "the prefix names the source dtype, the suffix the target dtype"
+            "the prefix names the source dtype, the suffix the target dtype, the same dtype copies"
         );
     }
 
