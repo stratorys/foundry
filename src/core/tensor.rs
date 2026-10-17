@@ -8,12 +8,12 @@ use crate::core::primitive::{
     ReduceOp,
     UnaryOp,
     binary_rule,
-    cast_rule,
-    concat_rule,
-    gather_rule,
+    cat_rule,
+    index_select_rule,
     matmul_rule,
     reduce_rule,
-    slice_update_rule,
+    slice_scatter_rule,
+    to_dtype_rule,
     unary_rule,
 };
 use crate::core::{
@@ -89,24 +89,26 @@ impl<B: Backend> Clone for Tensor<B> {
 }
 
 impl<B: Backend> Tensor<B> {
-    pub fn upload(
+    pub fn from_bytes(
         backend: &mut B,
         bytes: &[u8],
         dtype: DType,
         shape: Shape,
     ) -> Result<Self, TensorError<B::Error>> {
-        let byte_len = shape.byte_len(dtype);
-        if bytes.len() != byte_len {
+        let nbytes = shape.nbytes(dtype);
+        if bytes.len() != nbytes {
             error!(
                 message = "Byte length does not match the shape and dtype.",
                 bytes = bytes.len(),
-                bytes_expected = byte_len,
+                bytes_expected = nbytes,
                 ?dtype,
                 dims = ?shape.dims(),
             );
             return Err(CoreError::ByteLengthMismatch.into());
         }
-        let storage = backend.upload(bytes).map_err(backend_failed("upload"))?;
+        let storage = backend
+            .storage_from_bytes(bytes)
+            .map_err(backend_failed("from_bytes"))?;
         Ok(Self::from_storage(storage, dtype, shape))
     }
 
@@ -116,22 +118,22 @@ impl<B: Backend> Tensor<B> {
         shape: Shape,
     ) -> Result<Self, TensorError<B::Error>> {
         let storage = backend
-            .zeros(shape.byte_len(dtype))
+            .zeros(shape.nbytes(dtype))
             .map_err(backend_failed("zeros"))?;
         Ok(Self::from_storage(storage, dtype, shape))
     }
 
-    pub fn download(
+    pub fn to_bytes(
         &self,
         backend: &mut B,
     ) -> Result<Vec<u8>, TensorError<B::Error>> {
         if !self.layout.is_contiguous() {
-            error!(message = "Download requires a contiguous layout.", layout = ?self.layout);
-            return Err(CoreError::DownloadNonContiguous.into());
+            error!(message = "Reading bytes requires a contiguous layout.", layout = ?self.layout);
+            return Err(CoreError::ToBytesNonContiguous.into());
         }
         backend
-            .download(self.operand())
-            .map_err(backend_failed("download"))
+            .storage_to_bytes(self.operand())
+            .map_err(backend_failed("to_bytes"))
     }
 
     pub fn dtype(&self) -> DType { self.dtype }
@@ -149,25 +151,25 @@ impl<B: Backend> Tensor<B> {
 
     pub fn permute(
         &self,
-        axes: &[usize],
+        dims: &[usize],
     ) -> Result<Self, CoreError> {
-        Ok(self.view(self.layout.permute(axes)?))
+        Ok(self.view(self.layout.permute(dims)?))
     }
 
     pub fn narrow(
         &self,
-        axis: usize,
+        dim: usize,
         start: usize,
-        len: usize,
+        length: usize,
     ) -> Result<Self, CoreError> {
-        Ok(self.view(self.layout.narrow(axis, start, len)?))
+        Ok(self.view(self.layout.narrow(dim, start, length)?))
     }
 
-    pub fn broadcast_as(
+    pub fn expand(
         &self,
         shape: Shape,
     ) -> Result<Self, CoreError> {
-        Ok(self.view(self.layout.broadcast_as(shape)?))
+        Ok(self.view(self.layout.expand(shape)?))
     }
 
     pub fn neg(
@@ -191,11 +193,11 @@ impl<B: Backend> Tensor<B> {
         self.unary(backend, UnaryOp::Sqrt)
     }
 
-    pub fn recip(
+    pub fn reciprocal(
         &self,
         backend: &mut B,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.unary(backend, UnaryOp::Recip)
+        self.unary(backend, UnaryOp::Reciprocal)
     }
 
     pub fn add(
@@ -230,28 +232,28 @@ impl<B: Backend> Tensor<B> {
         self.binary(backend, BinaryOp::Div, rhs)
     }
 
-    pub fn sum(
+    pub fn sum_keepdim(
         &self,
         backend: &mut B,
-        axis: usize,
+        dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.reduce(backend, ReduceOp::Sum, axis)
+        self.reduce(backend, ReduceOp::Sum, dim)
     }
 
-    pub fn max(
+    pub fn amax_keepdim(
         &self,
         backend: &mut B,
-        axis: usize,
+        dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.reduce(backend, ReduceOp::Max, axis)
+        self.reduce(backend, ReduceOp::Amax, dim)
     }
 
-    pub fn argmax(
+    pub fn argmax_keepdim(
         &self,
         backend: &mut B,
-        axis: usize,
+        dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        self.reduce(backend, ReduceOp::Argmax, axis)
+        self.reduce(backend, ReduceOp::Argmax, dim)
     }
 
     pub fn matmul(
@@ -287,27 +289,34 @@ impl<B: Backend> Tensor<B> {
         Ok(Self::from_storage(storage, self.dtype, *self.shape()))
     }
 
-    pub fn cast(
+    pub fn to_dtype(
         &self,
         backend: &mut B,
         dtype: DType,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = cast_rule(self.dtype, dtype)?;
+        let spec = to_dtype_rule(self.dtype, dtype)?;
         let storage = backend
-            .cast(self.float_operand(spec.from()), spec.to())
-            .map_err(backend_failed("cast"))?;
+            .to_dtype(self.float_operand(spec.from()), spec.to())
+            .map_err(backend_failed("to_dtype"))?;
         Ok(Self::from_storage(storage, spec.to().into(), *self.shape()))
     }
 
-    pub fn gather(
+    pub fn index_select(
         &self,
         backend: &mut B,
+        dim: usize,
         indices: &Self,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = gather_rule(self.dtype, &self.layout, indices.dtype, indices.shape())?;
+        let spec = index_select_rule(
+            self.dtype,
+            &self.layout,
+            dim,
+            indices.dtype,
+            indices.shape(),
+        )?;
         let storage = backend
-            .gather(self.float_operand(spec.dtype()), indices.operand(), &spec)
-            .map_err(backend_failed("gather"))?;
+            .index_select(self.float_operand(spec.dtype()), indices.operand(), &spec)
+            .map_err(backend_failed("index_select"))?;
         Ok(Self::from_storage(
             storage,
             spec.dtype().into(),
@@ -315,20 +324,19 @@ impl<B: Backend> Tensor<B> {
         ))
     }
 
-    pub fn concat(
-        &self,
+    pub fn cat(
         backend: &mut B,
-        rhs: &Self,
-        axis: usize,
+        [lhs, rhs]: [&Self; 2],
+        dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = concat_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape(), axis)?;
+        let spec = cat_rule(lhs.dtype, lhs.shape(), rhs.dtype, rhs.shape(), dim)?;
         let storage = backend
-            .concat(
-                self.float_operand(spec.dtype()),
+            .cat(
+                lhs.float_operand(spec.dtype()),
                 rhs.float_operand(spec.dtype()),
                 &spec,
             )
-            .map_err(backend_failed("concat"))?;
+            .map_err(backend_failed("cat"))?;
         Ok(Self::from_storage(
             storage,
             spec.dtype().into(),
@@ -336,39 +344,33 @@ impl<B: Backend> Tensor<B> {
         ))
     }
 
-    pub fn slice_update(
+    pub fn slice_scatter(
         &mut self,
         backend: &mut B,
-        update: &Self,
-        axis: usize,
+        src: &Self,
+        dim: usize,
         start: usize,
     ) -> Result<(), TensorError<B::Error>> {
-        let spec = slice_update_rule(
-            self.dtype,
-            &self.layout,
-            update.dtype,
-            update.shape(),
-            axis,
-            start,
-        )?;
+        let spec =
+            slice_scatter_rule(self.dtype, &self.layout, src.dtype, src.shape(), dim, start)?;
         if !self.layout.is_contiguous() {
             error!(
-                message = "Slice update requires a contiguous target layout.",
+                message = "Slice scatter requires a contiguous target layout.",
                 layout = ?self.layout,
             );
-            return Err(CoreError::SliceUpdateNonContiguous.into());
+            return Err(CoreError::SliceScatterNonContiguous.into());
         }
         let storage = Rc::get_mut(&mut self.storage).ok_or_else(|| {
-            error!(message = "Slice update target shares its storage with another tensor.");
+            error!(message = "Slice scatter target shares its storage with another tensor.");
             CoreError::SharedStorage
         })?;
         backend
-            .slice_update(
+            .slice_scatter(
                 OperandMut::new(storage, &self.layout, spec.dtype()),
-                update.float_operand(spec.dtype()),
+                src.float_operand(spec.dtype()),
                 &spec,
             )
-            .map_err(backend_failed("slice_update"))
+            .map_err(backend_failed("slice_scatter"))
     }
 
     fn unary(
@@ -390,8 +392,8 @@ impl<B: Backend> Tensor<B> {
         rhs: &Self,
     ) -> Result<Self, TensorError<B::Error>> {
         let spec = binary_rule(self.dtype, self.shape(), rhs.dtype, rhs.shape())?;
-        let lhs = self.broadcast_as(*spec.output())?;
-        let rhs = rhs.broadcast_as(*spec.output())?;
+        let lhs = self.expand(*spec.output())?;
+        let rhs = rhs.expand(*spec.output())?;
         let storage = backend
             .binary(
                 op,
@@ -410,9 +412,9 @@ impl<B: Backend> Tensor<B> {
         &self,
         backend: &mut B,
         op: ReduceOp,
-        axis: usize,
+        dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        let spec = reduce_rule(op, self.dtype, &self.layout, axis)?;
+        let spec = reduce_rule(op, self.dtype, &self.layout, dim)?;
         let storage = backend
             .reduce(self.float_operand(spec.dtype()), &spec)
             .map_err(backend_failed("reduce"))?;

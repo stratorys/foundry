@@ -448,9 +448,9 @@ fn parameter_count<S: AsRef<[u8]>>(
     weights: &Weights<S>,
 ) -> Result<u64, CliError> {
     weights.tensors().try_fold(0_u64, |parameter_count, view| {
-        u64::try_from(view.shape.element_count())
+        u64::try_from(view.shape.numel())
             .ok()
-            .and_then(|element_count| parameter_count.checked_add(element_count))
+            .and_then(|numel| parameter_count.checked_add(numel))
             .ok_or_else(|| {
                 error!(message = "Parameter count overflows u64.", %model);
                 CliError::ParameterCountOverflow

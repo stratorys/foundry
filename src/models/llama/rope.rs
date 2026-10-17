@@ -18,7 +18,7 @@ use crate::models::llama::{
 };
 
 const POSITION_COUNT_MAX: usize = 1 << f32::MANTISSA_DIGITS;
-const DIM_AXIS: usize = 3;
+const LAST_DIM: usize = 3;
 
 pub struct LlamaRope<B: Backend> {
     cos: Tensor<B>,
@@ -46,7 +46,7 @@ impl<B: Backend> LlamaRope<B> {
         )?;
         let functions: [fn(f32) -> f32; 2] = [f32::cos, f32::sin];
         let [cos, sin] = functions.map(|function| {
-            Tensor::upload(
+            Tensor::from_bytes(
                 backend,
                 &angles
                     .iter()
@@ -55,7 +55,7 @@ impl<B: Backend> LlamaRope<B> {
                 DType::F32,
                 Shape::try_from([seq_len_max, head_dim].as_slice())?,
             )?
-            .cast(backend, DType::BF16)
+            .to_dtype(backend, DType::BF16)
         });
         Ok(Self {
             cos: cos?,
@@ -69,10 +69,11 @@ impl<B: Backend> LlamaRope<B> {
         backend: &mut B,
         positions: &Tensor<B>,
     ) -> Result<RopeAngles<B>, TensorError<B::Error>> {
-        let shape =
-            Shape::try_from([positions.shape().element_count(), 1, self.head_dim].as_slice())?;
+        let shape = Shape::try_from([positions.shape().numel(), 1, self.head_dim].as_slice())?;
         let [cos, sin] = [&self.cos, &self.sin].map(|table| {
-            Ok::<_, TensorError<B::Error>>(table.gather(backend, positions)?.reshape(shape)?)
+            Ok::<_, TensorError<B::Error>>(
+                table.index_select(backend, 0, positions)?.reshape(shape)?,
+            )
         });
         Ok(RopeAngles {
             cos: cos?,
@@ -88,11 +89,11 @@ impl<B: Backend> RopeAngles<B> {
         backend: &mut B,
         x: &Tensor<B>,
     ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        let rotated = x
-            .narrow(DIM_AXIS, self.half_dim, self.half_dim)?
-            .neg(backend)?
-            .concat(backend, &x.narrow(DIM_AXIS, 0, self.half_dim)?, DIM_AXIS)?
-            .mul(backend, &self.sin)?;
+        let neg_x2 = x
+            .narrow(LAST_DIM, self.half_dim, self.half_dim)?
+            .neg(backend)?;
+        let x1 = x.narrow(LAST_DIM, 0, self.half_dim)?;
+        let rotated = Tensor::cat(backend, [&neg_x2, &x1], LAST_DIM)?.mul(backend, &self.sin)?;
         x.mul(backend, &self.cos)?.add(backend, &rotated)
     }
 }

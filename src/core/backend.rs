@@ -2,18 +2,18 @@ use std::error::Error;
 
 use crate::core::primitive::{
     BinaryOp,
-    ConcatSpec,
-    GatherSpec,
+    CatSpec,
+    IndexSelectSpec,
     MatmulSpec,
     ReduceSpec,
-    SliceUpdateSpec,
+    SliceScatterSpec,
     UnaryOp,
 };
 use crate::core::{
+    AllocatedMemory,
     FloatDType,
     Operand,
     OperandMut,
-    PeakMemory,
 };
 
 pub trait Backend {
@@ -22,19 +22,19 @@ pub trait Backend {
 
     fn device_name(&self) -> String;
 
-    fn peak_memory(&self) -> Option<PeakMemory>;
+    fn current_allocated_memory(&self) -> Option<AllocatedMemory>;
 
-    fn upload(
+    fn storage_from_bytes(
         &mut self,
         bytes: &[u8],
     ) -> Result<Self::Storage, Self::Error>;
 
     fn zeros(
         &mut self,
-        byte_len: usize,
+        nbytes: usize,
     ) -> Result<Self::Storage, Self::Error>;
 
-    fn download(
+    fn storage_to_bytes(
         &mut self,
         input: Operand<'_, Self::Storage>,
     ) -> Result<Vec<u8>, Self::Error>;
@@ -70,30 +70,30 @@ pub trait Backend {
         input: Operand<'_, Self::Storage>,
     ) -> Result<Self::Storage, Self::Error>;
 
-    fn cast(
+    fn to_dtype(
         &mut self,
         input: Operand<'_, Self::Storage, FloatDType>,
         dtype: FloatDType,
     ) -> Result<Self::Storage, Self::Error>;
 
-    fn gather(
+    fn index_select(
         &mut self,
         table: Operand<'_, Self::Storage, FloatDType>,
         indices: Operand<'_, Self::Storage>,
-        spec: &GatherSpec,
+        spec: &IndexSelectSpec,
     ) -> Result<Self::Storage, Self::Error>;
 
-    fn concat(
+    fn cat(
         &mut self,
         lhs: Operand<'_, Self::Storage, FloatDType>,
         rhs: Operand<'_, Self::Storage, FloatDType>,
-        spec: &ConcatSpec,
+        spec: &CatSpec,
     ) -> Result<Self::Storage, Self::Error>;
 
-    fn slice_update(
+    fn slice_scatter(
         &mut self,
         target: OperandMut<'_, Self::Storage, FloatDType>,
-        update: Operand<'_, Self::Storage, FloatDType>,
-        spec: &SliceUpdateSpec,
+        src: Operand<'_, Self::Storage, FloatDType>,
+        spec: &SliceScatterSpec,
     ) -> Result<(), Self::Error>;
 }

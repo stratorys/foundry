@@ -11,7 +11,7 @@ struct MatmulArgs {
   uint m;
   uint n;
   uint k;
-  uint batch_rank;
+  uint batch_ndim;
   uint batch_dims[4];
   MatmulOperand lhs;
   MatmulOperand rhs;
@@ -20,10 +20,10 @@ struct MatmulArgs {
 inline uint matmul_base(uint batch, constant MatmulArgs &args,
                         constant MatmulOperand &operand) {
   uint index = operand.offset;
-  for (uint axis = args.batch_rank; axis > 0; --axis) {
-    uint dim = args.batch_dims[axis - 1];
-    index += (batch % dim) * operand.batch_strides[axis - 1];
-    batch /= dim;
+  for (uint dim = args.batch_ndim; dim > 0; --dim) {
+    uint size = args.batch_dims[dim - 1];
+    index += (batch % size) * operand.batch_strides[dim - 1];
+    batch /= size;
   }
   return index;
 }

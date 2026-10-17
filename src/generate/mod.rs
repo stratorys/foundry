@@ -17,7 +17,7 @@ use crate::core::{
     Tensor,
 };
 
-const VOCAB_AXIS: usize = 1;
+const VOCAB_DIM: usize = 1;
 const TOKEN_ID_BYTES: usize = 4;
 
 pub trait CausalLm<B: Backend> {
@@ -128,10 +128,10 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
             .iter()
             .flat_map(|token_id| token_id.to_le_bytes())
             .collect::<Vec<u8>>();
-        let tokens = self.upload(&token_bytes, DType::U32, &[token_count])?;
+        let tokens = self.tensor_from_bytes(&token_bytes, DType::U32, &[token_count])?;
         let positions =
-            self.upload(&positions(position, seq_len_total)?, DType::U32, &[seq_len])?;
-        let mask = self.upload(
+            self.tensor_from_bytes(&positions(position, seq_len_total)?, DType::U32, &[seq_len])?;
+        let mask = self.tensor_from_bytes(
             &causal_mask(position, seq_len_total),
             DType::BF16,
             &[seq_len, seq_len_total],
@@ -153,18 +153,19 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
         self.next_tokens(&logits)
     }
 
-    fn upload(
+    fn tensor_from_bytes(
         &mut self,
         bytes: &[u8],
         dtype: DType,
         dims: &[usize],
     ) -> Result<Tensor<B>, GenerateError> {
-        let upload_error = |error: &dyn std::error::Error| {
-            error!(message = "Uploading a generation input failed.", ?dtype, ?dims, %error);
-            GenerateError::Upload
+        let tensor_from_bytes_error = |error: &dyn std::error::Error| {
+            error!(message = "Creating a generation input tensor failed.", ?dtype, ?dims, %error);
+            GenerateError::FromBytes
         };
-        let shape = Shape::try_from(dims).map_err(|error| upload_error(&error))?;
-        Tensor::upload(self.backend, bytes, dtype, shape).map_err(|error| upload_error(&error))
+        let shape = Shape::try_from(dims).map_err(|error| tensor_from_bytes_error(&error))?;
+        Tensor::from_bytes(self.backend, bytes, dtype, shape)
+            .map_err(|error| tensor_from_bytes_error(&error))
     }
 
     fn next_tokens(
@@ -172,8 +173,8 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
         logits: &Tensor<B>,
     ) -> Result<Vec<u32>, GenerateError> {
         let bytes = logits
-            .argmax(self.backend, VOCAB_AXIS)
-            .and_then(|token| token.download(self.backend))
+            .argmax_keepdim(self.backend, VOCAB_DIM)
+            .and_then(|token| token.to_bytes(self.backend))
             .map_err(|error| {
                 error!(message = "Selecting the next token failed.", %error);
                 GenerateError::NextToken
@@ -235,7 +236,7 @@ fn decode_token_ids(
     let (tokens, remainder) = bytes.as_chunks::<TOKEN_ID_BYTES>();
     if tokens.len() != batch_size.get() || !remainder.is_empty() {
         error!(
-            message = "Next token download does not hold one u32 per sequence.",
+            message = "Next token bytes do not hold one u32 per sequence.",
             bytes = bytes.len(),
             batch_size = batch_size.get(),
         );

@@ -26,7 +26,7 @@ use crate::nn::{
 };
 
 const CACHE_DTYPE: DType = DType::BF16;
-const SEQ_AXIS: usize = 1;
+const SEQ_DIM: usize = 1;
 const HEAD_MAJOR: [usize; 4] = [0, 2, 1, 3];
 
 pub struct Llama<B: Backend> {
@@ -112,8 +112,8 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
         position: usize,
     ) -> Result<Tensor<B>, Self::Error> {
         let (batch_size, seq_len_total) = forward_dims(
-            token_ids.shape().element_count(),
-            positions.shape().element_count(),
+            token_ids.shape().numel(),
+            positions.shape().numel(),
             position,
             self.seq_len_max,
             cache.len(),
@@ -124,7 +124,7 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
             mask,
             position,
             batch_size,
-            seq_len: positions.shape().element_count(),
+            seq_len: positions.shape().numel(),
             seq_len_total,
         };
         self.logits(backend, token_ids, cache, &step)
@@ -189,12 +189,12 @@ impl<B: Backend> Llama<B> {
                 self.decoder_layer(backend, layer, layer_cache, &hidden, step)
             },
         )?;
-        let hidden_size = hidden.shape().dim(hidden.shape().last_axis()?)?;
+        let hidden_size = hidden.shape().size(hidden.shape().last_dim()?)?;
         let last = hidden
             .reshape(Shape::try_from(
                 [step.batch_size, step.seq_len, hidden_size].as_slice(),
             )?)?
-            .narrow(SEQ_AXIS, step.seq_len.saturating_sub(1), 1)?
+            .narrow(SEQ_DIM, step.seq_len.saturating_sub(1), 1)?
             .contiguous(backend)?
             .reshape(Shape::try_from([step.batch_size, hidden_size].as_slice())?)?;
         let normed = self.weights.norm().forward(backend, &last)?;

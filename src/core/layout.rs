@@ -4,15 +4,15 @@ use tracing::error;
 
 use crate::core::{
     CoreError,
-    RANK_MAX,
+    MAX_RANK,
     Shape,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Layout {
     shape: Shape,
-    strides: [usize; RANK_MAX],
-    offset: usize,
+    strides: [usize; MAX_RANK],
+    storage_offset: usize,
 }
 
 impl Layout {
@@ -20,27 +20,27 @@ impl Layout {
         Self {
             shape,
             strides: contiguous_strides(&shape),
-            offset: 0,
+            storage_offset: 0,
         }
     }
 
     pub fn shape(&self) -> &Shape { &self.shape }
 
-    pub fn strides(&self) -> &[usize] { self.strides.get(..self.shape.rank()).unwrap_or_default() }
+    pub fn strides(&self) -> &[usize] { self.strides.get(..self.shape.ndim()).unwrap_or_default() }
 
-    pub fn offset(&self) -> usize { self.offset }
+    pub fn storage_offset(&self) -> usize { self.storage_offset }
 
     pub fn stride(
         &self,
-        axis: usize,
+        dim: usize,
     ) -> Result<usize, CoreError> {
-        self.strides().get(axis).copied().ok_or_else(|| {
+        self.strides().get(dim).copied().ok_or_else(|| {
             error!(
-                message = "Axis is out of range.",
-                axis,
-                rank = self.shape.rank()
+                message = "Dimension is out of range.",
+                dim,
+                ndim = self.shape.ndim()
             );
-            CoreError::AxisOutOfRange
+            CoreError::DimOutOfRange
         })
     }
 
@@ -50,7 +50,7 @@ impl Layout {
             .dims()
             .iter()
             .zip(self.strides().iter().zip(expected.iter()))
-            .all(|(&dim, (&stride, &stride_expected))| dim == 1 || stride == stride_expected)
+            .all(|(&size, (&stride, &stride_expected))| size == 1 || stride == stride_expected)
     }
 
     pub fn reshape(
@@ -61,70 +61,70 @@ impl Layout {
             error!(message = "Reshape requires a contiguous layout.", layout = ?self);
             return Err(CoreError::ReshapeNonContiguous);
         }
-        let from = self.shape.element_count();
-        let to = shape.element_count();
+        let from = self.shape.numel();
+        let to = shape.numel();
         if from != to {
             error!(message = "Element counts do not match.", from, to);
-            return Err(CoreError::ElementCountMismatch);
+            return Err(CoreError::NumelMismatch);
         }
         Ok(Self {
-            offset: self.offset,
+            storage_offset: self.storage_offset,
             ..Self::contiguous(shape)
         })
     }
 
     pub fn permute(
         &self,
-        axes: &[usize],
+        dims: &[usize],
     ) -> Result<Self, CoreError> {
-        let rank = self.shape.rank();
+        let ndim = self.shape.ndim();
         let invalid = || {
             error!(
-                message = "Axes are not a permutation of the rank.",
-                ?axes,
-                rank
+                message = "Dims are not a permutation of the dimensions.",
+                ?dims,
+                ndim
             );
             CoreError::InvalidPermutation
         };
-        let is_permutation = axes.len() == rank && (0..rank).all(|axis| axes.contains(&axis));
+        let is_permutation = dims.len() == ndim && (0..ndim).all(|dim| dims.contains(&dim));
         if !is_permutation {
             return Err(invalid());
         }
-        let dims = permuted(self.shape.dims(), axes).ok_or_else(invalid)?;
-        let strides = permuted(self.strides(), axes).ok_or_else(invalid)?;
+        let sizes = permuted(self.shape.dims(), dims).ok_or_else(invalid)?;
+        let strides = permuted(self.strides(), dims).ok_or_else(invalid)?;
         Ok(Self {
-            shape: Shape::try_from(dims.as_slice())?,
+            shape: Shape::try_from(sizes.as_slice())?,
             strides: padded(&strides),
-            offset: self.offset,
+            storage_offset: self.storage_offset,
         })
     }
 
     pub fn narrow(
         &self,
-        axis: usize,
+        dim: usize,
         start: usize,
-        len: usize,
+        length: usize,
     ) -> Result<Self, CoreError> {
-        let dim = self.shape.dim(axis)?;
-        let stride = self.stride(axis)?;
+        let size = self.shape.size(dim)?;
+        let stride = self.stride(dim)?;
         let out_of_bounds = || {
             error!(
                 message = "Narrow exceeds the dimension.",
-                axis, start, len, dim
+                dim, start, length, size
             );
             CoreError::NarrowOutOfBounds
         };
-        let end = start.checked_add(len).ok_or_else(out_of_bounds)?;
-        if end > dim {
+        let end = start.checked_add(length).ok_or_else(out_of_bounds)?;
+        if end > size {
             return Err(out_of_bounds());
         }
-        let offset = start
+        let storage_offset = start
             .checked_mul(stride)
-            .and_then(|delta| self.offset.checked_add(delta))
+            .and_then(|delta| self.storage_offset.checked_add(delta))
             .ok_or_else(|| {
                 error!(
                     message = "View offset overflows.",
-                    offset = self.offset,
+                    storage_offset = self.storage_offset,
                     start,
                     stride,
                 );
@@ -135,44 +135,44 @@ impl Layout {
             .dims()
             .iter()
             .enumerate()
-            .map(|(index, &size)| if index == axis { len } else { size })
+            .map(|(index, &current)| if index == dim { length } else { current })
             .collect();
         Ok(Self {
             shape: Shape::try_from(dims.as_slice())?,
             strides: self.strides,
-            offset,
+            storage_offset,
         })
     }
 
-    pub fn broadcast_as(
+    pub fn expand(
         &self,
         shape: Shape,
     ) -> Result<Self, CoreError> {
         let incompatible = || {
             error!(
-                message = "Shape cannot be broadcast to the target shape.",
+                message = "Shape cannot be expanded to the target shape.",
                 from = ?self.shape.dims(),
                 to = ?shape.dims(),
             );
-            CoreError::BroadcastAsIncompatible
+            CoreError::ExpandIncompatible
         };
         let leading = shape
-            .rank()
-            .checked_sub(self.shape.rank())
+            .ndim()
+            .checked_sub(self.shape.ndim())
             .ok_or_else(incompatible)?;
         let strides = shape
             .dims()
             .iter()
             .enumerate()
-            .map(|(axis, &dim_target)| {
-                let Some(axis_source) = axis.checked_sub(leading) else {
+            .map(|(dim, &size_target)| {
+                let Some(dim_source) = dim.checked_sub(leading) else {
                     return Ok(0);
                 };
                 match (
-                    self.shape.dims().get(axis_source).copied(),
-                    self.strides().get(axis_source).copied(),
+                    self.shape.dims().get(dim_source).copied(),
+                    self.strides().get(dim_source).copied(),
                 ) {
-                    (Some(dim_source), Some(stride)) if dim_source == dim_target => Ok(stride),
+                    (Some(size_source), Some(stride)) if size_source == size_target => Ok(stride),
                     (Some(1), Some(_)) => Ok(0),
                     _ => Err(incompatible()),
                 }
@@ -181,7 +181,7 @@ impl Layout {
         Ok(Self {
             shape,
             strides: padded(&strides),
-            offset: self.offset,
+            storage_offset: self.storage_offset,
         })
     }
 }
@@ -191,16 +191,16 @@ struct StrideFold {
     stride_next: usize,
 }
 
-fn contiguous_strides(shape: &Shape) -> [usize; RANK_MAX] {
+fn contiguous_strides(shape: &Shape) -> [usize; MAX_RANK] {
     let strides_reversed = shape.dims().iter().rev().fold(
         StrideFold {
-            strides: Vec::with_capacity(RANK_MAX),
+            strides: Vec::with_capacity(MAX_RANK),
             stride_next: 1,
         },
-        |mut fold, &dim| {
+        |mut fold, &size| {
             fold.strides.push(fold.stride_next);
             StrideFold {
-                stride_next: fold.stride_next.saturating_mul(dim),
+                stride_next: fold.stride_next.saturating_mul(size),
                 strides: fold.strides,
             }
         },
@@ -211,13 +211,13 @@ fn contiguous_strides(shape: &Shape) -> [usize; RANK_MAX] {
 
 fn permuted(
     values: &[usize],
-    axes: &[usize],
+    dims: &[usize],
 ) -> Option<Vec<usize>> {
-    axes.iter().map(|&axis| values.get(axis).copied()).collect()
+    dims.iter().map(|&dim| values.get(dim).copied()).collect()
 }
 
-fn padded(values: &[usize]) -> [usize; RANK_MAX] {
-    array::from_fn(|axis| values.get(axis).copied().unwrap_or(0))
+fn padded(values: &[usize]) -> [usize; MAX_RANK] {
+    array::from_fn(|index| values.get(index).copied().unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -256,24 +256,24 @@ mod tests {
             Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"));
         [[0, 0, 1].as_slice(), &[0, 1, 3], &[0, 1]]
             .into_iter()
-            .for_each(|axes| {
+            .for_each(|dims| {
                 assert_eq!(
-                    layout.permute(axes),
+                    layout.permute(dims),
                     Err(CoreError::InvalidPermutation),
-                    "axes {axes:?}"
+                    "dims {dims:?}"
                 );
             });
     }
 
     #[test]
-    fn narrow_moves_offset_and_shrinks_axis() {
+    fn narrow_moves_offset_and_shrinks_dim() {
         let layout =
             Layout::contiguous(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
                 .narrow(1, 1, 2)
                 .expect("in bounds");
         assert_eq!(layout.shape().dims(), &[2, 2, 4], "narrowed dims");
         assert_eq!(layout.strides(), &[12, 4, 1], "strides unchanged");
-        assert_eq!(layout.offset(), 4, "offset moved by one row");
+        assert_eq!(layout.storage_offset(), 4, "offset moved by one row");
     }
 
     #[test]
@@ -283,12 +283,12 @@ mod tests {
         assert_eq!(
             layout.narrow(1, 2, 2),
             Err(CoreError::NarrowOutOfBounds),
-            "the window ends after the axis"
+            "the window ends after the dim"
         );
         assert_eq!(
             layout.narrow(3, 0, 1),
-            Err(CoreError::AxisOutOfRange),
-            "axis 3 does not exist"
+            Err(CoreError::DimOutOfRange),
+            "dim 3 does not exist"
         );
     }
 
@@ -301,7 +301,7 @@ mod tests {
                 1
             ),
             Err(CoreError::NarrowOutOfBounds),
-            "start plus len overflows usize"
+            "start plus length overflows usize"
         );
     }
 
@@ -315,7 +315,7 @@ mod tests {
             .reshape(Shape::try_from([3, 4].as_slice()).expect("valid shape"))
             .expect("contiguous");
         assert_eq!(reshaped.strides(), &[4, 1], "reshaped strides");
-        assert_eq!(reshaped.offset(), 12, "offset kept");
+        assert_eq!(reshaped.storage_offset(), 12, "offset kept");
     }
 
     #[test]
@@ -331,22 +331,22 @@ mod tests {
     }
 
     #[test]
-    fn reshape_rejects_element_count_mismatch() {
+    fn reshape_rejects_numel_mismatch() {
         assert_eq!(
             Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
                 .reshape(Shape::try_from([5].as_slice()).expect("valid shape")),
-            Err(CoreError::ElementCountMismatch),
+            Err(CoreError::NumelMismatch),
             "six elements cannot become five"
         );
     }
 
     #[test]
-    fn broadcast_as_uses_zero_strides() {
+    fn expand_uses_zero_strides() {
         let layout = Layout::contiguous(Shape::try_from([3, 1].as_slice()).expect("valid shape"))
-            .broadcast_as(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
-            .expect("broadcastable");
-        assert_eq!(layout.shape().dims(), &[2, 3, 4], "broadcast dims");
-        assert_eq!(layout.strides(), &[0, 1, 0], "broadcast strides");
+            .expand(Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"))
+            .expect("expandable");
+        assert_eq!(layout.shape().dims(), &[2, 3, 4], "expanded dims");
+        assert_eq!(layout.strides(), &[0, 1, 0], "expanded strides");
     }
 
     const WIDENED_DIMS: [usize; 4] = [2, 6, 5, 7];
@@ -358,12 +358,12 @@ mod tests {
 
     struct Window {
         start: usize,
-        len: usize,
+        length: usize,
     }
 
     fn addresses(layout: &Layout) -> Vec<usize> {
         let dims = layout.shape().dims();
-        (0..layout.shape().element_count())
+        (0..layout.shape().numel())
             .map(|flat| {
                 dims.iter()
                     .zip(layout.strides())
@@ -371,15 +371,15 @@ mod tests {
                     .fold(
                         AddressFold {
                             rest: flat,
-                            address: layout.offset(),
+                            address: layout.storage_offset(),
                         },
-                        |fold, (&dim, &stride)| {
+                        |fold, (&size, &stride)| {
                             let index = fold
                                 .rest
-                                .checked_rem(dim)
-                                .expect("a non-empty view has no zero dim");
+                                .checked_rem(size)
+                                .expect("a non-empty view has no zero size");
                             AddressFold {
-                                rest: fold.rest.checked_div(dim).expect("dim is non-zero"),
+                                rest: fold.rest.checked_div(size).expect("size is non-zero"),
                                 address: index
                                     .checked_mul(stride)
                                     .and_then(|delta| fold.address.checked_add(delta))
@@ -399,7 +399,7 @@ mod tests {
         let dims: Vec<usize> = dims
             .iter()
             .enumerate()
-            .map(|(axis, &dim)| size(axis, dim))
+            .map(|(dim, &current)| size(dim, current))
             .collect();
         Shape::try_from(dims.as_slice()).expect("a widened shape is valid")
     }
@@ -410,26 +410,26 @@ mod tests {
             .dims()
             .iter()
             .enumerate()
-            .flat_map(|(axis, &dim)| {
+            .flat_map(|(dim, &size)| {
                 [
                     Some(Window {
                         start: 0,
-                        len: dim,
+                        length: size,
                     }),
-                    dim.checked_sub(1).map(|len| Window {
+                    size.checked_sub(1).map(|length| Window {
                         start: 1,
-                        len,
+                        length,
                     }),
                     Some(Window {
-                        start: dim,
-                        len: 0,
+                        start: size,
+                        length: 0,
                     }),
                 ]
                 .into_iter()
                 .flatten()
                 .map(move |window| {
                     layout
-                        .narrow(axis, window.start, window.len)
+                        .narrow(dim, window.start, window.length)
                         .expect("the window is in bounds")
                 })
             })
@@ -437,45 +437,41 @@ mod tests {
     }
 
     fn permutes(layout: &Layout) -> Vec<Layout> {
-        let rank = layout.shape().rank();
-        let reversed: Vec<usize> = (0..rank).rev().collect();
-        let rotated: Vec<usize> = (1..rank).chain((rank > 0).then_some(0)).collect();
+        let ndim = layout.shape().ndim();
+        let reversed: Vec<usize> = (0..ndim).rev().collect();
+        let rotated: Vec<usize> = (1..ndim).chain((ndim > 0).then_some(0)).collect();
         [reversed, rotated]
             .iter()
-            .map(|axes| layout.permute(axes).expect("the axes are a permutation"))
+            .map(|dims| layout.permute(dims).expect("the dims are a permutation"))
             .collect()
     }
 
-    fn broadcasts(layout: &Layout) -> Vec<Layout> {
+    fn expands(layout: &Layout) -> Vec<Layout> {
         let dims = layout.shape().dims();
         let leading: Vec<usize> = [2].into_iter().chain(dims.iter().copied()).collect();
-        let widened_all = with_dims(dims, |axis, dim| {
-            if dim == 1 {
-                WIDENED_DIMS.get(axis).copied().unwrap_or(2)
+        let widened_all = with_dims(dims, |dim, size| {
+            if size == 1 {
+                WIDENED_DIMS.get(dim).copied().unwrap_or(2)
             } else {
-                dim
+                size
             }
         });
         let widened_each = dims
             .iter()
             .enumerate()
-            .filter(|&(_, &dim)| dim == 1)
-            .map(|(widened, _)| with_dims(dims, |axis, dim| if axis == widened { 2 } else { dim }));
+            .filter(|&(_, &size)| size == 1)
+            .map(|(widened, _)| with_dims(dims, |dim, size| if dim == widened { 2 } else { size }));
         Shape::try_from(leading.as_slice())
             .ok()
             .into_iter()
             .chain([widened_all])
             .chain(widened_each)
-            .map(|shape| {
-                layout
-                    .broadcast_as(shape)
-                    .expect("the shape is broadcastable")
-            })
+            .map(|shape| layout.expand(shape).expect("the shape is expandable"))
             .collect()
     }
 
     fn reshapes(layout: &Layout) -> Vec<Layout> {
-        Shape::try_from([layout.shape().element_count()].as_slice())
+        Shape::try_from([layout.shape().numel()].as_slice())
             .ok()
             .and_then(|shape| layout.reshape(shape).ok())
             .into_iter()
@@ -489,15 +485,15 @@ mod tests {
             permutes(layout)
                 .into_iter()
                 .chain(reshapes(layout))
-                .chain(broadcasts(layout))
+                .chain(expands(layout))
         });
         let after_permute = permuted
             .iter()
             .flat_map(narrows)
-            .flat_map(|layout| broadcasts(&layout));
+            .flat_map(|layout| expands(&layout));
         [*base]
             .into_iter()
-            .chain(broadcasts(base))
+            .chain(expands(base))
             .chain(reshapes(base))
             .chain(after_narrow.collect::<Vec<Layout>>())
             .chain(after_permute.collect::<Vec<Layout>>())
@@ -512,24 +508,22 @@ mod tests {
             .into_iter()
             .for_each(|dims| {
                 let base = Layout::contiguous(Shape::try_from(dims).expect("valid shape"));
-                let element_count = base.shape().element_count();
+                let numel = base.shape().numel();
                 views(&base).iter().for_each(|view| {
                     assert!(
-                        addresses(view)
-                            .iter()
-                            .all(|&address| address < element_count),
-                        "base {dims:?} view {:?} strides {:?} offset {} leaves {element_count} \
+                        addresses(view).iter().all(|&address| address < numel),
+                        "base {dims:?} view {:?} strides {:?} storage_offset {} leaves {numel} \
                          elements",
                         view.shape().dims(),
                         view.strides(),
-                        view.offset()
+                        view.storage_offset()
                     );
                 });
             });
     }
 
     #[test]
-    fn empty_contiguous_strides_do_not_depend_on_axis_order() {
+    fn empty_contiguous_strides_do_not_depend_on_dim_order() {
         assert_eq!(
             Layout::contiguous(
                 Shape::try_from([(1 << 30) - 1, 0, 2].as_slice()).expect("valid shape")
@@ -549,27 +543,27 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_as_rejects_incompatible_shape() {
+    fn expand_rejects_incompatible_shape() {
         assert_eq!(
             Layout::contiguous(Shape::try_from([3, 2].as_slice()).expect("valid shape"))
-                .broadcast_as(Shape::try_from([3, 4].as_slice()).expect("valid shape")),
-            Err(CoreError::BroadcastAsIncompatible),
+                .expand(Shape::try_from([3, 4].as_slice()).expect("valid shape")),
+            Err(CoreError::ExpandIncompatible),
             "dim 2 cannot become 4"
         );
     }
 
     #[test]
-    fn broadcast_as_to_a_lower_rank_is_rejected() {
+    fn expand_to_a_lower_ndim_is_rejected() {
         assert_eq!(
             Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
-                .broadcast_as(Shape::try_from([3].as_slice()).expect("valid shape")),
-            Err(CoreError::BroadcastAsIncompatible),
-            "a broadcast cannot drop an axis"
+                .expand(Shape::try_from([3].as_slice()).expect("valid shape")),
+            Err(CoreError::ExpandIncompatible),
+            "an expand cannot drop a dim"
         );
     }
 
     #[test]
-    fn size_one_axis_with_any_stride_is_contiguous() {
+    fn size_one_dim_with_any_stride_is_contiguous() {
         let layout =
             Layout::contiguous(Shape::try_from([2, 1, 3].as_slice()).expect("valid shape"))
                 .permute(&[1, 0, 2])
@@ -577,19 +571,19 @@ mod tests {
         assert_eq!(
             layout.strides(),
             &[3, 3, 1],
-            "the size one axis keeps stride 3"
+            "the size one dim keeps stride 3"
         );
         assert!(
             layout.is_contiguous(),
-            "moving a size one axis keeps the layout contiguous"
+            "moving a size one dim keeps the layout contiguous"
         );
     }
 
     #[test]
-    fn broadcast_layout_is_not_contiguous() {
+    fn expanded_layout_is_not_contiguous() {
         let layout = Layout::contiguous(Shape::try_from([3].as_slice()).expect("valid shape"))
-            .broadcast_as(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
-            .expect("broadcastable");
+            .expand(Shape::try_from([2, 3].as_slice()).expect("valid shape"))
+            .expect("expandable");
         assert!(
             !layout.is_contiguous(),
             "a zero stride on a dim of 2 is not contiguous"

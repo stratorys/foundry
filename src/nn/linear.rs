@@ -40,6 +40,6 @@ impl<B: Backend> Embedding<B> {
         backend: &mut B,
         token_ids: &Tensor<B>,
     ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        self.table.gather(backend, token_ids)
+        self.table.index_select(backend, 0, token_ids)
     }
 }

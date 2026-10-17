@@ -87,7 +87,7 @@ mod tests {
     fn model_propagation_preserves_tensor_and_backend_sources() {
         fn propagate() -> Result<(), LlamaError<fmt::Error>> {
             Err::<(), _>(TensorError::Backend {
-                operation: "upload",
+                operation: "from_bytes",
                 source: fmt::Error,
             })?;
             Ok(())
@@ -98,7 +98,7 @@ mod tests {
             matches!(
                 &error,
                 LlamaError::Tensor(TensorError::Backend {
-                    operation: "upload",
+                    operation: "from_bytes",
                     source: fmt::Error,
                 })
             ),
@@ -124,13 +124,13 @@ mod tests {
     #[test]
     fn model_propagation_preserves_direct_validation_failure() {
         fn propagate() -> Result<(), LlamaError<fmt::Error>> {
-            Err::<(), _>(CoreError::AxisOutOfRange)?;
+            Err::<(), _>(CoreError::DimOutOfRange)?;
             Ok(())
         }
 
         let error = propagate().expect_err("the validation failure propagates");
         assert!(
-            matches!(error, LlamaError::Validation(CoreError::AxisOutOfRange)),
+            matches!(error, LlamaError::Validation(CoreError::DimOutOfRange)),
             "pure validation failures do not become backend errors"
         );
     }

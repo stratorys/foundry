@@ -18,8 +18,8 @@ pub enum GenerateError {
     #[error("Creating the key-value cache failed.")]
     Cache,
 
-    #[error("Uploading a generation input failed.")]
-    Upload,
+    #[error("Creating a generation input tensor failed.")]
+    FromBytes,
 
     #[error("Model forward failed.")]
     Forward,
@@ -27,6 +27,6 @@ pub enum GenerateError {
     #[error("Selecting the next token failed.")]
     NextToken,
 
-    #[error("Next token download does not hold one u32 per sequence.")]
+    #[error("Next token bytes do not hold one u32 per sequence.")]
     TokenBytes,
 }

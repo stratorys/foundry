@@ -4,56 +4,58 @@ use tracing::error;
 
 use crate::core::{
     CoreError,
-    DTYPE_SIZE_BYTES_MAX,
     DType,
+    MAX_ITEMSIZE,
 };
 
-pub const RANK_MAX: usize = 4;
+pub const MAX_RANK: usize = 4;
 
-const ELEMENT_COUNT_MAX: usize = 0x7FFF_FFFF;
+const MAX_NUMEL: usize = 0x7FFF_FFFF;
 
 const _: () = assert!(
-    ELEMENT_COUNT_MAX
-        .checked_mul(DTYPE_SIZE_BYTES_MAX)
-        .is_some(),
+    MAX_NUMEL.checked_mul(MAX_ITEMSIZE).is_some(),
     "the byte count of every shape fits in usize"
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Shape {
-    dims: [usize; RANK_MAX],
-    rank: usize,
-    element_count: usize,
+    dims: [usize; MAX_RANK],
+    ndim: usize,
+    numel: usize,
 }
 
 impl Shape {
-    pub fn dims(&self) -> &[usize] { self.dims.get(..self.rank).unwrap_or_default() }
+    pub fn dims(&self) -> &[usize] { self.dims.get(..self.ndim).unwrap_or_default() }
 
-    pub fn rank(&self) -> usize { self.rank }
+    pub fn ndim(&self) -> usize { self.ndim }
 
-    pub fn element_count(&self) -> usize { self.element_count }
+    pub fn numel(&self) -> usize { self.numel }
 
-    pub fn byte_len(
+    pub fn nbytes(
         &self,
         dtype: DType,
     ) -> usize {
-        self.element_count.saturating_mul(dtype.size_bytes())
+        self.numel.saturating_mul(dtype.itemsize())
     }
 
-    pub fn dim(
+    pub fn size(
         &self,
-        axis: usize,
+        dim: usize,
     ) -> Result<usize, CoreError> {
-        self.dims().get(axis).copied().ok_or_else(|| {
-            error!(message = "Axis is out of range.", axis, rank = self.rank);
-            CoreError::AxisOutOfRange
+        self.dims().get(dim).copied().ok_or_else(|| {
+            error!(
+                message = "Dimension is out of range.",
+                dim,
+                ndim = self.ndim
+            );
+            CoreError::DimOutOfRange
         })
     }
 
-    pub fn last_axis(&self) -> Result<usize, CoreError> {
-        self.rank.checked_sub(1).ok_or_else(|| {
-            error!(message = "A scalar has no last axis.");
-            CoreError::AxisOutOfRange
+    pub fn last_dim(&self) -> Result<usize, CoreError> {
+        self.ndim.checked_sub(1).ok_or_else(|| {
+            error!(message = "A scalar has no last dimension.");
+            CoreError::DimOutOfRange
         })
     }
 
@@ -69,15 +71,15 @@ impl Shape {
             );
             CoreError::BroadcastIncompatible
         };
-        let dims_reversed = (0..lhs.rank.max(rhs.rank))
-            .map(|axis_from_end| {
+        let dims_reversed = (0..lhs.ndim.max(rhs.ndim))
+            .map(|dim_from_end| {
                 match (
-                    dim_from_end(lhs, axis_from_end),
-                    dim_from_end(rhs, axis_from_end),
+                    size_from_end(lhs, dim_from_end),
+                    size_from_end(rhs, dim_from_end),
                 ) {
-                    (lhs_dim, rhs_dim) if lhs_dim == rhs_dim => Ok(lhs_dim),
-                    (1, rhs_dim) => Ok(rhs_dim),
-                    (lhs_dim, 1) => Ok(lhs_dim),
+                    (lhs_size, rhs_size) if lhs_size == rhs_size => Ok(lhs_size),
+                    (1, rhs_size) => Ok(rhs_size),
+                    (lhs_size, 1) => Ok(lhs_size),
                     _ => Err(incompatible()),
                 }
             })
@@ -91,50 +93,46 @@ impl TryFrom<&[usize]> for Shape {
     type Error = CoreError;
 
     fn try_from(dims: &[usize]) -> Result<Self, Self::Error> {
-        let rank = dims.len();
-        if rank > RANK_MAX {
+        let ndim = dims.len();
+        if ndim > MAX_RANK {
             error!(
                 message = "Rank exceeds the maximum rank.",
-                rank,
-                rank_max = RANK_MAX
+                ndim,
+                max_rank = MAX_RANK
             );
             return Err(CoreError::RankTooLarge);
         }
-        let element_count_non_zero = dims
+        let numel_non_zero = dims
             .iter()
             .filter(|&&dim| dim != 0)
             .try_fold(1_usize, |count, &dim| count.checked_mul(dim))
-            .filter(|&count| count <= ELEMENT_COUNT_MAX)
+            .filter(|&count| count <= MAX_NUMEL)
             .ok_or_else(|| {
                 error!(
                     message = "Shape has too many elements.",
                     ?dims,
-                    element_count_max = ELEMENT_COUNT_MAX,
+                    max_numel = MAX_NUMEL,
                 );
-                CoreError::ElementCountOverflow
+                CoreError::NumelOverflow
             })?;
-        let element_count = if dims.contains(&0) {
-            0
-        } else {
-            element_count_non_zero
-        };
+        let numel = if dims.contains(&0) { 0 } else { numel_non_zero };
         Ok(Self {
-            dims: array::from_fn(|axis| dims.get(axis).copied().unwrap_or(1)),
-            rank,
-            element_count,
+            dims: array::from_fn(|dim| dims.get(dim).copied().unwrap_or(1)),
+            ndim,
+            numel,
         })
     }
 }
 
-fn dim_from_end(
+fn size_from_end(
     shape: &Shape,
-    axis_from_end: usize,
+    dim_from_end: usize,
 ) -> usize {
     shape
         .dims()
         .iter()
         .rev()
-        .nth(axis_from_end)
+        .nth(dim_from_end)
         .copied()
         .unwrap_or(1)
 }
@@ -147,7 +145,7 @@ mod tests {
     };
 
     #[test]
-    fn broadcast_aligns_axes_from_the_right() {
+    fn broadcast_aligns_dims_from_the_right() {
         let result = Shape::broadcast(
             &Shape::try_from([2, 1, 4].as_slice()).expect("valid shape"),
             &Shape::try_from([3, 1].as_slice()).expect("valid shape"),
@@ -170,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_prepends_missing_axes_on_the_left() {
+    fn broadcast_prepends_missing_dims_on_the_left() {
         let short = Shape::try_from([3].as_slice()).expect("valid shape");
         let long = Shape::try_from([2, 3].as_slice()).expect("valid shape");
         assert_eq!(
@@ -203,7 +201,7 @@ mod tests {
                 &Shape::try_from([1 << 30, 1].as_slice()).expect("valid shape"),
                 &Shape::try_from([1, 4].as_slice()).expect("valid shape"),
             ),
-            Err(CoreError::ElementCountOverflow),
+            Err(CoreError::NumelOverflow),
             "two valid shapes can broadcast to an invalid one"
         );
     }
@@ -220,7 +218,7 @@ mod tests {
     #[test]
     fn rank_at_max_is_accepted() {
         assert_eq!(
-            Shape::try_from([1, 2, 3, 4].as_slice()).map(|shape| shape.rank()),
+            Shape::try_from([1, 2, 3, 4].as_slice()).map(|shape| shape.ndim()),
             Ok(4),
             "rank 4 is accepted"
         );
@@ -229,43 +227,43 @@ mod tests {
     #[test]
     fn scalar_has_one_element() {
         assert_eq!(
-            Shape::try_from([].as_slice()).map(|shape| shape.element_count()),
+            Shape::try_from([].as_slice()).map(|shape| shape.numel()),
             Ok(1),
             "a rank 0 shape holds one element"
         );
     }
 
     #[test]
-    fn element_count_overflow_is_rejected() {
+    fn numel_overflow_is_rejected() {
         assert_eq!(
             Shape::try_from([usize::MAX, 2].as_slice()),
-            Err(CoreError::ElementCountOverflow),
+            Err(CoreError::NumelOverflow),
             "the product overflows usize"
         );
     }
 
     #[test]
-    fn element_count_above_i32_max_is_rejected() {
+    fn numel_above_i32_max_is_rejected() {
         assert_eq!(
             Shape::try_from([1 << 31].as_slice()),
-            Err(CoreError::ElementCountOverflow),
+            Err(CoreError::NumelOverflow),
             "one element above i32::MAX"
         );
     }
 
     #[test]
-    fn element_count_at_i32_max_is_accepted() {
+    fn numel_at_i32_max_is_accepted() {
         assert_eq!(
             Shape::try_from([(1 << 31) - 1].as_slice())
                 .expect("valid shape")
-                .element_count(),
+                .numel(),
             (1 << 31) - 1,
             "element count"
         );
     }
 
     #[test]
-    fn non_zero_product_above_i32_max_is_rejected_in_any_axis_order() {
+    fn non_zero_product_above_i32_max_is_rejected_in_any_dim_order() {
         [
             [usize::MAX, 2, 0],
             [usize::MAX, 0, 2],
@@ -276,21 +274,21 @@ mod tests {
         .for_each(|dims| {
             assert_eq!(
                 Shape::try_from(dims.as_slice()),
-                Err(CoreError::ElementCountOverflow),
+                Err(CoreError::NumelOverflow),
                 "dims {dims:?}"
             );
         });
     }
 
     #[test]
-    fn empty_shape_within_bound_is_accepted_in_any_axis_order() {
+    fn empty_shape_within_bound_is_accepted_in_any_dim_order() {
         [[(1 << 30) - 1, 0, 2], [0, (1 << 30) - 1, 2]]
             .into_iter()
             .for_each(|dims| {
                 assert_eq!(
                     Shape::try_from(dims.as_slice())
                         .expect("valid shape")
-                        .element_count(),
+                        .numel(),
                     0,
                     "dims {dims:?}"
                 );

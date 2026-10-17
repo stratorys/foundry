@@ -46,8 +46,8 @@ use self::stats::{
     ns_to_f64,
 };
 use crate::core::{
+    AllocatedMemorySource,
     Backend,
-    PeakMemorySource,
     SplitMix64,
 };
 use crate::generate::{
@@ -101,7 +101,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peak_memory_source: Option<PeakMemorySource>,
+    pub peak_memory_source: Option<AllocatedMemorySource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -209,7 +209,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
         .collect::<Result<Vec<RunSamples>, BenchError>>()?;
     let stats = stats(&runs)?;
     let metrics = metrics(&runs, counts)?;
-    let peak_memory = backend.peak_memory();
+    let peak_memory = backend.current_allocated_memory();
     Ok(Report {
         config: *config,
         mode,
@@ -331,7 +331,9 @@ fn run<B: Backend, M: CausalLm<B>>(
         prefill_ns,
         decode_ns,
         token_ids,
-        peak_memory_bytes: backend.peak_memory().map(|peak_memory| peak_memory.bytes),
+        peak_memory_bytes: backend
+            .current_allocated_memory()
+            .map(|peak_memory| peak_memory.bytes),
     })
 }
 

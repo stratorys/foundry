@@ -10,7 +10,7 @@ struct SqrtOp {
   static float apply(float x) { return sqrt(x); }
 };
 
-struct RecipOp {
+struct ReciprocalOp {
   static float apply(float x) { return 1.0f / x; }
 };
 
@@ -39,6 +39,6 @@ INSTANTIATE_UNARY("unary_exp_bf16", bf16_t, ExpOp)
 INSTANTIATE_UNARY("unary_sqrt_f32", float, SqrtOp)
 INSTANTIATE_UNARY("unary_sqrt_f16", half, SqrtOp)
 INSTANTIATE_UNARY("unary_sqrt_bf16", bf16_t, SqrtOp)
-INSTANTIATE_UNARY("unary_recip_f32", float, RecipOp)
-INSTANTIATE_UNARY("unary_recip_f16", half, RecipOp)
-INSTANTIATE_UNARY("unary_recip_bf16", bf16_t, RecipOp)
+INSTANTIATE_UNARY("unary_reciprocal_f32", float, ReciprocalOp)
+INSTANTIATE_UNARY("unary_reciprocal_f16", half, ReciprocalOp)
+INSTANTIATE_UNARY("unary_reciprocal_bf16", bf16_t, ReciprocalOp)

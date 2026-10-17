@@ -10,9 +10,9 @@ mod tensor;
 
 pub use self::backend::Backend;
 pub use self::dtype::{
-    DTYPE_SIZE_BYTES_MAX,
     DType,
     FloatDType,
+    MAX_ITEMSIZE,
     exact_f32,
 };
 pub use self::error::{
@@ -21,12 +21,12 @@ pub use self::error::{
 };
 pub use self::layout::Layout;
 pub use self::memory::{
-    PeakMemory,
-    PeakMemorySource,
+    AllocatedMemory,
+    AllocatedMemorySource,
 };
 pub use self::rng::SplitMix64;
 pub use self::shape::{
-    RANK_MAX,
+    MAX_RANK,
     Shape,
 };
 pub use self::tensor::{

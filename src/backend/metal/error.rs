@@ -45,6 +45,6 @@ pub enum MetalError {
     #[error("Storage was produced by another Metal backend instance.")]
     ForeignStorage,
 
-    #[error("Download exceeds the buffer length.")]
-    DownloadOutOfBounds,
+    #[error("Reading bytes exceeds the buffer length.")]
+    ToBytesOutOfBounds,
 }

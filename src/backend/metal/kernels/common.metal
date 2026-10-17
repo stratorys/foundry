@@ -4,7 +4,7 @@ using namespace metal;
 
 struct StridedArgs {
   uint count;
-  uint rank;
+  uint ndim;
   uint dims[4];
   uint strides[4];
   uint offset;
@@ -12,10 +12,10 @@ struct StridedArgs {
 
 inline uint strided_index(uint linear, constant StridedArgs &args) {
   uint index = args.offset;
-  for (uint axis = args.rank; axis > 0; --axis) {
-    uint dim = args.dims[axis - 1];
-    index += (linear % dim) * args.strides[axis - 1];
-    linear /= dim;
+  for (uint dim = args.ndim; dim > 0; --dim) {
+    uint size = args.dims[dim - 1];
+    index += (linear % size) * args.strides[dim - 1];
+    linear /= size;
   }
   return index;
 }

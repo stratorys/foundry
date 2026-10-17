@@ -17,10 +17,10 @@ pub enum FloatDType {
     BF16,
 }
 
-pub const DTYPE_SIZE_BYTES_MAX: usize = 4;
+pub const MAX_ITEMSIZE: usize = 4;
 
 impl DType {
-    pub const fn size_bytes(self) -> usize {
+    pub const fn itemsize(self) -> usize {
         match self {
             Self::F32 | Self::U32 => 4,
             Self::F16 | Self::BF16 => 2,
@@ -46,7 +46,7 @@ impl DType {
 }
 
 impl FloatDType {
-    pub const fn size_bytes(self) -> usize { DType::from_float(self).size_bytes() }
+    pub const fn itemsize(self) -> usize { DType::from_float(self).itemsize() }
 }
 
 impl From<FloatDType> for DType {
@@ -77,8 +77,8 @@ mod tests {
     fn size_bytes_matches_each_dtype() {
         assert_eq!(
             (
-                [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::size_bytes),
-                [FloatDType::F32, FloatDType::F16, FloatDType::BF16].map(FloatDType::size_bytes),
+                [DType::F32, DType::F16, DType::BF16, DType::U32].map(DType::itemsize),
+                [FloatDType::F32, FloatDType::F16, FloatDType::BF16].map(FloatDType::itemsize),
             ),
             ([4, 2, 2, 4], [4, 2, 2]),
             "f32 and u32 take four bytes, f16 and bf16 two"

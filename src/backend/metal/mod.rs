@@ -25,26 +25,26 @@ pub use self::error::MetalError;
 use self::stream::CommandStream;
 use crate::core::primitive::{
     BinaryOp,
-    ConcatSpec,
-    GatherSpec,
+    CatSpec,
+    IndexSelectSpec,
     MatmulSpec,
     MatrixLayout,
     ReduceOp,
     ReduceSpec,
-    SliceUpdateSpec,
+    SliceScatterSpec,
     UnaryOp,
 };
 use crate::core::{
+    AllocatedMemory,
+    AllocatedMemorySource,
     Backend,
-    DTYPE_SIZE_BYTES_MAX,
     DType,
     FloatDType,
     Layout,
+    MAX_ITEMSIZE,
+    MAX_RANK,
     Operand,
     OperandMut,
-    PeakMemory,
-    PeakMemorySource,
-    RANK_MAX,
     Shape,
 };
 
@@ -55,8 +55,8 @@ const KERNEL_SOURCES: &[&str] = &[
     include_str!("kernels/binary.metal"),
     include_str!("kernels/reduce.metal"),
     include_str!("kernels/matmul.metal"),
-    include_str!("kernels/gather.metal"),
-    include_str!("kernels/slice_update.metal"),
+    include_str!("kernels/index_select.metal"),
+    include_str!("kernels/slice_scatter.metal"),
 ];
 
 const REDUCE_THREADS: usize = 256;
@@ -75,7 +75,7 @@ type ComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 
 pub struct MetalStorage {
     buffer: Buffer,
-    byte_len: usize,
+    nbytes: usize,
     queue: Queue,
 }
 
@@ -96,17 +96,17 @@ struct BufferView<'buffer> {
 #[repr(C)]
 struct StridedArgs {
     count: u32,
-    rank: u32,
-    dims: [u32; RANK_MAX],
-    strides: [u32; RANK_MAX],
+    ndim: u32,
+    dims: [u32; MAX_RANK],
+    strides: [u32; MAX_RANK],
     offset: u32,
 }
 
 #[repr(C)]
 struct ReduceArgs {
     rows: StridedArgs,
-    axis_len: u32,
-    axis_stride: u32,
+    dim_size: u32,
+    dim_stride: u32,
 }
 
 #[repr(C)]
@@ -114,7 +114,7 @@ struct MatmulOperand {
     offset: u32,
     row_stride: u32,
     col_stride: u32,
-    batch_strides: [u32; RANK_MAX],
+    batch_strides: [u32; MAX_RANK],
 }
 
 #[repr(C)]
@@ -122,8 +122,8 @@ struct MatmulArgs {
     m: u32,
     n: u32,
     k: u32,
-    batch_rank: u32,
-    batch_dims: [u32; RANK_MAX],
+    batch_ndim: u32,
+    batch_dims: [u32; MAX_RANK],
     lhs: MatmulOperand,
     rhs: MatmulOperand,
 }
@@ -140,7 +140,7 @@ struct MatmulInput<'buffer> {
 }
 
 #[repr(C)]
-struct GatherArgs {
+struct IndexSelectArgs {
     count: u32,
     rows: u32,
     cols: u32,
@@ -160,11 +160,11 @@ impl StridedArgs {
         shape: &Shape,
     ) -> Result<Self, MetalError> {
         Ok(Self {
-            count: index_u32(shape.element_count())?,
-            rank: index_u32(shape.rank())?,
+            count: index_u32(shape.numel())?,
+            ndim: index_u32(shape.ndim())?,
             dims: padded_u32(shape.dims())?,
             strides: padded_u32(layout.strides())?,
-            offset: index_u32(layout.offset())?,
+            offset: index_u32(layout.storage_offset())?,
         })
     }
 
@@ -180,17 +180,17 @@ impl StridedArgs {
     }
 }
 
-impl GatherArgs {
+impl IndexSelectArgs {
     fn new(
         table: &BufferView<'_>,
         indices: &BufferView<'_>,
-        spec: &GatherSpec,
+        spec: &IndexSelectSpec,
     ) -> Result<Self, MetalError> {
         Ok(Self {
-            count: index_u32(spec.output().element_count())?,
+            count: index_u32(spec.output().numel())?,
             rows: index_u32(spec.rows())?,
             cols: index_u32(spec.cols())?,
-            table_offset: index_u32(table.layout.offset())?,
+            table_offset: index_u32(table.layout.storage_offset())?,
             table_row_stride: index_u32(spec.row_stride())?,
             table_col_stride: index_u32(spec.col_stride())?,
             indices: StridedArgs::new(indices)?,
@@ -205,8 +205,8 @@ impl ReduceArgs {
     ) -> Result<Self, MetalError> {
         Ok(Self {
             rows: StridedArgs::with_shape(input.layout, spec.output())?,
-            axis_len: index_u32(spec.axis_len())?,
-            axis_stride: index_u32(spec.axis_stride())?,
+            dim_size: index_u32(spec.dim_size())?,
+            dim_stride: index_u32(spec.dim_stride())?,
         })
     }
 }
@@ -233,7 +233,7 @@ impl MatmulDispatch {
             m: index_u32(spec.m())?,
             n: index_u32(spec.n())?,
             k: index_u32(spec.k())?,
-            batch_rank: index_u32(batch_dims.len())?,
+            batch_ndim: index_u32(batch_dims.len())?,
             batch_dims: padded_u32(batch_dims)?,
             lhs: MatmulOperand::new(lhs)?,
             rhs: MatmulOperand::new(rhs)?,
@@ -241,7 +241,7 @@ impl MatmulDispatch {
         let grid = MTLSize {
             width: spec.n().div_ceil(MATMUL_TILE),
             height: spec.m().div_ceil(MATMUL_TILE),
-            depth: spec.batch().element_count(),
+            depth: spec.batch().numel(),
         };
         Ok(Self {
             args,
@@ -277,13 +277,13 @@ impl MetalBackend {
 
     fn allocate(
         &mut self,
-        byte_len: usize,
+        nbytes: usize,
     ) -> Result<MetalStorage, MetalError> {
         let bytes_max = self.device.maxBufferLength();
-        if byte_len > bytes_max {
+        if nbytes > bytes_max {
             error!(
                 message = "Buffer exceeds the maximum Metal buffer length.",
-                bytes = byte_len,
+                bytes = nbytes,
                 bytes_max,
             );
             return Err(MetalError::BufferTooLarge);
@@ -291,14 +291,11 @@ impl MetalBackend {
         let buffer = self
             .device
             .newBufferWithLength_options(
-                byte_len.max(DTYPE_SIZE_BYTES_MAX),
+                nbytes.max(MAX_ITEMSIZE),
                 MTLResourceOptions::StorageModeShared,
             )
             .ok_or_else(|| {
-                error!(
-                    message = "Metal buffer allocation failed.",
-                    bytes = byte_len
-                );
+                error!(message = "Metal buffer allocation failed.", bytes = nbytes);
                 MetalError::BufferAllocation
             })?;
         self.allocated_bytes_peak = self
@@ -306,7 +303,7 @@ impl MetalBackend {
             .max(allocated_bytes(&self.device)?);
         Ok(MetalStorage {
             buffer,
-            byte_len,
+            nbytes,
             queue: self.stream.queue().clone(),
         })
     }
@@ -382,7 +379,7 @@ impl MetalBackend {
     ) -> Result<(), MetalError> {
         let count = inputs
             .first()
-            .map_or(0, |input| input.layout.shape().element_count());
+            .map_or(0, |input| input.layout.shape().numel());
         if count == 0 {
             return Ok(());
         }
@@ -552,12 +549,12 @@ impl MetalBackend {
         })
     }
 
-    fn dispatch_gather(
+    fn dispatch_index_select(
         &mut self,
         kernel: &'static str,
         table: &BufferView<'_>,
         indices: &BufferView<'_>,
-        args: &GatherArgs,
+        args: &IndexSelectArgs,
         count: usize,
         output: &MetalStorage,
     ) -> Result<(), MetalError> {
@@ -584,12 +581,12 @@ impl MetalBackend {
             // type, one per dispatched thread.
             unsafe { encoder.setBuffer_offset_atIndex(Some(&output.buffer), 0, 2) };
             // SAFETY: `args` is a `#[repr(C)]` struct of `u32` that matches the
-            // layout of `GatherArgs` in `gather.metal`; Metal copies the bytes
-            // before the call returns.
+            // layout of `IndexSelectArgs` in `index_select.metal`; Metal copies
+            // the bytes before the call returns.
             unsafe {
                 encoder.setBytes_length_atIndex(
                     NonNull::from(args).cast(),
-                    size_of::<GatherArgs>(),
+                    size_of::<IndexSelectArgs>(),
                     3,
                 )
             };
@@ -615,7 +612,7 @@ impl MetalBackend {
         window: &StridedArgs,
         output: &mut MetalStorage,
     ) -> Result<(), MetalError> {
-        let count = input.layout.shape().element_count();
+        let count = input.layout.shape().numel();
         if count == 0 {
             return Ok(());
         }
@@ -636,10 +633,10 @@ impl MetalBackend {
             // command buffer retains it. It was produced on this serial queue,
             // so this write is ordered after every earlier access to it. It is
             // borrowed mutably, so no other reference to it is live
-            // during encoding: either a slice update target, which
-            // `Tensor::slice_update` checked to be contiguous
+            // during encoding: either a slice scatter target, which
+            // `Tensor::slice_scatter` checked to be contiguous
             // and owned by no other tensor before building its `OperandMut`,
-            // or a fresh concat output with a contiguous layout. The shape rule
+            // or a fresh cat output with a contiguous layout. The shape rule
             // bounds `window` inside that layout, so every written
             // index stays inside the storage and is written by one
             // thread only.
@@ -679,7 +676,7 @@ impl MetalBackend {
         input: &BufferView<'_>,
         dtype: DType,
     ) -> Result<MetalStorage, MetalError> {
-        let output = self.allocate(input.layout.shape().byte_len(dtype))?;
+        let output = self.allocate(input.layout.shape().nbytes(dtype))?;
         self.dispatch_strided(copy_kernel(dtype), &[input], &output)?;
         Ok(output)
     }
@@ -714,22 +711,22 @@ impl Backend for MetalBackend {
 
     fn device_name(&self) -> String { self.device.name().to_string() }
 
-    fn peak_memory(&self) -> Option<PeakMemory> {
-        Some(PeakMemory {
+    fn current_allocated_memory(&self) -> Option<AllocatedMemory> {
+        Some(AllocatedMemory {
             bytes: self
                 .allocated_bytes_peak
                 .saturating_sub(self.allocated_bytes_baseline),
-            source: PeakMemorySource::MetalCurrentAllocatedSize,
+            source: AllocatedMemorySource::MetalCurrentAllocatedSize,
         })
     }
 
-    fn upload(
+    fn storage_from_bytes(
         &mut self,
         bytes: &[u8],
     ) -> Result<MetalStorage, MetalError> {
         let storage = self.allocate(bytes.len())?;
         // SAFETY: the buffer is freshly allocated in shared storage with at
-        // least `storage.byte_len == bytes.len()` bytes, and no GPU
+        // least `storage.nbytes == bytes.len()` bytes, and no GPU
         // work references it yet.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -743,36 +740,39 @@ impl Backend for MetalBackend {
 
     fn zeros(
         &mut self,
-        byte_len: usize,
+        nbytes: usize,
     ) -> Result<MetalStorage, MetalError> {
-        let storage = self.allocate(byte_len)?;
+        let storage = self.allocate(nbytes)?;
         self.stream.fill_zero(&storage.buffer)?;
         Ok(storage)
     }
 
-    fn download(
+    fn storage_to_bytes(
         &mut self,
         input: Operand<'_, MetalStorage>,
     ) -> Result<Vec<u8>, MetalError> {
         let dtype = input.dtype();
         let input = self.view(&input)?;
-        let bytes = input.layout.shape().byte_len(dtype);
-        let bytes_offset = input.layout.offset().saturating_mul(dtype.size_bytes());
-        let bytes_len = input.storage.byte_len;
+        let bytes = input.layout.shape().nbytes(dtype);
+        let bytes_offset = input
+            .layout
+            .storage_offset()
+            .saturating_mul(dtype.itemsize());
+        let bytes_len = input.storage.nbytes;
         match bytes_offset.checked_add(bytes) {
             Some(end) if end <= bytes_len => {}
             Some(_) | None => {
                 error!(
-                    message = "Download exceeds the buffer length.",
+                    message = "Reading bytes exceeds the buffer length.",
                     bytes, bytes_offset, bytes_len,
                 );
-                return Err(MetalError::DownloadOutOfBounds);
+                return Err(MetalError::ToBytesOutOfBounds);
             }
         }
         self.stream.synchronize()?;
         let mut output = vec![0_u8; bytes];
         // SAFETY: the buffer uses shared storage, `bytes_offset + bytes <=
-        // byte_len` was checked above, `output` holds `bytes` bytes,
+        // nbytes` was checked above, `output` holds `bytes` bytes,
         // and every command buffer that writes the buffer has completed:
         // `view` checked that the storage was produced on this backend's
         // queue, and `synchronize` committed the open command buffer, then
@@ -801,7 +801,7 @@ impl Backend for MetalBackend {
     ) -> Result<MetalStorage, MetalError> {
         let dtype = input.dtype();
         let input = self.view(&input)?;
-        let output = self.allocate(input.layout.shape().byte_len(dtype.into()))?;
+        let output = self.allocate(input.layout.shape().nbytes(dtype.into()))?;
         self.dispatch_strided(unary_kernel(op, dtype), &[&input], &output)?;
         Ok(output)
     }
@@ -815,7 +815,7 @@ impl Backend for MetalBackend {
         let dtype = lhs.dtype();
         let lhs = self.view(&lhs)?;
         let rhs = self.view(&rhs)?;
-        let output = self.allocate(lhs.layout.shape().byte_len(dtype.into()))?;
+        let output = self.allocate(lhs.layout.shape().nbytes(dtype.into()))?;
         self.dispatch_strided(binary_kernel(op, dtype), &[&lhs, &rhs], &output)?;
         Ok(output)
     }
@@ -827,12 +827,12 @@ impl Backend for MetalBackend {
     ) -> Result<MetalStorage, MetalError> {
         let input = self.view(&input)?;
         let args = ReduceArgs::new(&input, spec)?;
-        let output = self.allocate(spec.output().byte_len(spec.dtype_output()))?;
+        let output = self.allocate(spec.output().nbytes(spec.dtype_output()))?;
         self.dispatch_reduce(
             reduce_kernel(spec.op(), spec.dtype()),
             &input,
             &args,
-            spec.output().element_count(),
+            spec.output().numel(),
             &output,
         )?;
         Ok(output)
@@ -846,8 +846,8 @@ impl Backend for MetalBackend {
     ) -> Result<MetalStorage, MetalError> {
         let lhs = self.view(&lhs)?;
         let rhs = self.view(&rhs)?;
-        let output = self.allocate(spec.output().byte_len(spec.dtype().into()))?;
-        if spec.output().element_count() == 0 {
+        let output = self.allocate(spec.output().nbytes(spec.dtype().into()))?;
+        if spec.output().numel() == 0 {
             return Ok(output);
         }
         let lhs_input = self.matmul_operand(lhs, spec.lhs(), spec, spec.m(), spec.k())?;
@@ -876,49 +876,49 @@ impl Backend for MetalBackend {
         self.copy_view(&self.view(&input)?, dtype)
     }
 
-    fn cast(
+    fn to_dtype(
         &mut self,
         input: Operand<'_, MetalStorage, FloatDType>,
         dtype: FloatDType,
     ) -> Result<MetalStorage, MetalError> {
         let dtype_from = input.dtype();
         let input = self.view(&input)?;
-        let output = self.allocate(input.layout.shape().byte_len(dtype.into()))?;
-        self.dispatch_strided(cast_kernel(dtype_from, dtype), &[&input], &output)?;
+        let output = self.allocate(input.layout.shape().nbytes(dtype.into()))?;
+        self.dispatch_strided(to_dtype_kernel(dtype_from, dtype), &[&input], &output)?;
         Ok(output)
     }
 
-    fn gather(
+    fn index_select(
         &mut self,
         table: Operand<'_, MetalStorage, FloatDType>,
         indices: Operand<'_, MetalStorage>,
-        spec: &GatherSpec,
+        spec: &IndexSelectSpec,
     ) -> Result<MetalStorage, MetalError> {
         let table = self.view(&table)?;
         let indices = self.view(&indices)?;
-        let args = GatherArgs::new(&table, &indices, spec)?;
-        let output = self.allocate(spec.output().byte_len(spec.dtype().into()))?;
-        self.dispatch_gather(
-            gather_kernel(spec.dtype()),
+        let args = IndexSelectArgs::new(&table, &indices, spec)?;
+        let output = self.allocate(spec.output().nbytes(spec.dtype().into()))?;
+        self.dispatch_index_select(
+            index_select_kernel(spec.dtype()),
             &table,
             &indices,
             &args,
-            spec.output().element_count(),
+            spec.output().numel(),
             &output,
         )?;
         Ok(output)
     }
 
-    fn concat(
+    fn cat(
         &mut self,
         lhs: Operand<'_, MetalStorage, FloatDType>,
         rhs: Operand<'_, MetalStorage, FloatDType>,
-        spec: &ConcatSpec,
+        spec: &CatSpec,
     ) -> Result<MetalStorage, MetalError> {
         let lhs = self.view(&lhs)?;
         let rhs = self.view(&rhs)?;
-        let kernel = slice_update_kernel(spec.dtype());
-        let mut output = self.allocate(spec.output().byte_len(spec.dtype().into()))?;
+        let kernel = slice_scatter_kernel(spec.dtype());
+        let mut output = self.allocate(spec.output().nbytes(spec.dtype().into()))?;
         let layout = Layout::contiguous(*spec.output());
         let lhs_window = StridedArgs::window(&layout, lhs.layout.shape(), 0)?;
         let rhs_window = StridedArgs::window(&layout, rhs.layout.shape(), spec.rhs_offset())?;
@@ -927,19 +927,19 @@ impl Backend for MetalBackend {
         Ok(output)
     }
 
-    fn slice_update(
+    fn slice_scatter(
         &mut self,
         mut target: OperandMut<'_, MetalStorage, FloatDType>,
-        update: Operand<'_, MetalStorage, FloatDType>,
-        spec: &SliceUpdateSpec,
+        src: Operand<'_, MetalStorage, FloatDType>,
+        spec: &SliceScatterSpec,
     ) -> Result<(), MetalError> {
         self.owns(target.storage_mut())?;
         let layout = target.layout();
-        let update = self.view(&update)?;
-        let window = StridedArgs::window(layout, update.layout.shape(), spec.offset())?;
+        let src = self.view(&src)?;
+        let window = StridedArgs::window(layout, src.layout.shape(), spec.offset())?;
         self.dispatch_write(
-            slice_update_kernel(spec.dtype()),
-            &update,
+            slice_scatter_kernel(spec.dtype()),
+            &src,
             &window,
             target.storage_mut(),
         )
@@ -967,20 +967,20 @@ fn copy_kernel(dtype: DType) -> &'static str {
     }
 }
 
-fn cast_kernel(
+fn to_dtype_kernel(
     dtype_from: FloatDType,
     dtype_to: FloatDType,
 ) -> &'static str {
     match (dtype_from, dtype_to) {
-        (FloatDType::F32, FloatDType::F32) => "cast_f32_f32",
-        (FloatDType::F32, FloatDType::F16) => "cast_f32_f16",
-        (FloatDType::F32, FloatDType::BF16) => "cast_f32_bf16",
-        (FloatDType::F16, FloatDType::F32) => "cast_f16_f32",
-        (FloatDType::F16, FloatDType::F16) => "cast_f16_f16",
-        (FloatDType::F16, FloatDType::BF16) => "cast_f16_bf16",
-        (FloatDType::BF16, FloatDType::F32) => "cast_bf16_f32",
-        (FloatDType::BF16, FloatDType::F16) => "cast_bf16_f16",
-        (FloatDType::BF16, FloatDType::BF16) => "cast_bf16_bf16",
+        (FloatDType::F32, FloatDType::F32) => "to_dtype_f32_f32",
+        (FloatDType::F32, FloatDType::F16) => "to_dtype_f32_f16",
+        (FloatDType::F32, FloatDType::BF16) => "to_dtype_f32_bf16",
+        (FloatDType::F16, FloatDType::F32) => "to_dtype_f16_f32",
+        (FloatDType::F16, FloatDType::F16) => "to_dtype_f16_f16",
+        (FloatDType::F16, FloatDType::BF16) => "to_dtype_f16_bf16",
+        (FloatDType::BF16, FloatDType::F32) => "to_dtype_bf16_f32",
+        (FloatDType::BF16, FloatDType::F16) => "to_dtype_bf16_f16",
+        (FloatDType::BF16, FloatDType::BF16) => "to_dtype_bf16_bf16",
     }
 }
 
@@ -998,9 +998,9 @@ fn unary_kernel(
         (UnaryOp::Sqrt, FloatDType::F32) => "unary_sqrt_f32",
         (UnaryOp::Sqrt, FloatDType::F16) => "unary_sqrt_f16",
         (UnaryOp::Sqrt, FloatDType::BF16) => "unary_sqrt_bf16",
-        (UnaryOp::Recip, FloatDType::F32) => "unary_recip_f32",
-        (UnaryOp::Recip, FloatDType::F16) => "unary_recip_f16",
-        (UnaryOp::Recip, FloatDType::BF16) => "unary_recip_bf16",
+        (UnaryOp::Reciprocal, FloatDType::F32) => "unary_reciprocal_f32",
+        (UnaryOp::Reciprocal, FloatDType::F16) => "unary_reciprocal_f16",
+        (UnaryOp::Reciprocal, FloatDType::BF16) => "unary_reciprocal_bf16",
     }
 }
 
@@ -1032,9 +1032,9 @@ fn reduce_kernel(
         (ReduceOp::Sum, FloatDType::F32) => "reduce_sum_f32",
         (ReduceOp::Sum, FloatDType::F16) => "reduce_sum_f16",
         (ReduceOp::Sum, FloatDType::BF16) => "reduce_sum_bf16",
-        (ReduceOp::Max, FloatDType::F32) => "reduce_max_f32",
-        (ReduceOp::Max, FloatDType::F16) => "reduce_max_f16",
-        (ReduceOp::Max, FloatDType::BF16) => "reduce_max_bf16",
+        (ReduceOp::Amax, FloatDType::F32) => "reduce_amax_f32",
+        (ReduceOp::Amax, FloatDType::F16) => "reduce_amax_f16",
+        (ReduceOp::Amax, FloatDType::BF16) => "reduce_amax_bf16",
         (ReduceOp::Argmax, FloatDType::F32) => "reduce_argmax_f32",
         (ReduceOp::Argmax, FloatDType::F16) => "reduce_argmax_f16",
         (ReduceOp::Argmax, FloatDType::BF16) => "reduce_argmax_bf16",
@@ -1049,19 +1049,19 @@ fn matmul_kernel(dtype: FloatDType) -> &'static str {
     }
 }
 
-fn gather_kernel(dtype: FloatDType) -> &'static str {
+fn index_select_kernel(dtype: FloatDType) -> &'static str {
     match dtype {
-        FloatDType::F32 => "gather_f32",
-        FloatDType::F16 => "gather_f16",
-        FloatDType::BF16 => "gather_bf16",
+        FloatDType::F32 => "index_select_f32",
+        FloatDType::F16 => "index_select_f16",
+        FloatDType::BF16 => "index_select_bf16",
     }
 }
 
-fn slice_update_kernel(dtype: FloatDType) -> &'static str {
+fn slice_scatter_kernel(dtype: FloatDType) -> &'static str {
     match dtype {
-        FloatDType::F32 => "slice_update_f32",
-        FloatDType::F16 => "slice_update_f16",
-        FloatDType::BF16 => "slice_update_bf16",
+        FloatDType::F32 => "slice_scatter_f32",
+        FloatDType::F16 => "slice_scatter_f16",
+        FloatDType::BF16 => "slice_scatter_bf16",
     }
 }
 
@@ -1110,12 +1110,12 @@ fn index_u32(value: usize) -> Result<u32, MetalError> {
     })
 }
 
-fn padded_u32(values: &[usize]) -> Result<[u32; RANK_MAX], MetalError> {
+fn padded_u32(values: &[usize]) -> Result<[u32; MAX_RANK], MetalError> {
     values
         .iter()
-        .zip(0..RANK_MAX)
-        .try_fold([0_u32; RANK_MAX], |mut padded, (&value, axis)| {
-            if let Some(slot) = padded.get_mut(axis) {
+        .zip(0..MAX_RANK)
+        .try_fold([0_u32; MAX_RANK], |mut padded, (&value, dim)| {
+            if let Some(slot) = padded.get_mut(dim) {
                 *slot = index_u32(value)?;
             }
             Ok(padded)
@@ -1136,10 +1136,10 @@ mod tests {
     };
     use crate::core::primitive::matmul_rule;
     use crate::core::{
+        AllocatedMemorySource,
         Backend,
         CoreError,
         DType,
-        PeakMemorySource,
         Shape,
         Tensor,
         TensorError,
@@ -1152,24 +1152,30 @@ mod tests {
     }
 
     #[test]
-    fn peak_memory_counts_an_upload_and_never_decreases() {
-        let byte_len = 1 << 20;
+    fn current_allocated_memory_counts_from_bytes_and_never_decreases() {
+        let nbytes = 1 << 20;
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let storage = backend.upload(&vec![0; byte_len]).expect("upload succeeds");
-        let peak = backend.peak_memory().expect("Metal tracks peak memory");
+        let storage = backend
+            .storage_from_bytes(&vec![0; nbytes])
+            .expect("storage_from_bytes succeeds");
+        let peak = backend
+            .current_allocated_memory()
+            .expect("Metal tracks peak memory");
         assert_eq!(
             peak.source,
-            PeakMemorySource::MetalCurrentAllocatedSize,
+            AllocatedMemorySource::MetalCurrentAllocatedSize,
             "Metal reads the device allocated size"
         );
         assert!(
-            peak.bytes >= u64::try_from(byte_len).expect("the length fits in u64"),
-            "peak {} bytes covers the {byte_len} uploaded bytes",
+            peak.bytes >= u64::try_from(nbytes).expect("the length fits in u64"),
+            "peak {} bytes covers the {nbytes} written bytes",
             peak.bytes
         );
         drop(storage);
         backend.zeros(16).expect("zeros succeeds");
-        let peak_after_free = backend.peak_memory().expect("Metal tracks peak memory");
+        let peak_after_free = backend
+            .current_allocated_memory()
+            .expect("Metal tracks peak memory");
         assert!(
             peak_after_free.bytes >= peak.bytes,
             "peak {} bytes does not fall below {} bytes after a free",
@@ -1185,16 +1191,16 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let downloaded = Tensor::upload(
+        let read_back = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::F32,
             Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds");
-        assert_eq!(downloaded, bytes, "f32 bytes survive the round trip");
+        .expect("from_bytes succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds");
+        assert_eq!(read_back, bytes, "f32 bytes survive the round trip");
     }
 
     #[test]
@@ -1204,16 +1210,16 @@ mod tests {
             .iter()
             .flat_map(|bits| bits.to_le_bytes())
             .collect();
-        let downloaded = Tensor::upload(
+        let read_back = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::F16,
             Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds");
-        assert_eq!(downloaded, bytes, "f16 bytes survive the round trip");
+        .expect("from_bytes succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds");
+        assert_eq!(read_back, bytes, "f16 bytes survive the round trip");
     }
 
     #[test]
@@ -1223,16 +1229,16 @@ mod tests {
             .iter()
             .flat_map(|bits| bits.to_le_bytes())
             .collect();
-        let downloaded = Tensor::upload(
+        let read_back = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::BF16,
             Shape::try_from([6].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds");
-        assert_eq!(downloaded, bytes, "bf16 bytes survive the round trip");
+        .expect("from_bytes succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds");
+        assert_eq!(read_back, bytes, "bf16 bytes survive the round trip");
     }
 
     #[test]
@@ -1242,73 +1248,73 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let downloaded = Tensor::upload(
+        let read_back = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::U32,
             Shape::try_from([2, 1, 2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds");
-        assert_eq!(downloaded, bytes, "u32 bytes survive the round trip");
+        .expect("from_bytes succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds");
+        assert_eq!(read_back, bytes, "u32 bytes survive the round trip");
     }
 
     #[test]
     fn empty_round_trip_returns_no_bytes() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let downloaded = Tensor::upload(
+        let read_back = Tensor::from_bytes(
             &mut backend,
             &[],
             DType::F32,
             Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds");
-        assert!(downloaded.is_empty(), "an empty tensor downloads no bytes");
+        .expect("from_bytes succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds");
+        assert!(read_back.is_empty(), "an empty tensor reads back no bytes");
     }
 
     #[test]
-    fn zeros_download_only_zero_bytes() {
+    fn zeros_to_bytes_only_zero_bytes() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         [DType::F32, DType::F16, DType::BF16, DType::U32]
             .into_iter()
             .for_each(|dtype| {
-                let downloaded = Tensor::zeros(
+                let read_back = Tensor::zeros(
                     &mut backend,
                     dtype,
                     Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
                 )
                 .expect("zeros succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds");
+                .to_bytes(&mut backend)
+                .expect("to_bytes succeeds");
                 assert_eq!(
-                    downloaded.len(),
-                    6 * dtype.size_bytes(),
+                    read_back.len(),
+                    6 * dtype.itemsize(),
                     "zeros of {dtype:?} has the shape's byte length"
                 );
                 assert!(
-                    downloaded.iter().all(|&byte| byte == 0),
-                    "zeros of {dtype:?} downloads only zero bytes"
+                    read_back.iter().all(|&byte| byte == 0),
+                    "zeros of {dtype:?} reads back only zero bytes"
                 );
             });
     }
 
     #[test]
-    fn zeros_after_upload_keeps_both_values() {
+    fn zeros_after_from_bytes_keeps_both_values() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let bytes: Vec<u8> = [7_u32, 8, 9]
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let uploaded = Tensor::upload(
+        let stored = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::U32,
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         let zeros = Tensor::zeros(
             &mut backend,
             DType::U32,
@@ -1316,23 +1322,21 @@ mod tests {
         )
         .expect("zeros succeeds");
         assert_eq!(
-            zeros.download(&mut backend).expect("the download succeeds"),
+            zeros.to_bytes(&mut backend).expect("to_bytes succeeds"),
             vec![0; 12],
-            "zeros downloads zero bytes"
+            "zeros reads back zero bytes"
         );
         assert_eq!(
-            uploaded
-                .download(&mut backend)
-                .expect("the download succeeds"),
+            stored.to_bytes(&mut backend).expect("to_bytes succeeds"),
             bytes,
-            "the earlier upload is unchanged"
+            "the earlier from_bytes is unchanged"
         );
     }
 
     #[test]
-    fn upload_with_wrong_byte_length_fails() {
+    fn from_bytes_with_wrong_byte_length_fails() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let result = Tensor::upload(
+        let result = Tensor::from_bytes(
             &mut backend,
             &[0; 10],
             DType::F32,
@@ -1348,9 +1352,9 @@ mod tests {
     }
 
     #[test]
-    fn upload_of_empty_bytes_for_oversized_shape_reports_byte_length_mismatch() {
+    fn from_bytes_of_empty_bytes_for_oversized_shape_reports_byte_length_mismatch() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let result = Tensor::upload(
+        let result = Tensor::from_bytes(
             &mut backend,
             &[],
             DType::F32,
@@ -1366,47 +1370,45 @@ mod tests {
     }
 
     #[test]
-    fn narrow_on_leading_axis_downloads_the_sub_range() {
+    fn narrow_on_leading_dim_reads_the_sub_range() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let bytes: Vec<u8> = (0_u32..6).flat_map(u32::to_le_bytes).collect();
-        let narrowed = Tensor::upload(
+        let narrowed = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::U32,
             Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .narrow(0, 1, 2)
         .expect("the narrow is valid");
         let expected: Vec<u8> = (2_u32..6).flat_map(u32::to_le_bytes).collect();
         assert_eq!(
-            narrowed
-                .download(&mut backend)
-                .expect("the download succeeds"),
+            narrowed.to_bytes(&mut backend).expect("to_bytes succeeds"),
             expected,
-            "the narrowed rows are downloaded"
+            "the narrowed rows are read back"
         );
     }
 
     #[test]
-    fn permuted_download_is_rejected() {
+    fn permuted_to_bytes_is_rejected() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let bytes: Vec<u8> = (0_u32..6).flat_map(u32::to_le_bytes).collect();
-        let permuted = Tensor::upload(
+        let permuted = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::U32,
             Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid");
         assert!(
             matches!(
-                permuted.download(&mut backend).err(),
-                Some(TensorError::Validation(CoreError::DownloadNonContiguous))
+                permuted.to_bytes(&mut backend).err(),
+                Some(TensorError::Validation(CoreError::ToBytesNonContiguous))
             ),
-            "a non-contiguous layout cannot be downloaded"
+            "a non-contiguous layout cannot be read as bytes"
         );
     }
 
@@ -1420,7 +1422,7 @@ mod tests {
         .into_iter()
         .map(f32::from)
         .collect();
-        let source = Tensor::upload(
+        let source = Tensor::from_bytes(
             &mut backend,
             &(0_u16..24)
                 .flat_map(|value| f32::from(value).to_le_bytes())
@@ -1428,13 +1430,13 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         [DType::F32, DType::F16, DType::BF16]
             .into_iter()
             .for_each(|dtype| {
                 let copied = source
-                    .cast(&mut backend, dtype)
-                    .expect("the cast succeeds")
+                    .to_dtype(&mut backend, dtype)
+                    .expect("to_dtype succeeds")
                     .permute(&[2, 0, 1])
                     .expect("the permutation is valid")
                     .contiguous(&mut backend)
@@ -1443,10 +1445,10 @@ mod tests {
                 assert_eq!(copied.shape().dims(), &[4, 2, 3], "permuted dims");
                 assert!(copied.layout().is_contiguous(), "the copy is contiguous");
                 let actual: Vec<f32> = copied
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
@@ -1459,7 +1461,7 @@ mod tests {
     #[test]
     fn copy_of_narrowed_tensor_keeps_the_sub_range() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let copied = Tensor::upload(
+        let copied = Tensor::from_bytes(
             &mut backend,
             &(0_u16..24)
                 .flat_map(|value| f32::from(value).to_le_bytes())
@@ -1467,7 +1469,7 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .narrow(1, 1, 2)
         .expect("the narrow is valid")
         .contiguous(&mut backend)
@@ -1475,8 +1477,8 @@ mod tests {
         let expected: Vec<f32> = (4_u16..12).chain(16..24).map(f32::from).collect();
         assert_eq!(copied.shape().dims(), &[2, 2, 4], "narrowed dims");
         let actual: Vec<f32> = copied
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -1488,7 +1490,7 @@ mod tests {
     #[test]
     fn copy_of_broadcast_tensor_repeats_values() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let copied = Tensor::upload(
+        let copied = Tensor::from_bytes(
             &mut backend,
             &[1.0_f32, 2.0, 3.0]
                 .iter()
@@ -1497,16 +1499,16 @@ mod tests {
             DType::F32,
             Shape::try_from([3, 1].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .broadcast_as(Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"))
+        .expect("from_bytes succeeds")
+        .expand(Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"))
         .expect("the broadcast is valid")
         .contiguous(&mut backend)
         .expect("the copy succeeds");
         let block: [f32; 12] = [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0];
         let expected: Vec<f32> = block.iter().chain(block.iter()).copied().collect();
         let actual: Vec<f32> = copied
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -1519,13 +1521,13 @@ mod tests {
     fn copy_of_permuted_u32_tensor_is_contiguous() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let bytes: Vec<u8> = (0_u32..6).flat_map(u32::to_le_bytes).collect();
-        let copied = Tensor::upload(
+        let copied = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::U32,
             Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid")
         .contiguous(&mut backend)
@@ -1535,41 +1537,39 @@ mod tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         assert_eq!(
-            copied
-                .download(&mut backend)
-                .expect("the download succeeds"),
+            copied.to_bytes(&mut backend).expect("to_bytes succeeds"),
             expected,
             "transposed u32 values"
         );
     }
 
     #[test]
-    fn copy_of_empty_tensor_downloads_no_bytes() {
+    fn copy_of_empty_tensor_reads_no_bytes() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let copied = Tensor::upload(
+        let copied = Tensor::from_bytes(
             &mut backend,
             &[],
             DType::F32,
             Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid")
         .contiguous(&mut backend)
         .expect("the copy succeeds");
         assert!(
             copied
-                .download(&mut backend)
-                .expect("the download succeeds")
+                .to_bytes(&mut backend)
+                .expect("to_bytes succeeds")
                 .is_empty(),
-            "an empty copy downloads no bytes"
+            "an empty copy reads back no bytes"
         );
     }
 
     #[test]
-    fn cast_f32_to_bf16_and_back_rounds_known_values() {
+    fn to_dtype_f32_to_bf16_and_back_rounds_known_values() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let actual: Vec<f32> = Tensor::upload(
+        let actual: Vec<f32> = Tensor::from_bytes(
             &mut backend,
             &[1.0_f32, -2.5, PI]
                 .iter()
@@ -1578,13 +1578,13 @@ mod tests {
             DType::F32,
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .cast(&mut backend, DType::BF16)
-        .expect("the cast succeeds")
-        .cast(&mut backend, DType::F32)
-        .expect("the cast succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds")
+        .expect("from_bytes succeeds")
+        .to_dtype(&mut backend, DType::BF16)
+        .expect("to_dtype succeeds")
+        .to_dtype(&mut backend, DType::F32)
+        .expect("to_dtype succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds")
         .as_chunks::<4>()
         .0
         .iter()
@@ -1594,9 +1594,9 @@ mod tests {
     }
 
     #[test]
-    fn cast_f32_to_bf16_rounds_to_nearest_even() {
+    fn to_dtype_f32_to_bf16_rounds_to_nearest_even() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let actual: Vec<u16> = Tensor::upload(
+        let actual: Vec<u16> = Tensor::from_bytes(
             &mut backend,
             &[0x3F80_8000_u32, 0x3F81_8000, 0x3F80_8001, 0xBF80_8000]
                 .into_iter()
@@ -1605,11 +1605,11 @@ mod tests {
             DType::F32,
             Shape::try_from([4].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .cast(&mut backend, DType::BF16)
-        .expect("the cast succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds")
+        .expect("from_bytes succeeds")
+        .to_dtype(&mut backend, DType::BF16)
+        .expect("to_dtype succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds")
         .as_chunks::<2>()
         .0
         .iter()
@@ -1623,9 +1623,9 @@ mod tests {
     }
 
     #[test]
-    fn cast_f32_to_f16_and_back_rounds_known_values() {
+    fn to_dtype_f32_to_f16_and_back_rounds_known_values() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let cast = Tensor::upload(
+        let converted = Tensor::from_bytes(
             &mut backend,
             &[1.0_f32, -2.5, 0.5, PI]
                 .iter()
@@ -1634,23 +1634,23 @@ mod tests {
             DType::F32,
             Shape::try_from([4].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .cast(&mut backend, DType::F16)
-        .expect("the cast succeeds");
-        let bits: Vec<u16> = cast
-            .download(&mut backend)
-            .expect("the download succeeds")
+        .expect("from_bytes succeeds")
+        .to_dtype(&mut backend, DType::F16)
+        .expect("to_dtype succeeds");
+        let bits: Vec<u16> = converted
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<2>()
             .0
             .iter()
             .map(|&chunk| u16::from_le_bytes(chunk))
             .collect();
         assert_eq!(bits, vec![0x3C00, 0xC100, 0x3800, 0x4248], "f16 bits");
-        let round_tripped: Vec<f32> = cast
-            .cast(&mut backend, DType::F32)
-            .expect("the cast succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+        let round_tripped: Vec<f32> = converted
+            .to_dtype(&mut backend, DType::F32)
+            .expect("to_dtype succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -1664,9 +1664,9 @@ mod tests {
     }
 
     #[test]
-    fn cast_of_permuted_tensor_reads_strided_input() {
+    fn to_dtype_of_permuted_tensor_reads_strided_input() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let cast = Tensor::upload(
+        let converted = Tensor::from_bytes(
             &mut backend,
             &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
                 .iter()
@@ -1675,15 +1675,15 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid")
-        .cast(&mut backend, DType::BF16)
-        .expect("the cast succeeds");
-        assert_eq!(cast.shape().dims(), &[3, 2], "transposed dims");
-        let bits: Vec<u16> = cast
-            .download(&mut backend)
-            .expect("the download succeeds")
+        .to_dtype(&mut backend, DType::BF16)
+        .expect("to_dtype succeeds");
+        assert_eq!(converted.shape().dims(), &[3, 2], "transposed dims");
+        let bits: Vec<u16> = converted
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<2>()
             .0
             .iter()
@@ -1728,14 +1728,14 @@ mod tests {
                  dtype,
                  tolerance,
              }| {
-                let [neg_input, exp_input, sqrt_input, recip_input] = [
+                let [neg_input, exp_input, sqrt_input, reciprocal_input] = [
                     [1.0_f32, -2.5, 0.0],
                     [0.0, 1.0, -1.0],
                     [4.0, 2.25, 0.0],
                     [2.0, -4.0, 0.5],
                 ]
                 .map(|values| {
-                    Tensor::upload(
+                    Tensor::from_bytes(
                         &mut backend,
                         &values
                             .iter()
@@ -1744,9 +1744,9 @@ mod tests {
                         DType::F32,
                         Shape::try_from([3].as_slice()).expect("the shape is valid"),
                     )
-                    .expect("the upload succeeds")
-                    .cast(&mut backend, dtype)
-                    .expect("the cast succeeds")
+                    .expect("from_bytes succeeds")
+                    .to_dtype(&mut backend, dtype)
+                    .expect("to_dtype succeeds")
                 });
                 [
                     NameOutputExpectedCase {
@@ -1765,8 +1765,8 @@ mod tests {
                         expected: [2.0, 1.5, 0.0],
                     },
                     NameOutputExpectedCase {
-                        name: "recip",
-                        output: recip_input.recip(&mut backend),
+                        name: "reciprocal",
+                        output: reciprocal_input.reciprocal(&mut backend),
                         expected: [0.5, -0.25, 2.0],
                     },
                 ]
@@ -1779,10 +1779,10 @@ mod tests {
                      }| {
                         let actual: Vec<f32> = output
                             .expect("the op succeeds")
-                            .cast(&mut backend, DType::F32)
-                            .expect("the cast succeeds")
-                            .download(&mut backend)
-                            .expect("the download succeeds")
+                            .to_dtype(&mut backend, DType::F32)
+                            .expect("to_dtype succeeds")
+                            .to_bytes(&mut backend)
+                            .expect("to_bytes succeeds")
                             .as_chunks::<4>()
                             .0
                             .iter()
@@ -1836,7 +1836,7 @@ mod tests {
                  tolerance,
              }| {
                 let [lhs, rhs] = [[1.0_f32, 2.0, 3.0, 4.0], [2.0, 4.0, 0.5, -1.0]].map(|values| {
-                    Tensor::upload(
+                    Tensor::from_bytes(
                         &mut backend,
                         &values
                             .iter()
@@ -1845,9 +1845,9 @@ mod tests {
                         DType::F32,
                         Shape::try_from([4].as_slice()).expect("the shape is valid"),
                     )
-                    .expect("the upload succeeds")
-                    .cast(&mut backend, dtype)
-                    .expect("the cast succeeds")
+                    .expect("from_bytes succeeds")
+                    .to_dtype(&mut backend, dtype)
+                    .expect("to_dtype succeeds")
                 });
                 [
                     NameOutputExpectedCase {
@@ -1880,10 +1880,10 @@ mod tests {
                      }| {
                         let actual: Vec<f32> = output
                             .expect("the op succeeds")
-                            .cast(&mut backend, DType::F32)
-                            .expect("the cast succeeds")
-                            .download(&mut backend)
-                            .expect("the download succeeds")
+                            .to_dtype(&mut backend, DType::F32)
+                            .expect("to_dtype succeeds")
+                            .to_bytes(&mut backend)
+                            .expect("to_bytes succeeds")
                             .as_chunks::<4>()
                             .0
                             .iter()
@@ -1926,7 +1926,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -1935,14 +1935,14 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         let sum = matrix.add(&mut backend, &row).expect("the add succeeds");
         assert_eq!(sum.shape().dims(), &[2, 3], "broadcast dims");
         let actual: Vec<f32> = sum
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -1958,7 +1958,7 @@ mod tests {
     #[test]
     fn neg_of_permuted_tensor_reads_strided_input() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let negated = Tensor::upload(
+        let negated = Tensor::from_bytes(
             &mut backend,
             &[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0]
                 .iter()
@@ -1967,15 +1967,15 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid")
         .neg(&mut backend)
         .expect("the neg succeeds");
         assert_eq!(negated.shape().dims(), &[3, 2], "transposed dims");
         let actual: Vec<f32> = negated
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -2010,7 +2010,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -2019,7 +2019,7 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         let actual: Vec<f32> = transposed
@@ -2027,8 +2027,8 @@ mod tests {
             .expect("the permutation is valid")
             .mul(&mut backend, &contiguous)
             .expect("the mul succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -2045,13 +2045,13 @@ mod tests {
     fn binary_on_u32_is_rejected() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let bytes: Vec<u8> = (0_u32..3).flat_map(u32::to_le_bytes).collect();
-        let indices = Tensor::upload(
+        let indices = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::U32,
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         assert!(
             matches!(
                 indices.add(&mut backend, &indices).err(),
@@ -2062,28 +2062,28 @@ mod tests {
     }
 
     #[test]
-    fn add_of_empty_tensors_downloads_no_bytes() {
+    fn add_of_empty_tensors_reads_no_bytes() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let empty = Tensor::upload(
+        let empty = Tensor::from_bytes(
             &mut backend,
             &[],
             DType::F32,
             Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         let sum = empty.add(&mut backend, &empty).expect("the add succeeds");
         assert!(
-            sum.download(&mut backend)
-                .expect("the download succeeds")
+            sum.to_bytes(&mut backend)
+                .expect("to_bytes succeeds")
                 .is_empty(),
-            "an empty add downloads no bytes"
+            "an empty add reads back no bytes"
         );
     }
 
     #[test]
     fn long_chain_of_adds_spans_several_command_buffers() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let ones = Tensor::upload(
+        let ones = Tensor::from_bytes(
             &mut backend,
             &[1.0_f32; 4]
                 .iter()
@@ -2092,7 +2092,7 @@ mod tests {
             DType::F32,
             Shape::try_from([4].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         let start = Tensor::zeros(
             &mut backend,
             DType::F32,
@@ -2102,8 +2102,8 @@ mod tests {
         let actual: Vec<f32> = (0..300)
             .try_fold(start, |sum, _| sum.add(&mut backend, &ones))
             .expect("every add succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -2116,7 +2116,7 @@ mod tests {
     fn zeros_interleaved_with_adds_keep_submission_order() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let [ones, start] = [0_u8; 2].map(|_| {
-            Tensor::upload(
+            Tensor::from_bytes(
                 &mut backend,
                 &[1.0_f32; 3]
                     .iter()
@@ -2125,7 +2125,7 @@ mod tests {
                 DType::F32,
                 Shape::try_from([3].as_slice()).expect("the shape is valid"),
             )
-            .expect("the upload succeeds")
+            .expect("from_bytes succeeds")
         });
         let actual: Vec<f32> = (0..100)
             .try_fold(start, |sum, _| {
@@ -2137,8 +2137,8 @@ mod tests {
                 sum.add(&mut backend, &zeros)?.add(&mut backend, &ones)
             })
             .expect("every zeros and add succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -2152,7 +2152,7 @@ mod tests {
     }
 
     #[test]
-    fn sum_and_max_over_each_axis_match_hand_computed_values_for_each_float_dtype() {
+    fn sum_and_amax_over_each_dim_match_hand_computed_values_for_each_float_dtype() {
         struct NameReducedDimsExpectedCase<T0, T1, T2, T3> {
             name: T0,
             reduced: T1,
@@ -2184,7 +2184,7 @@ mod tests {
                  dtype,
                  tolerance,
              }| {
-                let input = Tensor::upload(
+                let input = Tensor::from_bytes(
                     &mut backend,
                     &[1.0_f32, 5.0, 3.0, 4.0, 2.0, 6.0]
                         .iter()
@@ -2193,31 +2193,31 @@ mod tests {
                     DType::F32,
                     Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds");
+                .expect("from_bytes succeeds")
+                .to_dtype(&mut backend, dtype)
+                .expect("to_dtype succeeds");
                 [
                     NameReducedDimsExpectedCase {
-                        name: "sum axis 0",
-                        reduced: input.sum(&mut backend, 0),
+                        name: "sum dim 0",
+                        reduced: input.sum_keepdim(&mut backend, 0),
                         dims: &[1, 3][..],
                         expected: &[5.0_f32, 7.0, 9.0][..],
                     },
                     NameReducedDimsExpectedCase {
-                        name: "sum axis 1",
-                        reduced: input.sum(&mut backend, 1),
+                        name: "sum dim 1",
+                        reduced: input.sum_keepdim(&mut backend, 1),
                         dims: &[2, 1],
                         expected: &[9.0, 12.0],
                     },
                     NameReducedDimsExpectedCase {
-                        name: "max axis 0",
-                        reduced: input.max(&mut backend, 0),
+                        name: "max dim 0",
+                        reduced: input.amax_keepdim(&mut backend, 0),
                         dims: &[1, 3],
                         expected: &[4.0, 5.0, 6.0],
                     },
                     NameReducedDimsExpectedCase {
-                        name: "max axis 1",
-                        reduced: input.max(&mut backend, 1),
+                        name: "max dim 1",
+                        reduced: input.amax_keepdim(&mut backend, 1),
                         dims: &[2, 1],
                         expected: &[5.0, 6.0],
                     },
@@ -2232,12 +2232,12 @@ mod tests {
                      }| {
                         let reduced = reduced.expect("the reduction succeeds");
                         assert_eq!(reduced.dtype(), dtype, "{name} keeps the dtype");
-                        assert_eq!(reduced.shape().dims(), dims, "{name} keeps the axis");
+                        assert_eq!(reduced.shape().dims(), dims, "{name} keeps the dim");
                         let actual: Vec<f32> = reduced
-                            .cast(&mut backend, DType::F32)
-                            .expect("the cast succeeds")
-                            .download(&mut backend)
-                            .expect("the download succeeds")
+                            .to_dtype(&mut backend, DType::F32)
+                            .expect("to_dtype succeeds")
+                            .to_bytes(&mut backend)
+                            .expect("to_bytes succeeds")
                             .as_chunks::<4>()
                             .0
                             .iter()
@@ -2262,9 +2262,9 @@ mod tests {
     }
 
     #[test]
-    fn argmax_over_each_axis_matches_hand_computed_indices_for_each_float_dtype() {
-        struct AxisDimsExpectedCase<T0, T1, T2> {
-            axis: T0,
+    fn argmax_over_each_dim_matches_hand_computed_indices_for_each_float_dtype() {
+        struct DimDimsExpectedCase<T0, T1, T2> {
+            dim: T0,
             dims: T1,
             expected: T2,
         }
@@ -2273,25 +2273,25 @@ mod tests {
             .into_iter()
             .for_each(|dtype| {
                 [
-                    AxisDimsExpectedCase {
-                        axis: 0,
+                    DimDimsExpectedCase {
+                        dim: 0,
                         dims: &[1, 3][..],
                         expected: &[1_u32, 0, 1][..],
                     },
-                    AxisDimsExpectedCase {
-                        axis: 1,
+                    DimDimsExpectedCase {
+                        dim: 1,
                         dims: &[2, 1],
                         expected: &[1, 2],
                     },
                 ]
                 .into_iter()
                 .for_each(
-                    |AxisDimsExpectedCase {
-                         axis,
+                    |DimDimsExpectedCase {
+                         dim,
                          dims,
                          expected,
                      }| {
-                        let indices = Tensor::upload(
+                        let indices = Tensor::from_bytes(
                             &mut backend,
                             &[1.0_f32, 5.0, 3.0, 4.0, 2.0, 6.0]
                                 .iter()
@@ -2300,22 +2300,22 @@ mod tests {
                             DType::F32,
                             Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
                         )
-                        .expect("the upload succeeds")
-                        .cast(&mut backend, dtype)
-                        .expect("the cast succeeds")
-                        .argmax(&mut backend, axis)
+                        .expect("from_bytes succeeds")
+                        .to_dtype(&mut backend, dtype)
+                        .expect("to_dtype succeeds")
+                        .argmax_keepdim(&mut backend, dim)
                         .expect("the argmax succeeds");
                         assert_eq!(indices.dtype(), DType::U32, "argmax outputs u32");
-                        assert_eq!(indices.shape().dims(), dims, "argmax keeps the axis");
+                        assert_eq!(indices.shape().dims(), dims, "argmax keeps the dim");
                         let actual: Vec<u32> = indices
-                            .download(&mut backend)
-                            .expect("the download succeeds")
+                            .to_bytes(&mut backend)
+                            .expect("to_bytes succeeds")
                             .as_chunks::<4>()
                             .0
                             .iter()
                             .map(|&chunk| u32::from_le_bytes(chunk))
                             .collect();
-                        assert_eq!(actual, expected, "argmax over axis {axis} for {dtype:?}");
+                        assert_eq!(actual, expected, "argmax over dim {dim} for {dtype:?}");
                     },
                 );
             });
@@ -2324,7 +2324,7 @@ mod tests {
     #[test]
     fn sum_of_4096_bf16_ones_equals_4096() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let actual: Vec<f32> = Tensor::upload(
+        let actual: Vec<f32> = Tensor::from_bytes(
             &mut backend,
             &[1.0_f32; 4096]
                 .iter()
@@ -2333,15 +2333,15 @@ mod tests {
             DType::F32,
             Shape::try_from([4096].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .cast(&mut backend, DType::BF16)
-        .expect("the cast succeeds")
-        .sum(&mut backend, 0)
+        .expect("from_bytes succeeds")
+        .to_dtype(&mut backend, DType::BF16)
+        .expect("to_dtype succeeds")
+        .sum_keepdim(&mut backend, 0)
         .expect("the sum succeeds")
-        .cast(&mut backend, DType::F32)
-        .expect("the cast succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds")
+        .to_dtype(&mut backend, DType::F32)
+        .expect("to_dtype succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds")
         .as_chunks::<4>()
         .0
         .iter()
@@ -2353,7 +2353,7 @@ mod tests {
     #[test]
     fn argmax_returns_the_first_index_on_ties() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let actual: Vec<u32> = Tensor::upload(
+        let actual: Vec<u32> = Tensor::from_bytes(
             &mut backend,
             &[3.0_f32, 7.0, 7.0, 1.0]
                 .iter()
@@ -2362,11 +2362,11 @@ mod tests {
             DType::F32,
             Shape::try_from([4].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .argmax(&mut backend, 0)
+        .expect("from_bytes succeeds")
+        .argmax_keepdim(&mut backend, 0)
         .expect("the argmax succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds")
         .as_chunks::<4>()
         .0
         .iter()
@@ -2378,7 +2378,7 @@ mod tests {
     #[test]
     fn argmax_returns_the_first_index_on_ties_across_threads() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let actual: Vec<u32> = Tensor::upload(
+        let actual: Vec<u32> = Tensor::from_bytes(
             &mut backend,
             &(0_u16..600)
                 .flat_map(|index| {
@@ -2392,11 +2392,11 @@ mod tests {
             DType::F32,
             Shape::try_from([600].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .argmax(&mut backend, 0)
+        .expect("from_bytes succeeds")
+        .argmax_keepdim(&mut backend, 0)
         .expect("the argmax succeeds")
-        .download(&mut backend)
-        .expect("the download succeeds")
+        .to_bytes(&mut backend)
+        .expect("to_bytes succeeds")
         .as_chunks::<4>()
         .0
         .iter()
@@ -2412,7 +2412,7 @@ mod tests {
     #[test]
     fn sum_of_permuted_tensor_reads_strided_input() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let sum = Tensor::upload(
+        let sum = Tensor::from_bytes(
             &mut backend,
             &[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0]
                 .iter()
@@ -2421,15 +2421,15 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid")
-        .sum(&mut backend, 1)
+        .sum_keepdim(&mut backend, 1)
         .expect("the sum succeeds");
         assert_eq!(sum.shape().dims(), &[3, 1], "transposed rows");
         let actual: Vec<f32> = sum
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -2443,21 +2443,21 @@ mod tests {
     }
 
     #[test]
-    fn sum_over_empty_axis_downloads_zeros() {
+    fn sum_over_empty_dim_reads_zeros() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let sum = Tensor::upload(
+        let sum = Tensor::from_bytes(
             &mut backend,
             &[],
             DType::F32,
             Shape::try_from([2, 0].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
-        .sum(&mut backend, 1)
+        .expect("from_bytes succeeds")
+        .sum_keepdim(&mut backend, 1)
         .expect("the sum succeeds");
-        assert_eq!(sum.shape().dims(), &[2, 1], "the axis is kept");
+        assert_eq!(sum.shape().dims(), &[2, 1], "the dim is kept");
         let actual: Vec<f32> = sum
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -2470,16 +2470,16 @@ mod tests {
     fn reduce_on_u32_is_rejected() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let bytes: Vec<u8> = (0_u32..3).flat_map(u32::to_le_bytes).collect();
-        let indices = Tensor::upload(
+        let indices = Tensor::from_bytes(
             &mut backend,
             &bytes,
             DType::U32,
             Shape::try_from([3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         assert!(
             matches!(
-                indices.sum(&mut backend, 0).err(),
+                indices.sum_keepdim(&mut backend, 0).err(),
                 Some(TensorError::Validation(CoreError::DTypeNotFloat))
             ),
             "reductions reject u32 on Metal"
@@ -2532,7 +2532,7 @@ mod tests {
                          values,
                          dims,
                      }| {
-                        Tensor::upload(
+                        Tensor::from_bytes(
                             &mut backend,
                             &values
                                 .iter()
@@ -2541,18 +2541,18 @@ mod tests {
                             DType::F32,
                             Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                         )
-                        .expect("the upload succeeds")
-                        .cast(&mut backend, dtype)
-                        .expect("the cast succeeds")
+                        .expect("from_bytes succeeds")
+                        .to_dtype(&mut backend, dtype)
+                        .expect("to_dtype succeeds")
                     },
                 );
                 let actual: Vec<f32> = lhs
                     .matmul(&mut backend, &rhs)
                     .expect("the matmul succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
@@ -2607,7 +2607,7 @@ mod tests {
                     [1.0, 0.0, -1.0, 2.0, 1.0, 0.0],
                 ]
                 .map(|values| {
-                    Tensor::upload(
+                    Tensor::from_bytes(
                         &mut backend,
                         &values
                             .iter()
@@ -2616,9 +2616,9 @@ mod tests {
                         DType::F32,
                         Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
                     )
-                    .expect("the upload succeeds")
-                    .cast(&mut backend, dtype)
-                    .expect("the cast succeeds")
+                    .expect("from_bytes succeeds")
+                    .to_dtype(&mut backend, dtype)
+                    .expect("to_dtype succeeds")
                 });
                 let weight_transposed = weight.permute(&[1, 0]).expect("the permutation is valid");
                 assert!(
@@ -2630,10 +2630,10 @@ mod tests {
                 let actual: Vec<f32> = x
                     .matmul(&mut backend, &weight_transposed)
                     .expect("the matmul succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
@@ -2683,7 +2683,7 @@ mod tests {
                     [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
                 ]
                 .map(|values| {
-                    Tensor::upload(
+                    Tensor::from_bytes(
                         &mut backend,
                         &values
                             .iter()
@@ -2692,9 +2692,9 @@ mod tests {
                         DType::F32,
                         Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
                     )
-                    .expect("the upload succeeds")
-                    .cast(&mut backend, dtype)
-                    .expect("the cast succeeds")
+                    .expect("from_bytes succeeds")
+                    .to_dtype(&mut backend, dtype)
+                    .expect("to_dtype succeeds")
                 });
                 let lhs_transposed = lhs.permute(&[1, 0]).expect("the permutation is valid");
                 assert!(
@@ -2705,10 +2705,10 @@ mod tests {
                 let actual: Vec<f32> = lhs_transposed
                     .matmul(&mut backend, &rhs)
                     .expect("the matmul succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
@@ -2809,7 +2809,7 @@ mod tests {
                          values,
                          dims,
                      }| {
-                        Tensor::upload(
+                        Tensor::from_bytes(
                             &mut backend,
                             &values
                                 .iter()
@@ -2818,18 +2818,18 @@ mod tests {
                             DType::F32,
                             Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                         )
-                        .expect("the upload succeeds")
-                        .cast(&mut backend, dtype)
-                        .expect("the cast succeeds")
+                        .expect("from_bytes succeeds")
+                        .to_dtype(&mut backend, dtype)
+                        .expect("to_dtype succeeds")
                     },
                 );
                 let actual: Vec<f32> = lhs
                     .matmul(&mut backend, &rhs)
                     .expect("the matmul succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
@@ -2916,7 +2916,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -2925,14 +2925,14 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         let actual: Vec<f32> = lhs
             .matmul(&mut backend, &rhs)
             .expect("the matmul succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -3003,7 +3003,7 @@ mod tests {
                  dtype,
                  tolerance,
              }| {
-                let rhs = Tensor::upload(
+                let rhs = Tensor::from_bytes(
                     &mut backend,
                     &(0_u16..24)
                         .flat_map(|value| f32::from(value).to_le_bytes())
@@ -3011,12 +3011,12 @@ mod tests {
                     DType::F32,
                     Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
+                .expect("from_bytes succeeds")
+                .to_dtype(&mut backend, dtype)
+                .expect("to_dtype succeeds")
                 .permute(&[2, 0, 1])
                 .expect("the permutation is valid");
-                let lhs = Tensor::upload(
+                let lhs = Tensor::from_bytes(
                     &mut backend,
                     &lhs_values
                         .iter()
@@ -3025,21 +3025,21 @@ mod tests {
                     DType::F32,
                     Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds");
+                .expect("from_bytes succeeds")
+                .to_dtype(&mut backend, dtype)
+                .expect("to_dtype succeeds");
                 assert!(
                     matmul_rule(dtype, lhs.layout(), dtype, rhs.layout())
                         .is_ok_and(|spec| !is_matmul_ready(spec.rhs(), spec.k(), spec.n())),
-                    "strides (12, 4) on the last two axes need a copy"
+                    "strides (12, 4) on the last two dims need a copy"
                 );
                 let actual: Vec<f32> = lhs
                     .matmul(&mut backend, &rhs)
                     .expect("the matmul succeeds")
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
@@ -3066,7 +3066,7 @@ mod tests {
     }
 
     #[test]
-    fn matmul_reads_permuted_batch_axes_in_place() {
+    fn matmul_reads_permuted_batch_dims_in_place() {
         struct CountDimsCase<T0, T1> {
             count: T0,
             dims: T1,
@@ -3087,7 +3087,7 @@ mod tests {
                  count,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &(0..count)
                         .flat_map(|value| f32::from(value).to_le_bytes())
@@ -3095,7 +3095,7 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         let lhs = lhs
@@ -3108,8 +3108,8 @@ mod tests {
         .map(|lhs| {
             lhs.matmul(&mut backend, &rhs)
                 .expect("the matmul succeeds")
-                .download(&mut backend)
-                .expect("the download succeeds")
+                .to_bytes(&mut backend)
+                .expect("to_bytes succeeds")
         });
         assert_eq!(
             actual, expected,
@@ -3118,7 +3118,7 @@ mod tests {
     }
 
     #[test]
-    fn matmul_with_empty_output_downloads_nothing() {
+    fn matmul_with_empty_output_reads_nothing() {
         struct ValuesDimsCase<T0, T1> {
             values: T0,
             dims: T1,
@@ -3139,7 +3139,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -3148,28 +3148,28 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         let output = lhs.matmul(&mut backend, &rhs).expect("the matmul succeeds");
         assert_eq!(output.shape().dims(), &[0, 2], "output shape is [m, n]");
         assert!(
             output
-                .download(&mut backend)
-                .expect("the download succeeds")
+                .to_bytes(&mut backend)
+                .expect("to_bytes succeeds")
                 .is_empty(),
-            "an empty matmul downloads no values"
+            "an empty matmul reads back no values"
         );
     }
 
     #[test]
-    fn gather_selects_rows_for_each_float_dtype() {
+    fn index_select_selects_rows_for_each_float_dtype() {
         struct DtypeToleranceCase<T0, T1> {
             dtype: T0,
             tolerance: T1,
         }
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let indices = Tensor::upload(
+        let indices = Tensor::from_bytes(
             &mut backend,
             &[2_u32, 0]
                 .iter()
@@ -3178,7 +3178,7 @@ mod tests {
             DType::U32,
             Shape::try_from([2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
@@ -3199,7 +3199,7 @@ mod tests {
                  dtype,
                  tolerance,
              }| {
-                let rows = Tensor::upload(
+                let rows = Tensor::from_bytes(
                     &mut backend,
                     &(0_u16..12)
                         .flat_map(|value| f32::from(value).to_le_bytes())
@@ -3207,28 +3207,28 @@ mod tests {
                     DType::F32,
                     Shape::try_from([3, 4].as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds")
-                .gather(&mut backend, &indices)
-                .expect("the gather succeeds");
+                .expect("from_bytes succeeds")
+                .to_dtype(&mut backend, dtype)
+                .expect("to_dtype succeeds")
+                .index_select(&mut backend, 0, &indices)
+                .expect("index_select succeeds");
                 assert_eq!(
                     rows.shape().dims(),
                     &[2, 4],
                     "output shape is [indices, cols]"
                 );
                 let actual: Vec<f32> = rows
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
                     .map(|&chunk| f32::from_le_bytes(chunk))
                     .collect();
                 let expected = [8.0_f32, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0];
-                assert_eq!(actual.len(), expected.len(), "gather: element count");
+                assert_eq!(actual.len(), expected.len(), "index_select: element count");
                 actual.iter().zip(expected).for_each(|(&actual, expected)| {
                     assert!(
                         (actual - expected).abs()
@@ -3242,9 +3242,9 @@ mod tests {
     }
 
     #[test]
-    fn gather_with_out_of_range_index_writes_a_zero_row() {
+    fn index_select_with_out_of_range_index_writes_a_zero_row() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let table = Tensor::upload(
+        let table = Tensor::from_bytes(
             &mut backend,
             &[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0]
                 .iter()
@@ -3253,8 +3253,8 @@ mod tests {
             DType::F32,
             Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
-        let indices = Tensor::upload(
+        .expect("from_bytes succeeds");
+        let indices = Tensor::from_bytes(
             &mut backend,
             &[1_u32, 3]
                 .iter()
@@ -3263,12 +3263,12 @@ mod tests {
             DType::U32,
             Shape::try_from([2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         let actual: Vec<f32> = table
-            .gather(&mut backend, &indices)
-            .expect("the gather succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .index_select(&mut backend, 0, &indices)
+            .expect("index_select succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -3282,9 +3282,9 @@ mod tests {
     }
 
     #[test]
-    fn gather_of_permuted_table_reads_strided_rows() {
+    fn index_select_of_permuted_table_reads_strided_rows() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let table = Tensor::upload(
+        let table = Tensor::from_bytes(
             &mut backend,
             &[0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0]
                 .iter()
@@ -3293,10 +3293,10 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid");
-        let indices = Tensor::upload(
+        let indices = Tensor::from_bytes(
             &mut backend,
             &[2_u32, 0]
                 .iter()
@@ -3305,12 +3305,12 @@ mod tests {
             DType::U32,
             Shape::try_from([2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         let actual: Vec<f32> = table
-            .gather(&mut backend, &indices)
-            .expect("the gather succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .index_select(&mut backend, 0, &indices)
+            .expect("index_select succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -3324,7 +3324,7 @@ mod tests {
     }
 
     #[test]
-    fn concat_on_first_and_last_axis_for_each_float_dtype() {
+    fn cat_on_first_and_last_dim_for_each_float_dtype() {
         struct NameOutputDimsExpectedCase<T0, T1, T2, T3> {
             name: T0,
             output: T1,
@@ -3383,7 +3383,7 @@ mod tests {
                          values,
                          dims,
                      }| {
-                        Tensor::upload(
+                        Tensor::from_bytes(
                             &mut backend,
                             &values
                                 .iter()
@@ -3392,21 +3392,21 @@ mod tests {
                             DType::F32,
                             Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                         )
-                        .expect("the upload succeeds")
-                        .cast(&mut backend, dtype)
-                        .expect("the cast succeeds")
+                        .expect("from_bytes succeeds")
+                        .to_dtype(&mut backend, dtype)
+                        .expect("to_dtype succeeds")
                     },
                 );
                 [
                     NameOutputDimsExpectedCase {
-                        name: "concat on axis 0",
-                        output: top.concat(&mut backend, &bottom, 0),
+                        name: "cat on dim 0",
+                        output: Tensor::cat(&mut backend, [&top, &bottom], 0),
                         dims: [3, 3],
                         expected: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                     },
                     NameOutputDimsExpectedCase {
-                        name: "concat on the last axis",
-                        output: left.concat(&mut backend, &right, 1),
+                        name: "cat on the last dim",
+                        output: Tensor::cat(&mut backend, [&left, &right], 1),
                         dims: [2, 4],
                         expected: vec![10.0, 0.0, 1.0, 2.0, 20.0, 3.0, 4.0, 5.0],
                     },
@@ -3419,13 +3419,13 @@ mod tests {
                          dims,
                          expected,
                      }| {
-                        let output = output.expect("the concat succeeds");
+                        let output = output.expect("cat succeeds");
                         assert_eq!(output.shape().dims(), &dims, "{name}: output dims");
                         let actual: Vec<f32> = output
-                            .cast(&mut backend, DType::F32)
-                            .expect("the cast succeeds")
-                            .download(&mut backend)
-                            .expect("the download succeeds")
+                            .to_dtype(&mut backend, DType::F32)
+                            .expect("to_dtype succeeds")
+                            .to_bytes(&mut backend)
+                            .expect("to_bytes succeeds")
                             .as_chunks::<4>()
                             .0
                             .iter()
@@ -3450,7 +3450,7 @@ mod tests {
     }
 
     #[test]
-    fn concat_of_permuted_input_reads_strided_values() {
+    fn cat_of_permuted_input_reads_strided_values() {
         struct ValuesDimsCase<T0, T1> {
             values: T0,
             dims: T1,
@@ -3471,7 +3471,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -3480,16 +3480,14 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
-        let actual: Vec<f32> = lhs
-            .permute(&[1, 0])
-            .expect("the permutation is valid")
-            .concat(&mut backend, &rhs, 0)
-            .expect("the concat succeeds")
-            .download(&mut backend)
-            .expect("the download succeeds")
+        let permuted = lhs.permute(&[1, 0]).expect("the permutation is valid");
+        let actual: Vec<f32> = Tensor::cat(&mut backend, [&permuted, &rhs], 0)
+            .expect("cat succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -3503,7 +3501,7 @@ mod tests {
     }
 
     #[test]
-    fn concat_with_empty_input_keeps_the_other_input() {
+    fn cat_with_empty_input_keeps_the_other_input() {
         struct ValuesDimsCase<T0, T1> {
             values: T0,
             dims: T1,
@@ -3524,7 +3522,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -3533,20 +3531,18 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
-        let output = empty
-            .concat(&mut backend, &rows, 0)
-            .expect("the concat succeeds");
+        let output = Tensor::cat(&mut backend, [&empty, &rows], 0).expect("cat succeeds");
         assert_eq!(
             output.shape().dims(),
             &[2, 3],
             "the empty input adds no rows"
         );
         let actual: Vec<f32> = output
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -3560,7 +3556,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_update_writes_one_position_and_keeps_the_others_for_each_float_dtype() {
+    fn slice_scatter_writes_one_position_and_keeps_the_others_for_each_float_dtype() {
         struct DtypeToleranceCase<T0, T1> {
             dtype: T0,
             tolerance: T1,
@@ -3615,7 +3611,7 @@ mod tests {
                         .expect("the shape is valid"),
                 )
                 .expect("the zeros succeed");
-                let update = Tensor::upload(
+                let update = Tensor::from_bytes(
                     &mut backend,
                     &update_values
                         .iter()
@@ -3624,23 +3620,23 @@ mod tests {
                     DType::F32,
                     Shape::try_from([heads, 1, head_dim].as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
-                .cast(&mut backend, dtype)
-                .expect("the cast succeeds");
+                .expect("from_bytes succeeds")
+                .to_dtype(&mut backend, dtype)
+                .expect("to_dtype succeeds");
                 cache
-                    .slice_update(&mut backend, &update, 1, position)
-                    .expect("the slice update succeeds");
+                    .slice_scatter(&mut backend, &update, 1, position)
+                    .expect("the slice scatter succeeds");
                 let actual: Vec<f32> = cache
-                    .cast(&mut backend, DType::F32)
-                    .expect("the cast succeeds")
-                    .download(&mut backend)
-                    .expect("the download succeeds")
+                    .to_dtype(&mut backend, DType::F32)
+                    .expect("to_dtype succeeds")
+                    .to_bytes(&mut backend)
+                    .expect("to_bytes succeeds")
                     .as_chunks::<4>()
                     .0
                     .iter()
                     .map(|&chunk| f32::from_le_bytes(chunk))
                     .collect();
-                assert_eq!(actual.len(), expected.len(), "slice update: element count");
+                assert_eq!(actual.len(), expected.len(), "slice scatter: element count");
                 actual
                     .iter()
                     .zip(&expected)
@@ -3657,7 +3653,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_update_of_permuted_update_reads_strided_values() {
+    fn slice_scatter_of_permuted_update_reads_strided_values() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let mut target = Tensor::zeros(
             &mut backend,
@@ -3665,7 +3661,7 @@ mod tests {
             Shape::try_from([2, 4].as_slice()).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
-        let update = Tensor::upload(
+        let update = Tensor::from_bytes(
             &mut backend,
             &[0.0_f32, 1.0, 2.0, 3.0]
                 .iter()
@@ -3674,15 +3670,15 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds")
+        .expect("from_bytes succeeds")
         .permute(&[1, 0])
         .expect("the permutation is valid");
         target
-            .slice_update(&mut backend, &update, 1, 1)
-            .expect("the slice update succeeds");
+            .slice_scatter(&mut backend, &update, 1, 1)
+            .expect("the slice scatter succeeds");
         let actual: Vec<f32> = target
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -3696,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_update_of_broadcast_target_is_rejected() {
+    fn slice_scatter_of_broadcast_target_is_rejected() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
         let mut target = Tensor::zeros(
             &mut backend,
@@ -3704,9 +3700,9 @@ mod tests {
             Shape::try_from([1, 4].as_slice()).expect("the shape is valid"),
         )
         .expect("the zeros succeed")
-        .broadcast_as(Shape::try_from([3, 4].as_slice()).expect("the shape is valid"))
+        .expand(Shape::try_from([3, 4].as_slice()).expect("the shape is valid"))
         .expect("the broadcast is valid");
-        let update = Tensor::upload(
+        let update = Tensor::from_bytes(
             &mut backend,
             &[0.0_f32, 1.0, 2.0]
                 .iter()
@@ -3715,20 +3711,22 @@ mod tests {
             DType::F32,
             Shape::try_from([3, 1].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         assert!(
             matches!(
-                target.slice_update(&mut backend, &update, 1, 0),
-                Err(TensorError::Validation(CoreError::SliceUpdateNonContiguous))
+                target.slice_scatter(&mut backend, &update, 1, 0),
+                Err(TensorError::Validation(
+                    CoreError::SliceScatterNonContiguous
+                ))
             ),
             "a broadcast target would be written by several threads"
         );
     }
 
     #[test]
-    fn slice_update_with_a_view_of_the_target_as_update_is_rejected() {
+    fn slice_scatter_with_a_view_of_the_target_as_update_is_rejected() {
         let mut backend = MetalBackend::new().expect("a Metal device is available");
-        let mut target = Tensor::upload(
+        let mut target = Tensor::from_bytes(
             &mut backend,
             &(0_u16..8)
                 .flat_map(|value| f32::from(value).to_le_bytes())
@@ -3736,9 +3734,9 @@ mod tests {
             DType::F32,
             Shape::try_from([2, 4].as_slice()).expect("the shape is valid"),
         )
-        .expect("the upload succeeds");
+        .expect("from_bytes succeeds");
         let update = target.narrow(1, 0, 1).expect("the narrow is valid");
-        let result = target.slice_update(&mut backend, &update, 1, 3);
+        let result = target.slice_scatter(&mut backend, &update, 1, 3);
         assert!(
             matches!(
                 result.err(),
@@ -3749,7 +3747,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_update_while_another_view_of_the_target_is_alive_is_rejected() {
+    fn slice_scatter_while_another_view_of_the_target_is_alive_is_rejected() {
         struct ValuesDimsCase<T0, T1> {
             values: T0,
             dims: T1,
@@ -3770,7 +3768,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -3779,11 +3777,11 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         let view = target.narrow(0, 0, 1).expect("the narrow is valid");
-        let result = target.slice_update(&mut backend, &update, 1, 3);
+        let result = target.slice_scatter(&mut backend, &update, 1, 3);
         assert!(
             matches!(
                 result.err(),
@@ -3795,7 +3793,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_update_without_live_views_writes_the_update() {
+    fn slice_scatter_without_live_views_writes_the_update() {
         struct ValuesDimsCase<T0, T1> {
             values: T0,
             dims: T1,
@@ -3816,7 +3814,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -3825,15 +3823,15 @@ mod tests {
                     DType::F32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         target
-            .slice_update(&mut backend, &update, 1, 3)
-            .expect("the slice update succeeds");
+            .slice_scatter(&mut backend, &update, 1, 3)
+            .expect("the slice scatter succeeds");
         let actual: Vec<f32> = target
-            .download(&mut backend)
-            .expect("the download succeeds")
+            .to_bytes(&mut backend)
+            .expect("to_bytes succeeds")
             .as_chunks::<4>()
             .0
             .iter()
@@ -3847,21 +3845,21 @@ mod tests {
     }
 
     #[test]
-    fn download_of_storage_from_another_backend_is_rejected() {
+    fn to_bytes_of_storage_from_another_backend_is_rejected() {
         let mut producer = MetalBackend::new().expect("a Metal device is available");
         let mut consumer = MetalBackend::new().expect("a Metal device is available");
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
-        let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
-            .expect("the upload succeeds");
+        let tensor = Tensor::from_bytes(&mut producer, &[0_u8; 8], DType::F32, shape)
+            .expect("from_bytes succeeds");
         assert!(
             matches!(
-                tensor.download(&mut consumer).err(),
+                tensor.to_bytes(&mut consumer).err(),
                 Some(TensorError::Backend {
-                    operation: "download",
+                    operation: "to_bytes",
                     source: MetalError::ForeignStorage
                 })
             ),
-            "a storage from another backend cannot be downloaded"
+            "a storage from another backend cannot be read as bytes"
         );
     }
 
@@ -3870,8 +3868,8 @@ mod tests {
         let mut producer = MetalBackend::new().expect("a Metal device is available");
         let mut consumer = MetalBackend::new().expect("a Metal device is available");
         let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
-        let tensor = Tensor::upload(&mut producer, &[0_u8; 8], DType::F32, shape)
-            .expect("the upload succeeds");
+        let tensor = Tensor::from_bytes(&mut producer, &[0_u8; 8], DType::F32, shape)
+            .expect("from_bytes succeeds");
         assert!(
             matches!(
                 tensor.neg(&mut consumer).err(),
@@ -3885,7 +3883,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_update_of_target_from_another_backend_is_rejected() {
+    fn slice_scatter_of_target_from_another_backend_is_rejected() {
         let mut producer = MetalBackend::new().expect("a Metal device is available");
         let mut consumer = MetalBackend::new().expect("a Metal device is available");
         let mut target = Tensor::zeros(
@@ -3902,9 +3900,9 @@ mod tests {
         .expect("the zeros succeed");
         assert!(
             matches!(
-                target.slice_update(&mut consumer, &update, 1, 0),
+                target.slice_scatter(&mut consumer, &update, 1, 0),
                 Err(TensorError::Backend {
-                    operation: "slice_update",
+                    operation: "slice_scatter",
                     source: MetalError::ForeignStorage
                 })
             ),
@@ -3913,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn gather_and_concat_on_u32_are_rejected() {
+    fn index_select_and_cat_on_u32_are_rejected() {
         struct ValuesDimsCase<T0, T1> {
             values: T0,
             dims: T1,
@@ -3934,7 +3932,7 @@ mod tests {
                  values,
                  dims,
              }| {
-                Tensor::upload(
+                Tensor::from_bytes(
                     &mut backend,
                     &values
                         .iter()
@@ -3943,22 +3941,22 @@ mod tests {
                     DType::U32,
                     Shape::try_from(dims.as_slice()).expect("the shape is valid"),
                 )
-                .expect("the upload succeeds")
+                .expect("from_bytes succeeds")
             },
         );
         assert!(
             matches!(
-                values.gather(&mut backend, &indices).err(),
+                values.index_select(&mut backend, 0, &indices).err(),
                 Some(TensorError::Validation(CoreError::DTypeNotFloat))
             ),
-            "gather rejects a u32 table on Metal"
+            "index_select rejects a u32 table on Metal"
         );
         assert!(
             matches!(
-                values.concat(&mut backend, &values, 0).err(),
+                Tensor::cat(&mut backend, [&values, &values], 0).err(),
                 Some(TensorError::Validation(CoreError::DTypeNotFloat))
             ),
-            "concat rejects u32 on Metal"
+            "cat rejects u32 on Metal"
         );
     }
 }

@@ -13,10 +13,10 @@ use crate::core::{
 };
 use crate::nn::{
     KvCache,
-    softmax_last_axis,
+    softmax,
 };
 
-const SEQ_AXIS: usize = 2;
+const SEQ_DIM: usize = 2;
 
 pub struct Attention<B: Backend> {
     head_dim: NonZeroUsize,
@@ -42,7 +42,7 @@ impl<B: Backend> Attention<B> {
         let head_dim_f32 = exact_f32(head_dim.get())?;
         Ok(Self {
             head_dim,
-            scale: Tensor::upload(
+            scale: Tensor::from_bytes(
                 backend,
                 &head_dim_f32.sqrt().recip().to_le_bytes(),
                 DType::F32,
@@ -59,8 +59,8 @@ impl<B: Backend> Attention<B> {
         seq_len_total: usize,
         mask: &Tensor<B>,
     ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        let keys = &cache.keys().narrow(SEQ_AXIS, 0, seq_len_total)?;
-        let values = &cache.values().narrow(SEQ_AXIS, 0, seq_len_total)?;
+        let keys = &cache.keys().narrow(SEQ_DIM, 0, seq_len_total)?;
+        let values = &cache.values().narrow(SEQ_DIM, 0, seq_len_total)?;
         let AttentionDims {
             batch,
             heads,
@@ -72,7 +72,7 @@ impl<B: Backend> Attention<B> {
         } = attention_dims(self.head_dim, query.shape(), keys.shape(), values.shape())?;
         let rows = group.saturating_mul(seq_len);
         let keys_t = keys.permute(&[0, 1, 3, 2])?;
-        let mask_f32 = mask.cast(backend, DType::F32)?;
+        let mask_f32 = mask.to_dtype(backend, DType::F32)?;
         let scores = query
             .contiguous(backend)?
             .reshape(Shape::try_from(
@@ -88,11 +88,11 @@ impl<B: Backend> Attention<B> {
                 ]
                 .as_slice(),
             )?)?
-            .cast(backend, DType::F32)?
+            .to_dtype(backend, DType::F32)?
             .mul(backend, &self.scale)?
             .add(backend, &mask_f32)?;
-        Ok(softmax_last_axis(backend, &scores)?
-            .cast(backend, query.dtype())?
+        Ok(softmax(backend, &scores, scores.shape().last_dim()?)?
+            .to_dtype(backend, query.dtype())?
             .reshape(Shape::try_from(
                 [batch, kv_heads, rows, seq_len_total].as_slice(),
             )?)?

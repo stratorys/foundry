@@ -9,7 +9,7 @@ use crate::core::{
     TensorError,
 };
 
-const SEQ_AXIS: usize = 2;
+const SEQ_DIM: usize = 2;
 
 pub struct KvCache<B: Backend> {
     keys: Tensor<B>,
@@ -55,9 +55,9 @@ impl<B: Backend> KvCache<B> {
             );
             return Err(CoreError::DTypeMismatch.into());
         }
-        self.keys.slice_update(backend, keys, SEQ_AXIS, position)?;
+        self.keys.slice_scatter(backend, keys, SEQ_DIM, position)?;
         self.values
-            .slice_update(backend, values, SEQ_AXIS, position)
+            .slice_scatter(backend, values, SEQ_DIM, position)
     }
 
     pub fn keys(&self) -> &Tensor<B> { &self.keys }

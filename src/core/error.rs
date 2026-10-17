@@ -4,7 +4,7 @@ pub enum CoreError {
     RankTooLarge,
 
     #[error("Shape has too many elements.")]
-    ElementCountOverflow,
+    NumelOverflow,
 
     #[error("View offset overflows.")]
     OffsetOverflow,
@@ -12,11 +12,11 @@ pub enum CoreError {
     #[error("Shapes cannot be broadcast together.")]
     BroadcastIncompatible,
 
-    #[error("Axes are not a permutation of the rank.")]
+    #[error("Dims are not a permutation of the dimensions.")]
     InvalidPermutation,
 
-    #[error("Axis is out of range.")]
-    AxisOutOfRange,
+    #[error("Dimension is out of range.")]
+    DimOutOfRange,
 
     #[error("Narrow exceeds the dimension.")]
     NarrowOutOfBounds,
@@ -28,10 +28,10 @@ pub enum CoreError {
     ReshapeNonContiguous,
 
     #[error("Element counts do not match.")]
-    ElementCountMismatch,
+    NumelMismatch,
 
-    #[error("Shape cannot be broadcast to the target shape.")]
-    BroadcastAsIncompatible,
+    #[error("Shape cannot be expanded to the target shape.")]
+    ExpandIncompatible,
 
     #[error("DType is not a float dtype.")]
     DTypeNotFloat,
@@ -39,35 +39,35 @@ pub enum CoreError {
     #[error("DTypes do not match.")]
     DTypeMismatch,
 
-    #[error("Gather indices are not u32.")]
+    #[error("Index select indices are not u32.")]
     IndicesNotU32,
 
     #[error("Shapes cannot be multiplied.")]
     MatmulIncompatible,
 
-    #[error("Table and indices cannot be gathered.")]
-    GatherIncompatible,
+    #[error("Indices cannot select rows of the table.")]
+    IndexSelectIncompatible,
 
     #[error("Shapes cannot be concatenated.")]
-    ConcatIncompatible,
+    CatIncompatible,
 
-    #[error("Slice update does not fit the target.")]
-    SliceUpdateOutOfBounds,
+    #[error("Slice scatter does not fit the target.")]
+    SliceScatterOutOfBounds,
 
-    #[error("Reduction over an empty axis has no result.")]
+    #[error("Reduction over an empty dimension has no result.")]
     EmptyReduction,
 
-    #[error("Slice update target shares its storage with another tensor.")]
+    #[error("Slice scatter target shares its storage with another tensor.")]
     SharedStorage,
 
-    #[error("Slice update requires a contiguous target layout.")]
-    SliceUpdateNonContiguous,
+    #[error("Slice scatter requires a contiguous target layout.")]
+    SliceScatterNonContiguous,
 
     #[error("Byte length does not match the shape and dtype.")]
     ByteLengthMismatch,
 
-    #[error("Download requires a contiguous layout.")]
-    DownloadNonContiguous,
+    #[error("Reading bytes requires a contiguous layout.")]
+    ToBytesNonContiguous,
 
     #[error("Query, keys and values are incompatible for attention.")]
     AttentionIncompatible,

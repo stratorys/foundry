@@ -2,8 +2,8 @@
 
 struct ReduceArgs {
   StridedArgs rows;
-  uint axis_len;
-  uint axis_stride;
+  uint dim_size;
+  uint dim_stride;
 };
 
 struct SumOp {
@@ -11,7 +11,7 @@ struct SumOp {
   static float apply(float lhs, float rhs) { return lhs + rhs; }
 };
 
-struct MaxOp {
+struct AmaxOp {
   static float identity() { return -INFINITY; }
   static float apply(float lhs, float rhs) { return max(lhs, rhs); }
 };
@@ -25,8 +25,8 @@ kernel void reduce_rows(device const T *input [[buffer(0)]],
   threadgroup float partial[REDUCE_THREADS];
   uint base = strided_index(row, args.rows);
   float acc = Op::identity();
-  for (uint k = tid; k < args.axis_len; k += REDUCE_THREADS) {
-    acc = Op::apply(acc, to_float(input[base + k * args.axis_stride]));
+  for (uint k = tid; k < args.dim_size; k += REDUCE_THREADS) {
+    acc = Op::apply(acc, to_float(input[base + k * args.dim_stride]));
   }
   partial[tid] = acc;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -52,8 +52,8 @@ kernel void argmax_rows(device const T *input [[buffer(0)]],
   uint base = strided_index(row, args.rows);
   float best = -INFINITY;
   uint best_index = 0;
-  for (uint k = tid; k < args.axis_len; k += REDUCE_THREADS) {
-    float value = to_float(input[base + k * args.axis_stride]);
+  for (uint k = tid; k < args.dim_size; k += REDUCE_THREADS) {
+    float value = to_float(input[base + k * args.dim_stride]);
     if (value > best) {
       best = value;
       best_index = k;
@@ -90,9 +90,9 @@ kernel void argmax_rows(device const T *input [[buffer(0)]],
 INSTANTIATE_REDUCE("reduce_sum_f32", float, SumOp)
 INSTANTIATE_REDUCE("reduce_sum_f16", half, SumOp)
 INSTANTIATE_REDUCE("reduce_sum_bf16", bf16_t, SumOp)
-INSTANTIATE_REDUCE("reduce_max_f32", float, MaxOp)
-INSTANTIATE_REDUCE("reduce_max_f16", half, MaxOp)
-INSTANTIATE_REDUCE("reduce_max_bf16", bf16_t, MaxOp)
+INSTANTIATE_REDUCE("reduce_amax_f32", float, AmaxOp)
+INSTANTIATE_REDUCE("reduce_amax_f16", half, AmaxOp)
+INSTANTIATE_REDUCE("reduce_amax_bf16", bf16_t, AmaxOp)
 INSTANTIATE_ARGMAX("reduce_argmax_f32", float)
 INSTANTIATE_ARGMAX("reduce_argmax_f16", half)
 INSTANTIATE_ARGMAX("reduce_argmax_bf16", bf16_t)

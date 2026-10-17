@@ -7,7 +7,7 @@ mod norm;
 
 pub use self::activation::{
     Silu,
-    softmax_last_axis,
+    softmax,
 };
 pub use self::attention::Attention;
 pub use self::kv_cache::KvCache;
