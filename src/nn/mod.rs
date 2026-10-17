@@ -34,10 +34,7 @@ pub use self::masking::{
     create_causal_mask,
     position_ids,
 };
-pub use self::memory::{
-    AllocatedMemory,
-    AllocatedMemorySource,
-};
+pub use self::memory::AllocatedMemory;
 pub use self::module::Module;
 pub use self::norm::RmsNorm;
 pub use self::primitive::Device;

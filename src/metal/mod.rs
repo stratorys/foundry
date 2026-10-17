@@ -51,7 +51,6 @@ use crate::nn::primitive::{
 };
 use crate::nn::{
     AllocatedMemory,
-    AllocatedMemorySource,
     DType,
     Device,
     Layout,
@@ -486,7 +485,7 @@ impl Device for MetalDevice {
             bytes: self
                 .allocated_bytes_peak
                 .saturating_sub(self.allocated_bytes_baseline),
-            source: AllocatedMemorySource::MetalCurrentAllocatedSize,
+            source: "metal_current_allocated_size",
         })
     }
 
@@ -690,7 +689,6 @@ mod tests {
         is_matmul_ready,
     };
     use crate::nn::{
-        AllocatedMemorySource,
         DType,
         Device,
         Shape,
@@ -715,8 +713,7 @@ mod tests {
             .max_memory_allocated()
             .expect("Metal tracks peak memory");
         assert_eq!(
-            peak.source,
-            AllocatedMemorySource::MetalCurrentAllocatedSize,
+            peak.source, "metal_current_allocated_size",
             "Metal reads the device allocated size"
         );
         assert!(

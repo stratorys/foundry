@@ -1,5 +1,4 @@
 mod error;
-mod memory;
 mod metadata;
 mod metrics;
 mod rng;
@@ -21,7 +20,6 @@ use tracing::{
 };
 
 pub use self::error::BenchError;
-pub use self::memory::PeakMemorySource;
 pub use self::metadata::{
     Metadata,
     git_commit,
@@ -99,7 +97,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub peak_memory_source: Option<PeakMemorySource>,
+    pub peak_memory_source: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -219,7 +217,7 @@ pub fn bench<D: Device, M: CausalLm<D>>(
         stats,
         metrics,
         peak_memory_bytes: peak_memory.map(|peak_memory| peak_memory.bytes),
-        peak_memory_source: peak_memory.map(|peak_memory| peak_memory.source.into()),
+        peak_memory_source: peak_memory.map(|peak_memory| peak_memory.source),
     })
 }
 
