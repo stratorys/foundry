@@ -83,11 +83,11 @@ mod tests {
     fn tensor_failures_become_the_tensor_variant() {
         assert_eq!(
             [
-                tensor_failed(TensorError::Backend),
+                tensor_failed(TensorError::Device),
                 tensor_failed(TensorError::DimOutOfRange)
             ],
             [LlamaError::Tensor, LlamaError::Tensor],
-            "backend and validation failures are logged, then reported as a tensor failure"
+            "device and validation failures are logged, then reported as a tensor failure"
         );
     }
 }

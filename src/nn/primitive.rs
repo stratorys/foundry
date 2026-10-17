@@ -66,7 +66,7 @@ pub enum Op {
     SliceScatter { dim: usize, start: usize },
 }
 
-pub trait Backend {
+pub trait Device {
     type Storage;
     type Error: Error + 'static;
 

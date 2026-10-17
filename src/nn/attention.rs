@@ -1,8 +1,8 @@
 use tracing::error;
 
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Shape,
     Tensor,
     TensorError,
@@ -20,14 +20,14 @@ struct AttentionDims {
     head_dim: usize,
 }
 
-pub fn scaled_dot_product_attention<B: Backend>(
-    backend: &mut B,
-    query: &Tensor<B>,
-    key: &Tensor<B>,
-    value: &Tensor<B>,
-    attn_mask: &Tensor<B>,
-    scale: &Tensor<B>,
-) -> Result<Tensor<B>, TensorError> {
+pub fn scaled_dot_product_attention<D: Device>(
+    device: &mut D,
+    query: &Tensor<D>,
+    key: &Tensor<D>,
+    value: &Tensor<D>,
+    attn_mask: &Tensor<D>,
+    scale: &Tensor<D>,
+) -> Result<Tensor<D>, TensorError> {
     let AttentionDims {
         batch,
         heads,
@@ -39,25 +39,25 @@ pub fn scaled_dot_product_attention<B: Backend>(
     } = attention_dims(query.shape(), key.shape(), value.shape())?;
     let rows = group.saturating_mul(seq_len);
     let key_t = key.permute(&[0, 1, 3, 2])?;
-    let attn_mask_f32 = attn_mask.to_dtype(backend, DType::F32)?;
+    let attn_mask_f32 = attn_mask.to_dtype(device, DType::F32)?;
     let scores = query
-        .contiguous(backend)?
+        .contiguous(device)?
         .reshape(Shape::try_from(
             [batch, kv_heads, rows, head_dim].as_slice(),
         )?)?
-        .matmul(backend, &key_t)?
+        .matmul(device, &key_t)?
         .reshape(Shape::try_from(
             [batch.saturating_mul(kv_heads), group, seq_len, kv_length].as_slice(),
         )?)?
-        .to_dtype(backend, DType::F32)?
-        .mul(backend, scale)?
-        .add(backend, &attn_mask_f32)?;
-    softmax(backend, &scores, scores.shape().last_dim()?)?
-        .to_dtype(backend, query.dtype())?
+        .to_dtype(device, DType::F32)?
+        .mul(device, scale)?
+        .add(device, &attn_mask_f32)?;
+    softmax(device, &scores, scores.shape().last_dim()?)?
+        .to_dtype(device, query.dtype())?
         .reshape(Shape::try_from(
             [batch, kv_heads, rows, kv_length].as_slice(),
         )?)?
-        .matmul(backend, value)?
+        .matmul(device, value)?
         .reshape(Shape::try_from(
             [batch, heads, seq_len, head_dim].as_slice(),
         )?)

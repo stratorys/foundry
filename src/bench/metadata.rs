@@ -12,8 +12,8 @@ const YEARS_PER_ERA: u64 = 400;
 pub struct Metadata {
     pub git_commit: Option<String>,
     pub test_time: String,
-    pub backend: String,
     pub device: String,
+    pub device_name: String,
     pub model_id: String,
     pub model_bytes: u64,
     pub model_parameter_count: u64,

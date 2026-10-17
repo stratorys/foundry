@@ -1,16 +1,16 @@
 use crate::nn::{
-    Backend,
+    Device,
     Shape,
     Tensor,
     TensorError,
 };
 
-pub struct Linear<B: Backend> {
-    weight: Tensor<B>,
+pub struct Linear<D: Device> {
+    weight: Tensor<D>,
 }
 
-impl<B: Backend> Linear<B> {
-    pub fn new(weight: Tensor<B>) -> Self {
+impl<D: Device> Linear<D> {
+    pub fn new(weight: Tensor<D>) -> Self {
         Self {
             weight,
         }
@@ -18,9 +18,9 @@ impl<B: Backend> Linear<B> {
 
     pub fn forward(
         &self,
-        backend: &mut B,
-        x: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError> {
+        device: &mut D,
+        x: &Tensor<D>,
+    ) -> Result<Tensor<D>, TensorError> {
         let weight_t = self.weight.permute(&[1, 0])?;
         let dims = x.shape().dims();
         let in_features = x.shape().size(x.shape().last_dim()?)?;
@@ -33,17 +33,17 @@ impl<B: Backend> Linear<B> {
             .chain([out_features])
             .collect::<Vec<usize>>();
         x.reshape(Shape::try_from([rows, in_features].as_slice())?)?
-            .matmul(backend, &weight_t)?
+            .matmul(device, &weight_t)?
             .reshape(Shape::try_from(output_dims.as_slice())?)
     }
 }
 
-pub struct Embedding<B: Backend> {
-    weight: Tensor<B>,
+pub struct Embedding<D: Device> {
+    weight: Tensor<D>,
 }
 
-impl<B: Backend> Embedding<B> {
-    pub fn new(weight: Tensor<B>) -> Self {
+impl<D: Device> Embedding<D> {
+    pub fn new(weight: Tensor<D>) -> Self {
         Self {
             weight,
         }
@@ -51,11 +51,11 @@ impl<B: Backend> Embedding<B> {
 
     pub fn forward(
         &self,
-        backend: &mut B,
-        input_ids: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError> {
-        self.weight.index_select(backend, 0, input_ids)
+        device: &mut D,
+        input_ids: &Tensor<D>,
+    ) -> Result<Tensor<D>, TensorError> {
+        self.weight.index_select(device, 0, input_ids)
     }
 
-    pub fn weight(&self) -> &Tensor<B> { &self.weight }
+    pub fn weight(&self) -> &Tensor<D> { &self.weight }
 }

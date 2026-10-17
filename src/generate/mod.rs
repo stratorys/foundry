@@ -11,8 +11,8 @@ use tracing::error;
 
 pub use self::error::GenerateError;
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Shape,
     Tensor,
 };
@@ -20,25 +20,25 @@ use crate::nn::{
 const VOCAB_DIM: usize = 1;
 const TOKEN_ID_BYTES: usize = 4;
 
-pub trait CausalLm<B: Backend> {
+pub trait CausalLm<D: Device> {
     type Cache;
     type Error: std::error::Error;
 
     fn cache(
         &self,
-        backend: &mut B,
+        device: &mut D,
         batch_size: NonZeroUsize,
     ) -> Result<Self::Cache, Self::Error>;
 
     fn forward(
         &self,
-        backend: &mut B,
-        input_ids: &Tensor<B>,
-        position_ids: &Tensor<B>,
-        attention_mask: &Tensor<B>,
+        device: &mut D,
+        input_ids: &Tensor<D>,
+        position_ids: &Tensor<D>,
+        attention_mask: &Tensor<D>,
         past_key_values: &mut Self::Cache,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, Self::Error>;
+    ) -> Result<Tensor<D>, Self::Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,15 +48,15 @@ pub struct Generation {
     pub decode_steps: Vec<Duration>,
 }
 
-pub struct Decoder<'run, B: Backend, M: CausalLm<B>> {
-    backend: &'run mut B,
+pub struct Decoder<'run, D: Device, M: CausalLm<D>> {
+    device: &'run mut D,
     model: &'run M,
     cache: M::Cache,
     batch_size: NonZeroUsize,
 }
 
-pub fn generate<B: Backend, M: CausalLm<B>>(
-    backend: &mut B,
+pub fn generate<D: Device, M: CausalLm<D>>(
+    device: &mut D,
     model: &M,
     prompts: &[&[u32]],
     max_new_tokens: usize,
@@ -70,7 +70,7 @@ pub fn generate<B: Backend, M: CausalLm<B>>(
             decode_steps: Vec::new(),
         });
     }
-    let mut decoder = Decoder::new(backend, model, batch_size)?;
+    let mut decoder = Decoder::new(device, model, batch_size)?;
     let prefill_start = Instant::now();
     let mut tokens = decoder.step(&prompts.concat(), 0)?;
     let mut generation = Generation {
@@ -102,18 +102,18 @@ pub fn generate<B: Backend, M: CausalLm<B>>(
     Ok(generation)
 }
 
-impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
+impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
     pub fn new(
-        backend: &'run mut B,
+        device: &'run mut D,
         model: &'run M,
         batch_size: NonZeroUsize,
     ) -> Result<Self, GenerateError> {
-        let cache = model.cache(backend, batch_size).map_err(|error| {
+        let cache = model.cache(device, batch_size).map_err(|error| {
             error!(message = "Creating the key-value cache failed.", %error);
             GenerateError::Cache
         })?;
         Ok(Self {
-            backend,
+            device,
             model,
             cache,
             batch_size,
@@ -145,7 +145,7 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
         let logits = self
             .model
             .forward(
-                self.backend,
+                self.device,
                 &input_ids,
                 &position_ids,
                 &attention_mask,
@@ -164,23 +164,23 @@ impl<'run, B: Backend, M: CausalLm<B>> Decoder<'run, B, M> {
         bytes: &[u8],
         dtype: DType,
         dims: &[usize],
-    ) -> Result<Tensor<B>, GenerateError> {
+    ) -> Result<Tensor<D>, GenerateError> {
         let tensor_from_bytes_error = |error: &dyn std::error::Error| {
             error!(message = "Creating a generation input tensor failed.", ?dtype, ?dims, %error);
             GenerateError::FromBytes
         };
         let shape = Shape::try_from(dims).map_err(|error| tensor_from_bytes_error(&error))?;
-        Tensor::from_bytes(self.backend, bytes, dtype, shape)
+        Tensor::from_bytes(self.device, bytes, dtype, shape)
             .map_err(|error| tensor_from_bytes_error(&error))
     }
 
     fn next_tokens(
         &mut self,
-        logits: &Tensor<B>,
+        logits: &Tensor<D>,
     ) -> Result<Vec<u32>, GenerateError> {
         let bytes = logits
-            .argmax_keepdim(self.backend, VOCAB_DIM)
-            .and_then(|token| token.to_bytes(self.backend))
+            .argmax_keepdim(self.device, VOCAB_DIM)
+            .and_then(|token| token.to_bytes(self.device))
             .map_err(|error| {
                 error!(message = "Selecting the next token failed.", %error);
                 GenerateError::NextToken

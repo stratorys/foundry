@@ -53,7 +53,7 @@ use crate::generate::{
     CausalLm,
     Decoder,
 };
-use crate::nn::Backend;
+use crate::nn::Device;
 
 const NS_PER_MS: f64 = 1e6;
 
@@ -146,8 +146,8 @@ impl RunSamples {
     }
 }
 
-pub fn bench<B: Backend, M: CausalLm<B>>(
-    backend: &mut B,
+pub fn bench<D: Device, M: CausalLm<D>>(
+    device: &mut D,
     model: &M,
     vocab_size: NonZeroU32,
     config: &BenchConfig,
@@ -176,7 +176,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
     let warmup = Duration::from_millis(config.warmup_ms);
     let mut warmup_run_count = 0_u32;
     while warmup_run_count < config.warmup_run_count || warmup_start.elapsed() < warmup {
-        let warmup_run = run(backend, model, &inputs)?;
+        let warmup_run = run(device, model, &inputs)?;
         warmup_run_count = warmup_run_count.checked_add(1).ok_or_else(|| {
             error!(message = "Run count overflows u32.", warmup_run_count);
             BenchError::RunCountOverflow
@@ -189,7 +189,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
     }
     let runs = (1..=config.run_count.get())
         .map(|run_number| {
-            let measured_run = run(backend, model, &inputs)?;
+            let measured_run = run(device, model, &inputs)?;
             let decode_ms = measured_run
                 .decode_ns
                 .iter()
@@ -209,7 +209,7 @@ pub fn bench<B: Backend, M: CausalLm<B>>(
         .collect::<Result<Vec<RunSamples>, BenchError>>()?;
     let stats = stats(&runs)?;
     let metrics = metrics(&runs, counts)?;
-    let peak_memory = backend.current_allocated_memory();
+    let peak_memory = device.current_allocated_memory();
     Ok(Report {
         config: *config,
         mode,
@@ -287,12 +287,12 @@ fn token_count(count: u32) -> Result<usize, BenchError> {
     })
 }
 
-fn run<B: Backend, M: CausalLm<B>>(
-    backend: &mut B,
+fn run<D: Device, M: CausalLm<D>>(
+    device: &mut D,
     model: &M,
     inputs: &Inputs,
 ) -> Result<RunSamples, BenchError> {
-    let mut decoder = Decoder::new(backend, model, inputs.batch_size).map_err(|error| {
+    let mut decoder = Decoder::new(device, model, inputs.batch_size).map_err(|error| {
         error!(message = "Creating the decoder failed.", %error);
         BenchError::Decoder
     })?;
@@ -331,7 +331,7 @@ fn run<B: Backend, M: CausalLm<B>>(
         prefill_ns,
         decode_ns,
         token_ids,
-        peak_memory_bytes: backend
+        peak_memory_bytes: device
             .current_allocated_memory()
             .map(|peak_memory| peak_memory.bytes),
     })
@@ -347,8 +347,8 @@ fn push_tokens(
         .for_each(|(row, &token)| row.push(token));
 }
 
-fn timed_step<B: Backend, M: CausalLm<B>>(
-    decoder: &mut Decoder<'_, B, M>,
+fn timed_step<D: Device, M: CausalLm<D>>(
+    decoder: &mut Decoder<'_, D, M>,
     input_ids: &[u32],
     past_seen_tokens: usize,
 ) -> Result<(Vec<u32>, u64), BenchError> {
@@ -365,8 +365,8 @@ fn timed_step<B: Backend, M: CausalLm<B>>(
     Ok((tokens, elapsed_ns))
 }
 
-fn step<B: Backend, M: CausalLm<B>>(
-    decoder: &mut Decoder<'_, B, M>,
+fn step<D: Device, M: CausalLm<D>>(
+    decoder: &mut Decoder<'_, D, M>,
     input_ids: &[u32],
     past_seen_tokens: usize,
 ) -> Result<Vec<u32>, BenchError> {

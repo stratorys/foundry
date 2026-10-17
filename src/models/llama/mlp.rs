@@ -5,7 +5,7 @@ use crate::models::llama::{
     LlamaError,
 };
 use crate::nn::{
-    Backend,
+    Device,
     Linear,
     Silu,
     Tensor,
@@ -13,16 +13,16 @@ use crate::nn::{
 };
 use crate::weights::Weights;
 
-pub struct LlamaMlp<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
-    down_proj: Linear<B>,
-    act_fn: Silu<B>,
+pub struct LlamaMlp<D: Device> {
+    gate_proj: Linear<D>,
+    up_proj: Linear<D>,
+    down_proj: Linear<D>,
+    act_fn: Silu<D>,
 }
 
-impl<B: Backend> LlamaMlp<B> {
+impl<D: Device> LlamaMlp<D> {
     pub fn load<S: AsRef<[u8]>>(
-        backend: &mut B,
+        device: &mut D,
         config: &LlamaConfig,
         weights: &Weights<S>,
         prefix: &str,
@@ -30,8 +30,7 @@ impl<B: Backend> LlamaMlp<B> {
         let hidden_size = config.hidden_size();
         let intermediate_size = config.intermediate_size();
         let mut linear = |name: &str, dims: [usize; 2]| {
-            load_tensor(backend, weights, &format!("{prefix}.{name}.weight"), &dims)
-                .map(Linear::new)
+            load_tensor(device, weights, &format!("{prefix}.{name}.weight"), &dims).map(Linear::new)
         };
         let gate_proj = linear("gate_proj", [intermediate_size, hidden_size])?;
         let up_proj = linear("up_proj", [intermediate_size, hidden_size])?;
@@ -40,18 +39,18 @@ impl<B: Backend> LlamaMlp<B> {
             gate_proj,
             up_proj,
             down_proj,
-            act_fn: Silu::new(backend).map_err(tensor_failed)?,
+            act_fn: Silu::new(device).map_err(tensor_failed)?,
         })
     }
 
     pub fn forward(
         &self,
-        backend: &mut B,
-        x: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError> {
-        let gate = self.gate_proj.forward(backend, x)?;
-        let up = self.up_proj.forward(backend, x)?;
-        let hidden = self.act_fn.forward(backend, &gate)?.mul(backend, &up)?;
-        self.down_proj.forward(backend, &hidden)
+        device: &mut D,
+        x: &Tensor<D>,
+    ) -> Result<Tensor<D>, TensorError> {
+        let gate = self.gate_proj.forward(device, x)?;
+        let up = self.up_proj.forward(device, x)?;
+        let hidden = self.act_fn.forward(device, &gate)?.mul(device, &up)?;
+        self.down_proj.forward(device, &hidden)
     }
 }

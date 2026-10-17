@@ -493,7 +493,7 @@ mod tests {
                 }),
                 candle: None,
             }),
-            "prefill only; no backend peak memory"
+            "prefill only; no device peak memory"
         );
     }
 

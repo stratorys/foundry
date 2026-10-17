@@ -23,8 +23,6 @@ use clap::{
     Parser,
     Subcommand,
 };
-#[cfg(target_os = "macos")]
-use foundry::backend::metal::MetalBackend;
 use foundry::bench::{
     BenchConfig,
     Metadata,
@@ -43,11 +41,13 @@ use foundry::generate::{
     Generation,
     generate,
 };
+#[cfg(target_os = "macos")]
+use foundry::metal::MetalDevice;
 use foundry::models::llama::{
     LlamaConfig,
     LlamaForCausalLm,
 };
-use foundry::nn::Backend;
+use foundry::nn::Device;
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
 use serde::Serialize;
@@ -57,7 +57,7 @@ use tracing::{
     warn,
 };
 
-const BACKEND_NAME: &str = "metal";
+const DEVICE: &str = "metal";
 const BENCH_REPORT_FILE: &str = "report.json";
 const EVAL_REPORT_FILE: &str = "eval.json";
 const EVAL_MAX_CACHE_LEN: usize = 1;
@@ -184,12 +184,12 @@ enum CliError {
     Output,
 
     #[cfg(target_os = "macos")]
-    #[error("Creating the Metal backend failed.")]
-    Backend,
+    #[error("Creating the Metal device failed.")]
+    Device,
 
     #[cfg(not(target_os = "macos"))]
-    #[error("No backend is available on this platform.")]
-    BackendUnavailable,
+    #[error("No device is available on this platform.")]
+    DeviceUnavailable,
 
     #[error("Loading the model failed.")]
     Load,
@@ -330,7 +330,7 @@ fn run(
     let token_ids = generation.token_ids.concat();
     info!(
         message = "Generated tokens.",
-        backend = BACKEND_NAME,
+        device = DEVICE,
         prompt_tokens = prompt_ids.len(),
         generated_tokens = token_ids.len(),
         prefill_ms = %generation.prefill.as_millis(),
@@ -382,14 +382,14 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
         batch_size: args.batch_size,
         seed: args.seed,
     };
-    let (device, report) =
+    let (device_name, report) =
         bench_on_platform(&args.model, &config, &weights, vocab_size, &bench_config)?;
     let record = BenchRecord {
         metadata: Metadata {
             git_commit,
             test_time,
-            backend: BACKEND_NAME.to_owned(),
-            device,
+            device: DEVICE.to_owned(),
+            device_name,
             model_id: args.model.to_string(),
             model_bytes,
             model_parameter_count,
@@ -399,8 +399,8 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
     let report_path = write_report(&args.out, BENCH_REPORT_FILE, &record)?;
     info!(
         message = "Benchmarked the model.",
-        backend = BACKEND_NAME,
-        device = %record.metadata.device,
+        device = DEVICE,
+        device_name = %record.metadata.device_name,
         git_commit = ?record.metadata.git_commit,
         mode = ?record.report.mode,
         llama_cpp_avg_ts = record.report.metrics.llama_cpp.avg_ts,
@@ -429,13 +429,13 @@ fn eval_command(args: &EvalArgs) -> Result<(), CliError> {
         );
         CliError::Activations
     })?;
-    let (device, layers) = eval_on_platform(&args.model, &config, &weights, &activations)?;
+    let (device_name, layers) = eval_on_platform(&args.model, &config, &weights, &activations)?;
     let record = EvalRecord {
         metadata: Metadata {
             git_commit,
             test_time,
-            backend: BACKEND_NAME.to_owned(),
-            device,
+            device: DEVICE.to_owned(),
+            device_name,
             model_id: args.model.to_string(),
             model_bytes,
             model_parameter_count,
@@ -455,8 +455,8 @@ fn eval_command(args: &EvalArgs) -> Result<(), CliError> {
         .count();
     info!(
         message = "Evaluated the submodules.",
-        backend = BACKEND_NAME,
-        device = %record.metadata.device,
+        device = DEVICE,
+        device_name = %record.metadata.device_name,
         layer_count = record.layers.len(),
         failed_count,
         skipped_count,
@@ -552,10 +552,10 @@ fn parameter_count<S: AsRef<[u8]>>(
 }
 
 #[cfg(target_os = "macos")]
-fn metal_backend() -> Result<MetalBackend, CliError> {
-    MetalBackend::new().map_err(|error| {
-        error!(message = "Creating the Metal backend failed.", %error);
-        CliError::Backend
+fn metal_device() -> Result<MetalDevice, CliError> {
+    MetalDevice::new().map_err(|error| {
+        error!(message = "Creating the Metal device failed.", %error);
+        CliError::Device
     })
 }
 
@@ -568,7 +568,7 @@ fn generate_on_platform(
     max_new_tokens: usize,
 ) -> Result<Generation, CliError> {
     generate_on(
-        &mut metal_backend()?,
+        &mut metal_device()?,
         model,
         config,
         weights,
@@ -585,8 +585,8 @@ fn generate_on_platform(
     _prompt_ids: &[u32],
     _max_new_tokens: usize,
 ) -> Result<Generation, CliError> {
-    error!(message = "No backend is available on this platform.");
-    Err(CliError::BackendUnavailable)
+    error!(message = "No device is available on this platform.");
+    Err(CliError::DeviceUnavailable)
 }
 
 #[cfg(target_os = "macos")]
@@ -598,7 +598,7 @@ fn bench_on_platform(
     bench_config: &BenchConfig,
 ) -> Result<(String, Report), CliError> {
     bench_on(
-        &mut metal_backend()?,
+        &mut metal_device()?,
         model,
         config,
         weights,
@@ -615,8 +615,8 @@ fn bench_on_platform(
     _vocab_size: NonZeroU32,
     _bench_config: &BenchConfig,
 ) -> Result<(String, Report), CliError> {
-    error!(message = "No backend is available on this platform.");
-    Err(CliError::BackendUnavailable)
+    error!(message = "No device is available on this platform.");
+    Err(CliError::DeviceUnavailable)
 }
 
 #[cfg(target_os = "macos")]
@@ -626,7 +626,7 @@ fn eval_on_platform(
     weights: &Weights,
     activations: &Weights<Vec<u8>>,
 ) -> Result<(String, Vec<LayerReport>), CliError> {
-    eval_on(&mut metal_backend()?, model, config, weights, activations)
+    eval_on(&mut metal_device()?, model, config, weights, activations)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -636,37 +636,37 @@ fn eval_on_platform(
     _weights: &Weights,
     _activations: &Weights<Vec<u8>>,
 ) -> Result<(String, Vec<LayerReport>), CliError> {
-    error!(message = "No backend is available on this platform.");
-    Err(CliError::BackendUnavailable)
+    error!(message = "No device is available on this platform.");
+    Err(CliError::DeviceUnavailable)
 }
 
 #[cfg_attr(
     not(target_os = "macos"),
-    expect(dead_code, reason = "no backend on this platform")
+    expect(dead_code, reason = "no device on this platform")
 )]
-fn eval_on<B: Backend>(
-    backend: &mut B,
+fn eval_on<D: Device>(
+    device: &mut D,
     model: &ModelId,
     config: &LlamaConfig,
     weights: &Weights,
     activations: &Weights<Vec<u8>>,
 ) -> Result<(String, Vec<LayerReport>), CliError> {
-    let device = backend.device_name();
-    info!(message = "Selected the device.", %device);
-    let llama = load_llama(backend, model, config, weights, EVAL_MAX_CACHE_LEN)?;
-    let layers = eval_layers(backend, &llama, activations).map_err(|error| {
+    let device_name = device.device_name();
+    info!(message = "Selected the device.", %device_name);
+    let llama = load_llama(device, model, config, weights, EVAL_MAX_CACHE_LEN)?;
+    let layers = eval_layers(device, &llama, activations).map_err(|error| {
         error!(message = "Evaluation failed.", %model, %error);
         CliError::Eval
     })?;
-    Ok((device, layers))
+    Ok((device_name, layers))
 }
 
 #[cfg_attr(
     not(target_os = "macos"),
-    expect(dead_code, reason = "no backend on this platform")
+    expect(dead_code, reason = "no device on this platform")
 )]
-fn bench_on<B: Backend>(
-    backend: &mut B,
+fn bench_on<D: Device>(
+    device: &mut D,
     model: &ModelId,
     config: &LlamaConfig,
     weights: &Weights,
@@ -691,14 +691,14 @@ fn bench_on<B: Backend>(
         );
         CliError::SeqLenOverflow
     })?;
-    let device = backend.device_name();
-    info!(message = "Selected the device.", %device);
-    let llama = load_llama(backend, model, config, weights, max_cache_len)?;
-    let report = bench(backend, &llama, vocab_size, bench_config).map_err(|error| {
+    let device_name = device.device_name();
+    info!(message = "Selected the device.", %device_name);
+    let llama = load_llama(device, model, config, weights, max_cache_len)?;
+    let report = bench(device, &llama, vocab_size, bench_config).map_err(|error| {
         error!(message = "Benchmark failed.", %model, %error);
         CliError::Bench
     })?;
-    Ok((device, report))
+    Ok((device_name, report))
 }
 
 fn write_report(
@@ -727,19 +727,19 @@ fn write_report(
 
 #[cfg_attr(
     not(target_os = "macos"),
-    expect(dead_code, reason = "no backend on this platform")
+    expect(dead_code, reason = "no device on this platform")
 )]
-fn load_llama<B: Backend>(
-    backend: &mut B,
+fn load_llama<D: Device>(
+    device: &mut D,
     model: &ModelId,
     config: &LlamaConfig,
     weights: &Weights,
     max_cache_len: usize,
-) -> Result<LlamaForCausalLm<B>, CliError> {
+) -> Result<LlamaForCausalLm<D>, CliError> {
     info!(message = "Loading the model.", %model);
     let load_start = Instant::now();
     let llama =
-        LlamaForCausalLm::load(backend, config, weights, max_cache_len).map_err(|error| {
+        LlamaForCausalLm::load(device, config, weights, max_cache_len).map_err(|error| {
             error!(message = "Loading the model failed.", %model, max_cache_len, %error);
             CliError::Load
         })?;
@@ -754,10 +754,10 @@ fn load_llama<B: Backend>(
 
 #[cfg_attr(
     not(target_os = "macos"),
-    expect(dead_code, reason = "no backend on this platform")
+    expect(dead_code, reason = "no device on this platform")
 )]
-fn generate_on<B: Backend>(
-    backend: &mut B,
+fn generate_on<D: Device>(
+    device: &mut D,
     model: &ModelId,
     config: &LlamaConfig,
     weights: &Weights,
@@ -775,9 +775,9 @@ fn generate_on<B: Backend>(
             );
             CliError::SeqLenOverflow
         })?;
-    let llama = load_llama(backend, model, config, weights, max_cache_len)?;
+    let llama = load_llama(device, model, config, weights, max_cache_len)?;
     generate(
-        backend,
+        device,
         &llama,
         &[prompt_ids],
         max_new_tokens,
@@ -914,14 +914,14 @@ mod tests {
     }
 
     #[test]
-    fn run_rejects_the_backend_option() {
+    fn run_rejects_the_device_option() {
         assert_eq!(
             Cli::try_parse_from([
                 "foundry",
                 "run",
                 "--model",
                 "a/b",
-                "--backend",
+                "--device",
                 "metal",
                 "--prompt-ids",
                 "1",
@@ -931,7 +931,7 @@ mod tests {
             .map(|cli| cli.command)
             .map_err(|error| error.kind()),
             Err(ErrorKind::UnknownArgument),
-            "the backend is not selectable"
+            "the device is not selectable"
         );
     }
 

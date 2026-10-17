@@ -14,8 +14,8 @@ use crate::models::llama::{
     LlamaError,
 };
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Embedding,
     Linear,
     RmsNorm,
@@ -29,35 +29,35 @@ use crate::weights::Weights;
 const CACHE_DTYPE: DType = DType::BF16;
 const SEQ_DIM: usize = 1;
 
-pub struct LlamaForCausalLm<B: Backend> {
-    model: LlamaModel<B>,
-    lm_head: Linear<B>,
+pub struct LlamaForCausalLm<D: Device> {
+    model: LlamaModel<D>,
+    lm_head: Linear<D>,
     config: LlamaConfig,
 }
 
-pub struct LlamaModel<B: Backend> {
-    embed_tokens: Embedding<B>,
-    layers: Vec<LlamaDecoderLayer<B>>,
-    norm: RmsNorm<B>,
-    rotary_emb: LlamaRotaryEmbedding<B>,
+pub struct LlamaModel<D: Device> {
+    embed_tokens: Embedding<D>,
+    layers: Vec<LlamaDecoderLayer<D>>,
+    norm: RmsNorm<D>,
+    rotary_emb: LlamaRotaryEmbedding<D>,
     max_cache_len: usize,
 }
 
-pub struct LlamaDecoderLayer<B: Backend> {
-    self_attn: LlamaAttention<B>,
-    mlp: LlamaMlp<B>,
-    input_layernorm: RmsNorm<B>,
-    post_attention_layernorm: RmsNorm<B>,
+pub struct LlamaDecoderLayer<D: Device> {
+    self_attn: LlamaAttention<D>,
+    mlp: LlamaMlp<D>,
+    input_layernorm: RmsNorm<D>,
+    post_attention_layernorm: RmsNorm<D>,
 }
 
-impl<B: Backend> LlamaForCausalLm<B> {
+impl<D: Device> LlamaForCausalLm<D> {
     pub fn load<S: AsRef<[u8]>>(
-        backend: &mut B,
+        device: &mut D,
         config: &LlamaConfig,
         weights: &Weights<S>,
         max_cache_len: usize,
     ) -> Result<Self, LlamaError> {
-        let model = LlamaModel::load(backend, config, weights, "model", max_cache_len)?;
+        let model = LlamaModel::load(device, config, weights, "model", max_cache_len)?;
         let lm_head = Linear::new(model.embed_tokens.weight().clone());
         Ok(Self {
             model,
@@ -67,17 +67,17 @@ impl<B: Backend> LlamaForCausalLm<B> {
     }
 }
 
-impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
-    type Cache = StaticCache<B>;
+impl<D: Device> CausalLm<D> for LlamaForCausalLm<D> {
+    type Cache = StaticCache<D>;
     type Error = LlamaError;
 
     fn cache(
         &self,
-        backend: &mut B,
+        device: &mut D,
         batch_size: NonZeroUsize,
     ) -> Result<Self::Cache, Self::Error> {
         StaticCache::new(
-            backend,
+            device,
             CACHE_DTYPE,
             self.config.num_hidden_layers(),
             batch_size.get(),
@@ -90,13 +90,13 @@ impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
 
     fn forward(
         &self,
-        backend: &mut B,
-        input_ids: &Tensor<B>,
-        position_ids: &Tensor<B>,
-        attention_mask: &Tensor<B>,
+        device: &mut D,
+        input_ids: &Tensor<D>,
+        position_ids: &Tensor<D>,
+        attention_mask: &Tensor<D>,
         past_key_values: &mut Self::Cache,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, Self::Error> {
+    ) -> Result<Tensor<D>, Self::Error> {
         check_forward(
             input_ids.shape().numel(),
             position_ids.shape().numel(),
@@ -108,7 +108,7 @@ impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
         let hidden_states = self
             .model
             .forward(
-                backend,
+                device,
                 input_ids,
                 position_ids,
                 attention_mask,
@@ -116,35 +116,35 @@ impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
                 past_seen_tokens,
             )
             .map_err(tensor_failed)?;
-        self.last_token_logits(backend, &hidden_states)
+        self.last_token_logits(device, &hidden_states)
             .map_err(tensor_failed)
     }
 }
 
-impl<B: Backend> Submodules<B> for LlamaForCausalLm<B> {
+impl<D: Device> Submodules<D> for LlamaForCausalLm<D> {
     type Error = LlamaError;
 
     fn forward_submodule(
         &self,
-        backend: &mut B,
+        device: &mut D,
         target: &str,
-        input: &Tensor<B>,
-    ) -> Result<Option<Tensor<B>>, Self::Error> {
+        input: &Tensor<D>,
+    ) -> Result<Option<Tensor<D>>, Self::Error> {
         let Some(target) = target.strip_prefix("model.") else {
             return Ok(None);
         };
         self.model
-            .forward_submodule(backend, target, input)
+            .forward_submodule(device, target, input)
             .map_err(tensor_failed)
     }
 }
 
-impl<B: Backend> LlamaForCausalLm<B> {
+impl<D: Device> LlamaForCausalLm<D> {
     fn last_token_logits(
         &self,
-        backend: &mut B,
-        hidden_states: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError> {
+        device: &mut D,
+        hidden_states: &Tensor<D>,
+    ) -> Result<Tensor<D>, TensorError> {
         let &[batch_size, seq_len, hidden_size] = hidden_states.shape().dims() else {
             error!(
                 message = "Model output is not [batch, seq, hidden].",
@@ -154,23 +154,23 @@ impl<B: Backend> LlamaForCausalLm<B> {
         };
         let last_hidden_state = hidden_states
             .narrow(SEQ_DIM, seq_len.saturating_sub(1), 1)?
-            .contiguous(backend)?
+            .contiguous(device)?
             .reshape(Shape::try_from([batch_size, hidden_size].as_slice())?)?;
-        self.lm_head.forward(backend, &last_hidden_state)
+        self.lm_head.forward(device, &last_hidden_state)
     }
 }
 
-impl<B: Backend> LlamaModel<B> {
+impl<D: Device> LlamaModel<D> {
     fn load<S: AsRef<[u8]>>(
-        backend: &mut B,
+        device: &mut D,
         config: &LlamaConfig,
         weights: &Weights<S>,
         prefix: &str,
         max_cache_len: usize,
     ) -> Result<Self, LlamaError> {
-        let rotary_emb = LlamaRotaryEmbedding::new(backend, config, max_cache_len)?;
+        let rotary_emb = LlamaRotaryEmbedding::new(device, config, max_cache_len)?;
         let embed_tokens = Embedding::new(load_tensor(
-            backend,
+            device,
             weights,
             &format!("{prefix}.embed_tokens.weight"),
             &[config.vocab_size(), config.hidden_size()],
@@ -178,15 +178,15 @@ impl<B: Backend> LlamaModel<B> {
         let layers = (0..config.num_hidden_layers())
             .map(|layer_idx| {
                 LlamaDecoderLayer::load(
-                    backend,
+                    device,
                     config,
                     weights,
                     &format!("{prefix}.layers.{layer_idx}"),
                     layer_idx,
                 )
             })
-            .collect::<Result<Vec<LlamaDecoderLayer<B>>, LlamaError>>()?;
-        let norm = load_rms_norm(backend, config, weights, &format!("{prefix}.norm.weight"))?;
+            .collect::<Result<Vec<LlamaDecoderLayer<D>>, LlamaError>>()?;
+        let norm = load_rms_norm(device, config, weights, &format!("{prefix}.norm.weight"))?;
         Ok(Self {
             embed_tokens,
             layers,
@@ -198,13 +198,13 @@ impl<B: Backend> LlamaModel<B> {
 
     fn forward(
         &self,
-        backend: &mut B,
-        input_ids: &Tensor<B>,
-        position_ids: &Tensor<B>,
-        attention_mask: &Tensor<B>,
-        past_key_values: &mut StaticCache<B>,
+        device: &mut D,
+        input_ids: &Tensor<D>,
+        position_ids: &Tensor<D>,
+        attention_mask: &Tensor<D>,
+        past_key_values: &mut StaticCache<D>,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, TensorError> {
+    ) -> Result<Tensor<D>, TensorError> {
         let seq_len = position_ids.shape().numel();
         let batch_size = input_ids
             .shape()
@@ -214,20 +214,20 @@ impl<B: Backend> LlamaModel<B> {
                 error!(message = "Forward input holds no position.");
                 TensorError::NumelMismatch
             })?;
-        let inputs_embeds = self.embed_tokens.forward(backend, input_ids)?;
+        let inputs_embeds = self.embed_tokens.forward(device, input_ids)?;
         let hidden_size = inputs_embeds
             .shape()
             .size(inputs_embeds.shape().last_dim()?)?;
         let inputs_embeds = inputs_embeds.reshape(Shape::try_from(
             [batch_size, seq_len, hidden_size].as_slice(),
         )?)?;
-        let [cos, sin] = self.rotary_emb.forward(backend, position_ids)?;
+        let [cos, sin] = self.rotary_emb.forward(device, position_ids)?;
         let hidden_states =
             self.layers
                 .iter()
                 .try_fold(inputs_embeds, |hidden_states, layer| {
                     layer.forward(
-                        backend,
+                        device,
                         &hidden_states,
                         [&cos, &sin],
                         attention_mask,
@@ -235,37 +235,37 @@ impl<B: Backend> LlamaModel<B> {
                         past_seen_tokens,
                     )
                 })?;
-        self.norm.forward(backend, &hidden_states)
+        self.norm.forward(device, &hidden_states)
     }
 }
 
-impl<B: Backend> LlamaModel<B> {
+impl<D: Device> LlamaModel<D> {
     fn forward_submodule(
         &self,
-        backend: &mut B,
+        device: &mut D,
         target: &str,
-        input: &Tensor<B>,
-    ) -> Result<Option<Tensor<B>>, TensorError> {
+        input: &Tensor<D>,
+    ) -> Result<Option<Tensor<D>>, TensorError> {
         if target == "embed_tokens" {
-            return self.embed(backend, input).map(Some);
+            return self.embed(device, input).map(Some);
         }
         let Some((layer_idx, target)) = layer_target(target) else {
             return Ok(None);
         };
         match self.layers.get(layer_idx) {
-            Some(layer) => layer.forward_submodule(backend, target, input),
+            Some(layer) => layer.forward_submodule(device, target, input),
             None => Ok(None),
         }
     }
 
     fn embed(
         &self,
-        backend: &mut B,
-        input_ids: &Tensor<B>,
-    ) -> Result<Tensor<B>, TensorError> {
+        device: &mut D,
+        input_ids: &Tensor<D>,
+    ) -> Result<Tensor<D>, TensorError> {
         let flat_ids =
             input_ids.reshape(Shape::try_from([input_ids.shape().numel()].as_slice())?)?;
-        let inputs_embeds = self.embed_tokens.forward(backend, &flat_ids)?;
+        let inputs_embeds = self.embed_tokens.forward(device, &flat_ids)?;
         let hidden_size = inputs_embeds
             .shape()
             .size(inputs_embeds.shape().last_dim()?)?;
@@ -280,34 +280,34 @@ impl<B: Backend> LlamaModel<B> {
     }
 }
 
-impl<B: Backend> LlamaDecoderLayer<B> {
+impl<D: Device> LlamaDecoderLayer<D> {
     fn load<S: AsRef<[u8]>>(
-        backend: &mut B,
+        device: &mut D,
         config: &LlamaConfig,
         weights: &Weights<S>,
         prefix: &str,
         layer_idx: usize,
     ) -> Result<Self, LlamaError> {
         let input_layernorm = load_rms_norm(
-            backend,
+            device,
             config,
             weights,
             &format!("{prefix}.input_layernorm.weight"),
         )?;
         let self_attn = LlamaAttention::load(
-            backend,
+            device,
             config,
             weights,
             &format!("{prefix}.self_attn"),
             layer_idx,
         )?;
         let post_attention_layernorm = load_rms_norm(
-            backend,
+            device,
             config,
             weights,
             &format!("{prefix}.post_attention_layernorm.weight"),
         )?;
-        let mlp = LlamaMlp::load(backend, config, weights, &format!("{prefix}.mlp"))?;
+        let mlp = LlamaMlp::load(device, config, weights, &format!("{prefix}.mlp"))?;
         Ok(Self {
             self_attn,
             mlp,
@@ -318,47 +318,47 @@ impl<B: Backend> LlamaDecoderLayer<B> {
 
     fn forward(
         &self,
-        backend: &mut B,
-        hidden_states: &Tensor<B>,
-        position_embeddings: [&Tensor<B>; 2],
-        attention_mask: &Tensor<B>,
-        past_key_values: &mut StaticCache<B>,
+        device: &mut D,
+        hidden_states: &Tensor<D>,
+        position_embeddings: [&Tensor<D>; 2],
+        attention_mask: &Tensor<D>,
+        past_key_values: &mut StaticCache<D>,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, TensorError> {
-        let normed = self.input_layernorm.forward(backend, hidden_states)?;
+    ) -> Result<Tensor<D>, TensorError> {
+        let normed = self.input_layernorm.forward(device, hidden_states)?;
         let attn_output = self.self_attn.forward(
-            backend,
+            device,
             &normed,
             position_embeddings,
             attention_mask,
             past_key_values,
             past_seen_tokens,
         )?;
-        let hidden_states = hidden_states.add(backend, &attn_output)?;
+        let hidden_states = hidden_states.add(device, &attn_output)?;
         let normed = self
             .post_attention_layernorm
-            .forward(backend, &hidden_states)?;
-        let mlp_output = self.mlp.forward(backend, &normed)?;
-        hidden_states.add(backend, &mlp_output)
+            .forward(device, &hidden_states)?;
+        let mlp_output = self.mlp.forward(device, &normed)?;
+        hidden_states.add(device, &mlp_output)
     }
 }
 
-impl<B: Backend> LlamaDecoderLayer<B> {
+impl<D: Device> LlamaDecoderLayer<D> {
     fn forward_submodule(
         &self,
-        backend: &mut B,
+        device: &mut D,
         target: &str,
-        input: &Tensor<B>,
-    ) -> Result<Option<Tensor<B>>, TensorError> {
+        input: &Tensor<D>,
+    ) -> Result<Option<Tensor<D>>, TensorError> {
         match target {
-            "input_layernorm" => self.input_layernorm.forward(backend, input).map(Some),
+            "input_layernorm" => self.input_layernorm.forward(device, input).map(Some),
             "post_attention_layernorm" => self
                 .post_attention_layernorm
-                .forward(backend, input)
+                .forward(device, input)
                 .map(Some),
-            "mlp" => self.mlp.forward(backend, input).map(Some),
+            "mlp" => self.mlp.forward(device, input).map(Some),
             _ => match target.strip_prefix("self_attn.") {
-                Some(target) => self.self_attn.forward_submodule(backend, target, input),
+                Some(target) => self.self_attn.forward_submodule(device, target, input),
                 None => Ok(None),
             },
         }
@@ -370,14 +370,14 @@ fn layer_target(target: &str) -> Option<(usize, &str)> {
     Some((layer_idx.parse().ok()?, target))
 }
 
-fn load_rms_norm<B: Backend, S: AsRef<[u8]>>(
-    backend: &mut B,
+fn load_rms_norm<D: Device, S: AsRef<[u8]>>(
+    device: &mut D,
     config: &LlamaConfig,
     weights: &Weights<S>,
     name: &str,
-) -> Result<RmsNorm<B>, LlamaError> {
-    let weight = load_tensor(backend, weights, name, &[config.hidden_size()])?;
-    RmsNorm::new(backend, weight, config.rms_norm_eps()).map_err(tensor_failed)
+) -> Result<RmsNorm<D>, LlamaError> {
+    let weight = load_tensor(device, weights, name, &[config.hidden_size()])?;
+    RmsNorm::new(device, weight, config.rms_norm_eps()).map_err(tensor_failed)
 }
 
 fn check_forward(

@@ -11,8 +11,8 @@ use crate::nn::primitive::{
     output,
 };
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Layout,
     Shape,
     TensorError,
@@ -46,19 +46,19 @@ impl<'layout, S> Operand<'layout, S> {
     pub fn dtype(&self) -> DType { self.dtype }
 }
 
-pub struct Tensor<B: Backend> {
-    storage: Rc<B::Storage>,
+pub struct Tensor<D: Device> {
+    storage: Rc<D::Storage>,
     layout: Layout,
     dtype: DType,
 }
 
-impl<B: Backend> Clone for Tensor<B> {
+impl<D: Device> Clone for Tensor<D> {
     fn clone(&self) -> Self { self.view(self.layout) }
 }
 
-impl<B: Backend> Tensor<B> {
+impl<D: Device> Tensor<D> {
     pub fn from_bytes(
-        backend: &mut B,
+        device: &mut D,
         bytes: &[u8],
         dtype: DType,
         shape: Shape,
@@ -74,34 +74,34 @@ impl<B: Backend> Tensor<B> {
             );
             return Err(TensorError::ByteLengthMismatch);
         }
-        let storage = backend
+        let storage = device
             .storage_from_bytes(bytes)
-            .map_err(backend_failed("from_bytes"))?;
+            .map_err(device_failed("from_bytes"))?;
         Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn zeros(
-        backend: &mut B,
+        device: &mut D,
         dtype: DType,
         shape: Shape,
     ) -> Result<Self, TensorError> {
-        let storage = backend
+        let storage = device
             .zeros(shape.nbytes(dtype))
-            .map_err(backend_failed("zeros"))?;
+            .map_err(device_failed("zeros"))?;
         Ok(Self::from_storage(storage, dtype, shape))
     }
 
     pub fn to_bytes(
         &self,
-        backend: &mut B,
+        device: &mut D,
     ) -> Result<Vec<u8>, TensorError> {
         if !self.layout.is_contiguous() {
             error!(message = "Reading bytes requires a contiguous layout.", layout = ?self.layout);
             return Err(TensorError::ToBytesNonContiguous);
         }
-        backend
+        device
             .storage_to_bytes(&self.operand())
-            .map_err(backend_failed("to_bytes"))
+            .map_err(device_failed("to_bytes"))
     }
 
     pub fn dtype(&self) -> DType { self.dtype }
@@ -142,72 +142,72 @@ impl<B: Backend> Tensor<B> {
 
     pub fn neg(
         &self,
-        backend: &mut B,
+        device: &mut D,
     ) -> Result<Self, TensorError> {
-        Self::apply(backend, Op::Unary(UnaryOp::Neg), [self])
+        Self::apply(device, Op::Unary(UnaryOp::Neg), [self])
     }
 
     pub fn exp(
         &self,
-        backend: &mut B,
+        device: &mut D,
     ) -> Result<Self, TensorError> {
-        Self::apply(backend, Op::Unary(UnaryOp::Exp), [self])
+        Self::apply(device, Op::Unary(UnaryOp::Exp), [self])
     }
 
     pub fn sqrt(
         &self,
-        backend: &mut B,
+        device: &mut D,
     ) -> Result<Self, TensorError> {
-        Self::apply(backend, Op::Unary(UnaryOp::Sqrt), [self])
+        Self::apply(device, Op::Unary(UnaryOp::Sqrt), [self])
     }
 
     pub fn reciprocal(
         &self,
-        backend: &mut B,
+        device: &mut D,
     ) -> Result<Self, TensorError> {
-        Self::apply(backend, Op::Unary(UnaryOp::Reciprocal), [self])
+        Self::apply(device, Op::Unary(UnaryOp::Reciprocal), [self])
     }
 
     pub fn add(
         &self,
-        backend: &mut B,
+        device: &mut D,
         rhs: &Self,
     ) -> Result<Self, TensorError> {
-        self.binary(backend, BinaryOp::Add, rhs)
+        self.binary(device, BinaryOp::Add, rhs)
     }
 
     pub fn sub(
         &self,
-        backend: &mut B,
+        device: &mut D,
         rhs: &Self,
     ) -> Result<Self, TensorError> {
-        self.binary(backend, BinaryOp::Sub, rhs)
+        self.binary(device, BinaryOp::Sub, rhs)
     }
 
     pub fn mul(
         &self,
-        backend: &mut B,
+        device: &mut D,
         rhs: &Self,
     ) -> Result<Self, TensorError> {
-        self.binary(backend, BinaryOp::Mul, rhs)
+        self.binary(device, BinaryOp::Mul, rhs)
     }
 
     pub fn div(
         &self,
-        backend: &mut B,
+        device: &mut D,
         rhs: &Self,
     ) -> Result<Self, TensorError> {
-        self.binary(backend, BinaryOp::Div, rhs)
+        self.binary(device, BinaryOp::Div, rhs)
     }
 
     pub fn sum_keepdim(
         &self,
-        backend: &mut B,
+        device: &mut D,
         dim: usize,
     ) -> Result<Self, TensorError> {
         let op = ReduceOp::Sum;
         Self::apply(
-            backend,
+            device,
             Op::Reduce {
                 op,
                 dim,
@@ -218,12 +218,12 @@ impl<B: Backend> Tensor<B> {
 
     pub fn amax_keepdim(
         &self,
-        backend: &mut B,
+        device: &mut D,
         dim: usize,
     ) -> Result<Self, TensorError> {
         let op = ReduceOp::Amax;
         Self::apply(
-            backend,
+            device,
             Op::Reduce {
                 op,
                 dim,
@@ -234,12 +234,12 @@ impl<B: Backend> Tensor<B> {
 
     pub fn argmax_keepdim(
         &self,
-        backend: &mut B,
+        device: &mut D,
         dim: usize,
     ) -> Result<Self, TensorError> {
         let op = ReduceOp::Argmax;
         Self::apply(
-            backend,
+            device,
             Op::Reduce {
                 op,
                 dim,
@@ -250,38 +250,38 @@ impl<B: Backend> Tensor<B> {
 
     pub fn matmul(
         &self,
-        backend: &mut B,
+        device: &mut D,
         rhs: &Self,
     ) -> Result<Self, TensorError> {
-        Self::apply(backend, Op::Matmul, [self, rhs])
+        Self::apply(device, Op::Matmul, [self, rhs])
     }
 
     pub fn contiguous(
         &self,
-        backend: &mut B,
+        device: &mut D,
     ) -> Result<Self, TensorError> {
         if self.layout.is_contiguous() {
             return Ok(self.view(self.layout));
         }
-        Self::apply(backend, Op::Copy, [self])
+        Self::apply(device, Op::Copy, [self])
     }
 
     pub fn to_dtype(
         &self,
-        backend: &mut B,
+        device: &mut D,
         dtype: DType,
     ) -> Result<Self, TensorError> {
-        Self::apply(backend, Op::ToDtype(dtype), [self])
+        Self::apply(device, Op::ToDtype(dtype), [self])
     }
 
     pub fn index_select(
         &self,
-        backend: &mut B,
+        device: &mut D,
         dim: usize,
         indices: &Self,
     ) -> Result<Self, TensorError> {
         Self::apply(
-            backend,
+            device,
             Op::IndexSelect {
                 dim,
             },
@@ -290,12 +290,12 @@ impl<B: Backend> Tensor<B> {
     }
 
     pub fn cat(
-        backend: &mut B,
+        device: &mut D,
         tensors: [&Self; 2],
         dim: usize,
     ) -> Result<Self, TensorError> {
         Self::apply(
-            backend,
+            device,
             Op::Cat {
                 dim,
             },
@@ -305,7 +305,7 @@ impl<B: Backend> Tensor<B> {
 
     pub fn slice_scatter(
         &mut self,
-        backend: &mut B,
+        device: &mut D,
         src: &Self,
         dim: usize,
         start: usize,
@@ -329,43 +329,43 @@ impl<B: Backend> Tensor<B> {
             error!(message = "Slice scatter target shares its storage with another tensor.");
             TensorError::SharedStorage
         })?;
-        backend
+        device
             .run_in_place(
                 op,
                 Operand::new(storage, &self.layout, self.dtype),
                 &[src.operand()],
             )
-            .map_err(backend_failed(op.name()))
+            .map_err(device_failed(op.name()))
     }
 
     fn binary(
         &self,
-        backend: &mut B,
+        device: &mut D,
         op: BinaryOp,
         rhs: &Self,
     ) -> Result<Self, TensorError> {
         let shape = Shape::broadcast(self.shape(), rhs.shape())?;
         Self::apply(
-            backend,
+            device,
             Op::Binary(op),
             [&self.expand(shape)?, &rhs.expand(shape)?],
         )
     }
 
     fn apply<const N: usize>(
-        backend: &mut B,
+        device: &mut D,
         op: Op,
         inputs: [&Self; N],
     ) -> Result<Self, TensorError> {
         let (shape, dtype) = output(op, &inputs.map(|input| (input.dtype, *input.shape())))?;
-        let storage = backend
+        let storage = device
             .run(op, &inputs.map(Self::operand), &shape, dtype)
-            .map_err(backend_failed(op.name()))?;
+            .map_err(device_failed(op.name()))?;
         Ok(Self::from_storage(storage, dtype, shape))
     }
 
     fn from_storage(
-        storage: B::Storage,
+        storage: D::Storage,
         dtype: DType,
         shape: Shape,
     ) -> Self {
@@ -387,15 +387,15 @@ impl<B: Backend> Tensor<B> {
         }
     }
 
-    fn operand(&self) -> Operand<'_, &B::Storage> {
+    fn operand(&self) -> Operand<'_, &D::Storage> {
         Operand::new(&self.storage, &self.layout, self.dtype)
     }
 }
 
-fn backend_failed<E: Error>(operation: &'static str) -> impl FnOnce(E) -> TensorError {
+fn device_failed<E: Error>(operation: &'static str) -> impl FnOnce(E) -> TensorError {
     move |error| {
-        error!(message = "Backend operation failed.", operation, %error);
-        TensorError::Backend
+        error!(message = "Device operation failed.", operation, %error);
+        TensorError::Device
     }
 }
 
@@ -404,14 +404,14 @@ mod tests {
     use std::fmt;
 
     use crate::nn::TensorError;
-    use crate::nn::tensor::backend_failed;
+    use crate::nn::tensor::device_failed;
 
     #[test]
-    fn backend_failure_becomes_the_backend_variant() {
+    fn device_failure_becomes_the_device_variant() {
         assert_eq!(
-            backend_failed("matmul")(fmt::Error),
-            TensorError::Backend,
-            "the backend cause is logged, not returned"
+            device_failed("matmul")(fmt::Error),
+            TensorError::Device,
+            "the device cause is logged, not returned"
         );
     }
 }

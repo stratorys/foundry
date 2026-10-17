@@ -8,8 +8,8 @@ use crate::models::llama::{
     LlamaError,
 };
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Linear,
     Shape,
     StaticCache,
@@ -22,21 +22,21 @@ use crate::weights::Weights;
 
 const HEAD_MAJOR: [usize; 4] = [0, 2, 1, 3];
 
-pub struct LlamaAttention<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    o_proj: Linear<B>,
+pub struct LlamaAttention<D: Device> {
+    q_proj: Linear<D>,
+    k_proj: Linear<D>,
+    v_proj: Linear<D>,
+    o_proj: Linear<D>,
     num_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
-    scaling: Tensor<B>,
+    scaling: Tensor<D>,
     layer_idx: usize,
 }
 
-impl<B: Backend> LlamaAttention<B> {
+impl<D: Device> LlamaAttention<D> {
     pub fn load<S: AsRef<[u8]>>(
-        backend: &mut B,
+        device: &mut D,
         config: &LlamaConfig,
         weights: &Weights<S>,
         prefix: &str,
@@ -53,14 +53,13 @@ impl<B: Backend> LlamaAttention<B> {
             LlamaError::KvDimOverflow
         })?;
         let mut linear = |name: &str, dims: [usize; 2]| {
-            load_tensor(backend, weights, &format!("{prefix}.{name}.weight"), &dims)
-                .map(Linear::new)
+            load_tensor(device, weights, &format!("{prefix}.{name}.weight"), &dims).map(Linear::new)
         };
         let q_proj = linear("q_proj", [hidden_size, hidden_size])?;
         let k_proj = linear("k_proj", [kv_dim, hidden_size])?;
         let v_proj = linear("v_proj", [kv_dim, hidden_size])?;
         let o_proj = linear("o_proj", [hidden_size, hidden_size])?;
-        let scaling = scaling(backend, head_dim).map_err(tensor_failed)?;
+        let scaling = scaling(device, head_dim).map_err(tensor_failed)?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -76,13 +75,13 @@ impl<B: Backend> LlamaAttention<B> {
 
     pub fn forward(
         &self,
-        backend: &mut B,
-        hidden_states: &Tensor<B>,
-        [cos, sin]: [&Tensor<B>; 2],
-        attention_mask: &Tensor<B>,
-        past_key_values: &mut StaticCache<B>,
+        device: &mut D,
+        hidden_states: &Tensor<D>,
+        [cos, sin]: [&Tensor<D>; 2],
+        attention_mask: &Tensor<D>,
+        past_key_values: &mut StaticCache<D>,
         past_seen_tokens: usize,
-    ) -> Result<Tensor<B>, TensorError> {
+    ) -> Result<Tensor<D>, TensorError> {
         let &[batch_size, seq_len, _] = hidden_states.shape().dims() else {
             error!(
                 message = "Attention input is not [batch, seq, hidden].",
@@ -97,28 +96,28 @@ impl<B: Backend> LlamaAttention<B> {
         )?;
         let query_states = self
             .q_proj
-            .forward(backend, hidden_states)?
+            .forward(device, hidden_states)?
             .reshape(query_shape)?;
         let key_states = self
             .k_proj
-            .forward(backend, hidden_states)?
+            .forward(device, hidden_states)?
             .reshape(kv_shape)?;
         let value_states = self
             .v_proj
-            .forward(backend, hidden_states)?
+            .forward(device, hidden_states)?
             .reshape(kv_shape)?
             .permute(&HEAD_MAJOR)?;
         let [query_states, key_states] =
-            apply_rotary_pos_emb(backend, &query_states, &key_states, cos, sin)?;
+            apply_rotary_pos_emb(device, &query_states, &key_states, cos, sin)?;
         let [keys, values] = past_key_values.update(
-            backend,
+            device,
             &key_states.permute(&HEAD_MAJOR)?,
             &value_states,
             self.layer_idx,
             past_seen_tokens,
         )?;
         let attn_output = scaled_dot_product_attention(
-            backend,
+            device,
             &query_states.permute(&HEAD_MAJOR)?,
             &keys,
             &values,
@@ -126,7 +125,7 @@ impl<B: Backend> LlamaAttention<B> {
             &self.scaling,
         )?
         .permute(&HEAD_MAJOR)?
-        .contiguous(backend)?
+        .contiguous(device)?
         .reshape(Shape::try_from(
             [
                 batch_size,
@@ -135,15 +134,15 @@ impl<B: Backend> LlamaAttention<B> {
             ]
             .as_slice(),
         )?)?;
-        self.o_proj.forward(backend, &attn_output)
+        self.o_proj.forward(device, &attn_output)
     }
 
     pub fn forward_submodule(
         &self,
-        backend: &mut B,
+        device: &mut D,
         target: &str,
-        input: &Tensor<B>,
-    ) -> Result<Option<Tensor<B>>, TensorError> {
+        input: &Tensor<D>,
+    ) -> Result<Option<Tensor<D>>, TensorError> {
         let proj = match target {
             "q_proj" => &self.q_proj,
             "k_proj" => &self.k_proj,
@@ -151,16 +150,16 @@ impl<B: Backend> LlamaAttention<B> {
             "o_proj" => &self.o_proj,
             _ => return Ok(None),
         };
-        proj.forward(backend, input).map(Some)
+        proj.forward(device, input).map(Some)
     }
 }
 
-fn scaling<B: Backend>(
-    backend: &mut B,
+fn scaling<D: Device>(
+    device: &mut D,
     head_dim: usize,
-) -> Result<Tensor<B>, TensorError> {
+) -> Result<Tensor<D>, TensorError> {
     Tensor::from_bytes(
-        backend,
+        device,
         &exact_f32(head_dim)?.sqrt().recip().to_le_bytes(),
         DType::F32,
         Shape::try_from([1].as_slice())?,

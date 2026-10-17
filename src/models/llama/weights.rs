@@ -3,8 +3,8 @@ use tracing::error;
 use crate::models::llama::LlamaError;
 use crate::models::llama::error::tensor_failed;
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Tensor,
 };
 use crate::weights::{
@@ -14,14 +14,14 @@ use crate::weights::{
 
 const DTYPE: DType = DType::BF16;
 
-pub fn load_tensor<B: Backend, S: AsRef<[u8]>>(
-    backend: &mut B,
+pub fn load_tensor<D: Device, S: AsRef<[u8]>>(
+    device: &mut D,
     weights: &Weights<S>,
     name: &str,
     dims_expected: &[usize],
-) -> Result<Tensor<B>, LlamaError> {
+) -> Result<Tensor<D>, LlamaError> {
     let view = checked_view(weights.tensor(name), name, dims_expected)?;
-    Tensor::from_bytes(backend, view.bytes, view.dtype, view.shape).map_err(tensor_failed)
+    Tensor::from_bytes(device, view.bytes, view.dtype, view.shape).map_err(tensor_failed)
 }
 
 fn checked_view<'weights>(

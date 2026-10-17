@@ -42,7 +42,7 @@ pub enum MetalError {
     #[error("Metal command buffer failed.")]
     CommandBufferFailed,
 
-    #[error("Storage was produced by another Metal backend instance.")]
+    #[error("Storage was produced by another Metal device instance.")]
     ForeignStorage,
 
     #[error("Reading bytes exceeds the buffer length.")]

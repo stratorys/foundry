@@ -1,8 +1,8 @@
 use tracing::error;
 
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Shape,
     Tensor,
     TensorError,
@@ -10,13 +10,13 @@ use crate::nn::{
 
 const SEQ_DIM: usize = 2;
 
-pub struct StaticCache<B: Backend> {
-    layers: Vec<(Tensor<B>, Tensor<B>)>,
+pub struct StaticCache<D: Device> {
+    layers: Vec<(Tensor<D>, Tensor<D>)>,
 }
 
-impl<B: Backend> StaticCache<B> {
+impl<D: Device> StaticCache<D> {
     pub fn new(
-        backend: &mut B,
+        device: &mut D,
         dtype: DType,
         num_layers: usize,
         batch_size: usize,
@@ -29,11 +29,11 @@ impl<B: Backend> StaticCache<B> {
         let layers = (0..num_layers)
             .map(|_| {
                 Ok((
-                    Tensor::zeros(backend, dtype, shape)?,
-                    Tensor::zeros(backend, dtype, shape)?,
+                    Tensor::zeros(device, dtype, shape)?,
+                    Tensor::zeros(device, dtype, shape)?,
                 ))
             })
-            .collect::<Result<Vec<(Tensor<B>, Tensor<B>)>, TensorError>>()?;
+            .collect::<Result<Vec<(Tensor<D>, Tensor<D>)>, TensorError>>()?;
         Ok(Self {
             layers,
         })
@@ -41,12 +41,12 @@ impl<B: Backend> StaticCache<B> {
 
     pub fn update(
         &mut self,
-        backend: &mut B,
-        key_states: &Tensor<B>,
-        value_states: &Tensor<B>,
+        device: &mut D,
+        key_states: &Tensor<D>,
+        value_states: &Tensor<D>,
         layer_idx: usize,
         past_seen_tokens: usize,
-    ) -> Result<[Tensor<B>; 2], TensorError> {
+    ) -> Result<[Tensor<D>; 2], TensorError> {
         if key_states.shape() != value_states.shape() {
             error!(
                 message = "Keys and values do not have the same shape.",
@@ -71,8 +71,8 @@ impl<B: Backend> StaticCache<B> {
             );
             return Err(TensorError::CacheLayerOutOfRange);
         };
-        keys.slice_scatter(backend, key_states, SEQ_DIM, past_seen_tokens)?;
-        values.slice_scatter(backend, value_states, SEQ_DIM, past_seen_tokens)?;
+        keys.slice_scatter(device, key_states, SEQ_DIM, past_seen_tokens)?;
+        values.slice_scatter(device, value_states, SEQ_DIM, past_seen_tokens)?;
         let kv_length = past_seen_tokens
             .checked_add(key_states.shape().size(SEQ_DIM)?)
             .ok_or_else(|| {

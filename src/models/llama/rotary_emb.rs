@@ -10,8 +10,8 @@ use crate::models::llama::{
     LlamaError,
 };
 use crate::nn::{
-    Backend,
     DType,
+    Device,
     Shape,
     Tensor,
     TensorError,
@@ -20,15 +20,15 @@ use crate::nn::{
 
 const MAX_POSITION_COUNT: usize = 1 << f32::MANTISSA_DIGITS;
 
-pub struct LlamaRotaryEmbedding<B: Backend> {
-    cos_cached: Tensor<B>,
-    sin_cached: Tensor<B>,
+pub struct LlamaRotaryEmbedding<D: Device> {
+    cos_cached: Tensor<D>,
+    sin_cached: Tensor<D>,
     head_dim: usize,
 }
 
-impl<B: Backend> LlamaRotaryEmbedding<B> {
+impl<D: Device> LlamaRotaryEmbedding<D> {
     pub fn new(
-        backend: &mut B,
+        device: &mut D,
         config: &LlamaConfig,
         max_cache_len: usize,
     ) -> Result<Self, LlamaError> {
@@ -39,7 +39,7 @@ impl<B: Backend> LlamaRotaryEmbedding<B> {
             config.max_position_embeddings().min(MAX_POSITION_COUNT),
         )?;
         let [cos_cached, sin_cached] =
-            cached_tables(backend, &angles, max_cache_len, head_dim).map_err(tensor_failed)?;
+            cached_tables(device, &angles, max_cache_len, head_dim).map_err(tensor_failed)?;
         Ok(Self {
             cos_cached,
             sin_cached,
@@ -49,52 +49,52 @@ impl<B: Backend> LlamaRotaryEmbedding<B> {
 
     pub fn forward(
         &self,
-        backend: &mut B,
-        position_ids: &Tensor<B>,
-    ) -> Result<[Tensor<B>; 2], TensorError> {
+        device: &mut D,
+        position_ids: &Tensor<D>,
+    ) -> Result<[Tensor<D>; 2], TensorError> {
         let shape = Shape::try_from([position_ids.shape().numel(), 1, self.head_dim].as_slice())?;
         let [cos, sin] = [&self.cos_cached, &self.sin_cached]
-            .map(|table| table.index_select(backend, 0, position_ids)?.reshape(shape));
+            .map(|table| table.index_select(device, 0, position_ids)?.reshape(shape));
         Ok([cos?, sin?])
     }
 }
 
-pub fn apply_rotary_pos_emb<B: Backend>(
-    backend: &mut B,
-    q: &Tensor<B>,
-    k: &Tensor<B>,
-    cos: &Tensor<B>,
-    sin: &Tensor<B>,
-) -> Result<[Tensor<B>; 2], TensorError> {
+pub fn apply_rotary_pos_emb<D: Device>(
+    device: &mut D,
+    q: &Tensor<D>,
+    k: &Tensor<D>,
+    cos: &Tensor<D>,
+    sin: &Tensor<D>,
+) -> Result<[Tensor<D>; 2], TensorError> {
     let [q_embed, k_embed] = [q, k].map(|x| {
-        let rotated = rotate_half(backend, x)?.mul(backend, sin)?;
-        x.mul(backend, cos)?.add(backend, &rotated)
+        let rotated = rotate_half(device, x)?.mul(device, sin)?;
+        x.mul(device, cos)?.add(device, &rotated)
     });
     Ok([q_embed?, k_embed?])
 }
 
-fn rotate_half<B: Backend>(
-    backend: &mut B,
-    x: &Tensor<B>,
-) -> Result<Tensor<B>, TensorError> {
+fn rotate_half<D: Device>(
+    device: &mut D,
+    x: &Tensor<D>,
+) -> Result<Tensor<D>, TensorError> {
     let last_dim = x.shape().last_dim()?;
     let half_dim = x.shape().size(last_dim)? / 2;
-    let neg_x2 = x.narrow(last_dim, half_dim, half_dim)?.neg(backend)?;
+    let neg_x2 = x.narrow(last_dim, half_dim, half_dim)?.neg(device)?;
     let x1 = x.narrow(last_dim, 0, half_dim)?;
-    Tensor::cat(backend, [&neg_x2, &x1], last_dim)
+    Tensor::cat(device, [&neg_x2, &x1], last_dim)
 }
 
-fn cached_tables<B: Backend>(
-    backend: &mut B,
+fn cached_tables<D: Device>(
+    device: &mut D,
     angles: &[f32],
     max_cache_len: usize,
     head_dim: usize,
-) -> Result<[Tensor<B>; 2], TensorError> {
+) -> Result<[Tensor<D>; 2], TensorError> {
     let shape = Shape::try_from([max_cache_len, head_dim].as_slice())?;
     let functions: [fn(f32) -> f32; 2] = [f32::cos, f32::sin];
     let [cos, sin] = functions.map(|function| {
         Tensor::from_bytes(
-            backend,
+            device,
             &angles
                 .iter()
                 .flat_map(|&angle| function(angle).to_le_bytes())
@@ -102,7 +102,7 @@ fn cached_tables<B: Backend>(
             DType::F32,
             shape,
         )?
-        .to_dtype(backend, DType::BF16)
+        .to_dtype(device, DType::BF16)
     });
     Ok([cos?, sin?])
 }

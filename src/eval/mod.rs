@@ -18,22 +18,22 @@ pub use self::fixtures::{
     read_activations,
 };
 use crate::nn::{
-    Backend,
+    Device,
     Tensor,
 };
 use crate::weights::Weights;
 
 const RTOL: f32 = 1e-2;
 
-pub trait Submodules<B: Backend> {
+pub trait Submodules<D: Device> {
     type Error: std::error::Error;
 
     fn forward_submodule(
         &self,
-        backend: &mut B,
+        device: &mut D,
         target: &str,
-        input: &Tensor<B>,
-    ) -> Result<Option<Tensor<B>>, Self::Error>;
+        input: &Tensor<D>,
+    ) -> Result<Option<Tensor<D>>, Self::Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -63,19 +63,19 @@ impl LayerOutcome {
     pub fn is_failure(&self) -> bool { matches!(self, Self::Failed(_) | Self::Mismatch { .. }) }
 }
 
-pub fn eval_layers<B: Backend, M: Submodules<B>, S: AsRef<[u8]>>(
-    backend: &mut B,
+pub fn eval_layers<D: Device, M: Submodules<D>, S: AsRef<[u8]>>(
+    device: &mut D,
     model: &M,
     weights: &Weights<S>,
 ) -> Result<Vec<LayerReport>, EvalError> {
     activations(weights)?
         .iter()
-        .map(|activation| eval_layer(backend, model, activation))
+        .map(|activation| eval_layer(device, model, activation))
         .collect()
 }
 
-fn eval_layer<B: Backend, M: Submodules<B>>(
-    backend: &mut B,
+fn eval_layer<D: Device, M: Submodules<D>>(
+    device: &mut D,
     model: &M,
     activation: &Activation<'_>,
 ) -> Result<LayerReport, EvalError> {
@@ -85,12 +85,12 @@ fn eval_layer<B: Backend, M: Submodules<B>>(
         output: expected,
     } = *activation;
     let input =
-        Tensor::from_bytes(backend, input.bytes, input.dtype, input.shape).map_err(|error| {
+        Tensor::from_bytes(device, input.bytes, input.dtype, input.shape).map_err(|error| {
             error!(message = "Creating a submodule input tensor failed.", name, %error);
             EvalError::Input
         })?;
     let actual = model
-        .forward_submodule(backend, name, &input)
+        .forward_submodule(device, name, &input)
         .map_err(|error| {
             error!(message = "Submodule forward failed.", name, %error);
             EvalError::Forward
@@ -112,8 +112,8 @@ fn eval_layer<B: Backend, M: Submodules<B>>(
         }));
     }
     let actual_bytes = actual
-        .contiguous(backend)
-        .and_then(|actual| actual.to_bytes(backend))
+        .contiguous(device)
+        .and_then(|actual| actual.to_bytes(device))
         .map_err(|error| {
             error!(message = "Reading a submodule output failed.", name, %error);
             EvalError::Output

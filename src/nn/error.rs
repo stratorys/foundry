@@ -81,6 +81,6 @@ pub enum TensorError {
     #[error("Operand count does not match the operation.")]
     OperandCount,
 
-    #[error("Backend operation failed.")]
-    Backend,
+    #[error("Device operation failed.")]
+    Device,
 }

@@ -33,7 +33,7 @@ pub use self::memory::{
     AllocatedMemorySource,
 };
 pub use self::norm::RmsNorm;
-pub use self::primitive::Backend;
+pub use self::primitive::Device;
 pub use self::shape::{
     MAX_RANK,
     Shape,

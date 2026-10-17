@@ -13,7 +13,7 @@ use objc2_metal::{
 };
 use tracing::error;
 
-use crate::backend::metal::{
+use crate::metal::{
     Buffer,
     CommandBuffer,
     ComputeEncoder,
