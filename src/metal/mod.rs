@@ -144,17 +144,6 @@ struct MatmulGeometry {
     rhs: MatrixLayout,
 }
 
-struct StrideFold {
-    strides: Vec<usize>,
-    stride_next: usize,
-}
-
-struct MatmulInput<'buffer> {
-    view: BufferView<'buffer>,
-    layout: MatrixLayout,
-    copy: Option<MetalStorage>,
-}
-
 #[repr(C)]
 struct IndexSelectArgs {
     count: u32,
@@ -345,34 +334,6 @@ impl ReduceArgs {
 }
 
 impl MatrixLayout {
-    fn contiguous(
-        batch: &Shape,
-        rows: usize,
-        cols: usize,
-    ) -> Self {
-        let matrix_len = rows.saturating_mul(cols);
-        let batch_strides_reversed = batch.dims().iter().rev().fold(
-            StrideFold {
-                strides: Vec::with_capacity(MAX_RANK),
-                stride_next: matrix_len,
-            },
-            |mut fold, &dim| {
-                fold.strides.push(fold.stride_next);
-                StrideFold {
-                    stride_next: fold.stride_next.saturating_mul(dim),
-                    strides: fold.strides,
-                }
-            },
-        );
-        let batch_strides: Vec<usize> = batch_strides_reversed.strides.into_iter().rev().collect();
-        Self {
-            offset: 0,
-            row_stride: cols,
-            col_stride: 1,
-            batch_strides: padded(&batch_strides),
-        }
-    }
-
     fn of(layout: &Layout) -> Option<Self> {
         let (batch_strides, [row_stride, col_stride]) = layout.strides().split_last_chunk::<2>()?;
         Some(Self {
@@ -414,11 +375,7 @@ impl MatmulOperand {
 }
 
 impl MatmulDispatch {
-    fn new(
-        geometry: &MatmulGeometry,
-        lhs: &MatrixLayout,
-        rhs: &MatrixLayout,
-    ) -> Result<Self, MetalError> {
+    fn new(geometry: &MatmulGeometry) -> Result<Self, MetalError> {
         let batch_dims = geometry.batch.dims();
         let args = MatmulArgs {
             m: index_u32(geometry.m)?,
@@ -426,8 +383,8 @@ impl MatmulDispatch {
             k: index_u32(geometry.k)?,
             batch_ndim: index_u32(batch_dims.len())?,
             batch_dims: padded_u32(batch_dims)?,
-            lhs: MatmulOperand::new(lhs)?,
-            rhs: MatmulOperand::new(rhs)?,
+            lhs: MatmulOperand::new(&geometry.lhs)?,
+            rhs: MatmulOperand::new(&geometry.rhs)?,
         };
         let grid = MTLSize {
             width: geometry.n.div_ceil(MATMUL_TILE),
@@ -659,27 +616,17 @@ impl MetalDevice {
         Ok(output)
     }
 
-    fn matmul_operand<'buffer>(
+    fn matmul_operand(
         &mut self,
-        operand: BufferView<'buffer>,
+        operand: &BufferView<'_>,
         matrix: &MatrixLayout,
-        batch: &Shape,
         [rows, cols]: [usize; 2],
         dtype: DType,
-    ) -> Result<MatmulInput<'buffer>, MetalError> {
+    ) -> Result<Option<MetalStorage>, MetalError> {
         if is_matmul_ready(matrix, rows, cols) {
-            return Ok(MatmulInput {
-                view: operand,
-                layout: *matrix,
-                copy: None,
-            });
+            return Ok(None);
         }
-        let storage = self.copy_view(&operand, dtype)?;
-        Ok(MatmulInput {
-            view: operand,
-            layout: MatrixLayout::contiguous(batch, rows, cols),
-            copy: Some(storage),
-        })
+        self.copy_view(operand, dtype).map(Some)
     }
 
     fn unary(
@@ -768,25 +715,23 @@ impl MetalDevice {
         if output_shape.numel() == 0 {
             return Ok(output);
         }
-        let lhs_input = self.matmul_operand(
-            lhs,
-            &geometry.lhs,
-            &geometry.batch,
-            [geometry.m, geometry.k],
-            dtype,
-        )?;
-        let rhs_input = self.matmul_operand(
-            rhs,
-            &geometry.rhs,
-            &geometry.batch,
-            [geometry.k, geometry.n],
-            dtype,
-        )?;
-        let lhs_layout = Layout::contiguous(*lhs_input.view.layout.shape());
-        let rhs_layout = Layout::contiguous(*rhs_input.view.layout.shape());
-        let dispatch = MatmulDispatch::new(&geometry, &lhs_input.layout, &rhs_input.layout)?;
-        let lhs = copied_view(lhs_input.view, lhs_input.copy.as_ref(), &lhs_layout);
-        let rhs = copied_view(rhs_input.view, rhs_input.copy.as_ref(), &rhs_layout);
+        let lhs_copy = self.matmul_operand(&lhs, &geometry.lhs, [geometry.m, geometry.k], dtype)?;
+        let rhs_copy = self.matmul_operand(&rhs, &geometry.rhs, [geometry.k, geometry.n], dtype)?;
+        let lhs_layout = Layout::contiguous(*lhs.layout.shape());
+        let rhs_layout = Layout::contiguous(*rhs.layout.shape());
+        let lhs = lhs_copy.as_ref().map_or(lhs, |storage| BufferView {
+            storage,
+            layout: &lhs_layout,
+        });
+        let rhs = rhs_copy.as_ref().map_or(rhs, |storage| BufferView {
+            storage,
+            layout: &rhs_layout,
+        });
+        // The geometry is read again from the views bound to the kernel, so a
+        // copied operand is addressed through its contiguous layout.
+        let geometry = MatmulGeometry::of(lhs.layout, rhs.layout)
+            .ok_or_else(|| invalid_operation(Op::Matmul))?;
+        let dispatch = MatmulDispatch::new(&geometry)?;
         // The output holds `batch * m * n` elements, and the kernel writes
         // only inside `[m, n]` of each batch.
         self.dispatch(
@@ -1111,20 +1056,6 @@ fn slice_offset(
 
 fn padded(values: &[usize]) -> [usize; MAX_RANK] {
     array::from_fn(|index| values.get(index).copied().unwrap_or(0))
-}
-
-fn copied_view<'buffer>(
-    operand: BufferView<'buffer>,
-    copy: Option<&'buffer MetalStorage>,
-    layout: &'buffer Layout,
-) -> BufferView<'buffer> {
-    match copy {
-        Some(storage) => BufferView {
-            storage,
-            layout,
-        },
-        None => operand,
-    }
 }
 
 fn allocated_bytes(device: &MtlDevice) -> Result<u64, MetalError> {
