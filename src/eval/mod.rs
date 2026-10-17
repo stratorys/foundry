@@ -79,6 +79,7 @@ pub struct PromptReport {
     #[serde(flatten)]
     pub generation: GenerationReport,
     pub first_step: FirstStepReport,
+    pub non_finite_logit_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -125,7 +126,7 @@ impl ReferenceReport {
             || self
                 .generation
                 .iter()
-                .any(|prompt| !prompt.generation.close)
+                .any(|prompt| !prompt.generation.close || prompt.non_finite_logit_count > 0)
     }
 }
 
@@ -328,6 +329,7 @@ fn eval_prompt<D: Device, M: CausalLm<D>>(
     let mut token_ids = Vec::with_capacity(generation.max_tokens);
     let mut top_logprobs = Vec::with_capacity(generation.max_tokens);
     let mut first_logits = Vec::new();
+    let mut non_finite_logit_count = 0_usize;
     let mut input_ids = prompt.prompt_ids.clone();
     let mut past_seen_tokens = 0_usize;
     for step in 0..generation.max_tokens {
@@ -335,6 +337,7 @@ fn eval_prompt<D: Device, M: CausalLm<D>>(
             .step_with_logits(&input_ids, past_seen_tokens)
             .map_err(generate_failed)?;
         let logits = to_f32(logits.dtype, &logits.bytes)?;
+        non_finite_logit_count = non_finite_logit_count.saturating_add(non_finite_count(&logits));
         let &[token] = tokens.as_slice() else {
             error!(
                 message = "Batch-one step did not return one token.",
@@ -369,6 +372,7 @@ fn eval_prompt<D: Device, M: CausalLm<D>>(
         );
         return Err(EvalError::LastLogitsMissing);
     };
+    let expected_logits = to_f32(expected_logits.dtype, expected_logits.bytes)?;
     Ok(PromptReport {
         prompt_index,
         prompt_tokens: prompt.prompt_ids.len(),
@@ -379,11 +383,14 @@ fn eval_prompt<D: Device, M: CausalLm<D>>(
             },
             prompt.steps(),
         ),
-        first_step: first_step(
-            &first_logits,
-            &to_f32(expected_logits.dtype, expected_logits.bytes)?,
-        )?,
+        first_step: first_step(&first_logits, &expected_logits)?,
+        non_finite_logit_count: non_finite_logit_count
+            .saturating_add(non_finite_count(&expected_logits)),
     })
+}
+
+fn non_finite_count(values: &[f32]) -> usize {
+    values.iter().filter(|value| !value.is_finite()).count()
 }
 
 #[cfg(test)]
@@ -392,10 +399,44 @@ mod tests {
 
     use crate::eval::{
         CloseReport,
+        FirstStepReport,
+        GenerationReport,
         LayerOutcome,
         LayerReport,
+        PromptReport,
+        ReferenceReport,
         Tolerance,
     };
+
+    #[test]
+    fn is_failure_holds_for_a_close_prompt_with_non_finite_logits() {
+        let reference = |non_finite_logit_count| ReferenceReport {
+            engine: "mlx".to_owned(),
+            dir: "mlx".to_owned(),
+            layers: None,
+            generation: vec![PromptReport {
+                prompt_index: 0,
+                prompt_tokens: 3,
+                generation: GenerationReport {
+                    compared_tokens: 1,
+                    matched_tokens: 1,
+                    first_divergence: None,
+                    close: true,
+                    max_logprob_abs_diff: Some(0.0),
+                },
+                first_step: FirstStepReport {
+                    kl: 0.0,
+                    max_abs_logit_diff: 0.0,
+                },
+                non_finite_logit_count,
+            }],
+        };
+        assert_eq!(
+            [reference(0).is_failure(), reference(1).is_failure()],
+            [false, true],
+            "finite logits, then one NaN logit with the same tokens"
+        );
+    }
 
     #[test]
     fn is_failure_holds_for_failed_and_mismatched_layers() {
