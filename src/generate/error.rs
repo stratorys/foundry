@@ -29,4 +29,7 @@ pub enum GenerateError {
 
     #[error("Next token bytes do not hold one u32 per sequence.")]
     TokenBytes,
+
+    #[error("Reading the logits failed.")]
+    Logits,
 }

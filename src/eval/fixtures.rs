@@ -16,7 +16,7 @@ use crate::weights::{
 
 const INPUT_SUFFIX: &str = ".input";
 const OUTPUT_SUFFIX: &str = ".output";
-const MAX_ACTIVATIONS_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_SAFETENSORS_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Activation<'weights> {
@@ -25,40 +25,46 @@ pub struct Activation<'weights> {
     pub output: WeightView<'weights>,
 }
 
-pub fn read_activations(path: &Path) -> Result<Weights<Vec<u8>>, EvalError> {
+pub fn read_file(
+    path: &Path,
+    nbytes_max: u64,
+) -> Result<Vec<u8>, EvalError> {
     let read_error = |error| {
         error!(
-            message = "Reading the activations file failed.",
+            message = "Reading a reference file failed.",
             path = %path.display(),
             %error,
         );
-        EvalError::ActivationsRead
+        EvalError::FileRead
     };
     let nbytes = fs::metadata(path).map_err(read_error)?.len();
-    if nbytes > MAX_ACTIVATIONS_BYTES {
+    if nbytes > nbytes_max {
         error!(
-            message = "Activations file exceeds the maximum size.",
+            message = "Reference file exceeds the maximum size.",
             path = %path.display(),
             nbytes,
-            max_nbytes = MAX_ACTIVATIONS_BYTES,
+            nbytes_max,
         );
-        return Err(EvalError::ActivationsTooLarge);
+        return Err(EvalError::FileTooLarge);
     }
-    let bytes = fs::read(path).map_err(read_error)?;
+    fs::read(path).map_err(read_error)
+}
+
+pub fn read_safetensors(path: &Path) -> Result<Weights<Vec<u8>>, EvalError> {
     Weights::from_shards(
         None,
         vec![Shard {
             name: path.display().to_string(),
-            bytes,
+            bytes: read_file(path, MAX_SAFETENSORS_BYTES)?,
         }],
     )
     .map_err(|error| {
         error!(
-            message = "Activations file is not a valid safetensors file.",
+            message = "Reference file is not a valid safetensors file.",
             path = %path.display(),
             %error,
         );
-        EvalError::ActivationsInvalid
+        EvalError::SafetensorsInvalid
     })
 }
 

@@ -39,6 +39,12 @@ pub trait CausalLm<D: Device> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepLogits {
+    pub dtype: DType,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generation {
     pub token_ids: Vec<Vec<u32>>,
     pub prefill: Duration,
@@ -122,6 +128,38 @@ impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
         input_ids: &[u32],
         past_seen_tokens: usize,
     ) -> Result<Vec<u32>, GenerateError> {
+        let logits = self.forward_logits(input_ids, past_seen_tokens)?;
+        self.next_tokens(&logits)
+    }
+
+    pub fn step_with_logits(
+        &mut self,
+        input_ids: &[u32],
+        past_seen_tokens: usize,
+    ) -> Result<(Vec<u32>, StepLogits), GenerateError> {
+        let logits = self.forward_logits(input_ids, past_seen_tokens)?;
+        let token_ids = self.next_tokens(&logits)?;
+        let bytes = logits
+            .contiguous(self.device)
+            .and_then(|logits| logits.to_bytes(self.device))
+            .map_err(|error| {
+                error!(message = "Reading the logits failed.", %error);
+                GenerateError::Logits
+            })?;
+        Ok((
+            token_ids,
+            StepLogits {
+                dtype: logits.dtype(),
+                bytes,
+            },
+        ))
+    }
+
+    fn forward_logits(
+        &mut self,
+        input_ids: &[u32],
+        past_seen_tokens: usize,
+    ) -> Result<Tensor<D>, GenerateError> {
         let seq_len = step_seq_len(input_ids.len(), self.batch_size)?;
         let token_bytes = input_ids
             .iter()
@@ -129,14 +167,12 @@ impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
             .collect::<Vec<u8>>();
         let input_ids =
             self.tensor_from_bytes(&token_bytes, DType::U32, &[self.batch_size.get(), seq_len])?;
-        let logits = self
-            .model
+        self.model
             .forward(self.device, &input_ids, &mut self.cache, past_seen_tokens)
             .map_err(|error| {
                 error!(message = "Model forward failed.", past_seen_tokens, seq_len, %error);
                 GenerateError::Forward
-            })?;
-        self.next_tokens(&logits)
+            })
     }
 
     fn tensor_from_bytes(

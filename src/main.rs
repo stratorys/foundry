@@ -32,10 +32,13 @@ use foundry::bench::{
     rfc3339_utc,
 };
 use foundry::eval::{
-    LayerOutcome,
-    LayerReport,
-    eval_layers,
-    read_activations,
+    BaselineReport,
+    Reference,
+    ReferenceReport,
+    baselines,
+    eval_reference,
+    max_cache_len,
+    read_reference,
 };
 use foundry::generate::{
     Generation,
@@ -60,7 +63,6 @@ use tracing::{
 const DEVICE: &str = "metal";
 const BENCH_REPORT_FILE: &str = "report.json";
 const EVAL_REPORT_FILE: &str = "eval.json";
-const EVAL_MAX_CACHE_LEN: usize = 1;
 
 #[derive(Parser)]
 #[command(about = "Foundry LLM inference engine.")]
@@ -145,10 +147,12 @@ struct EvalArgs {
     #[arg(long, help = "Hugging Face repository id, as owner/name.")]
     model: ModelId,
     #[arg(
-        long,
-        help = "Safetensors file of {module}.input and {module}.output reference activations."
+        long = "reference",
+        required = true,
+        help = "Reference directory holding generation.json, last_logits.safetensors and, for at \
+                least one reference, activations.safetensors. Repeatable."
     )]
-    activations: PathBuf,
+    references: Vec<PathBuf>,
     #[arg(long, help = "Directory that receives eval.json.")]
     out: PathBuf,
 }
@@ -209,13 +213,16 @@ enum CliError {
     #[error("Writing the report failed.")]
     Report,
 
-    #[error("Reading the reference activations failed.")]
-    Activations,
+    #[error("Reading a reference failed.")]
+    Reference,
+
+    #[error("No reference holds layer activations.")]
+    NoActivations,
 
     #[error("Evaluation failed.")]
     Eval,
 
-    #[error("A submodule does not match the reference activations.")]
+    #[error("The model does not match a reference.")]
     EvalMismatch,
 
     #[error("System clock cannot be formatted as an RFC 3339 time.")]
@@ -235,7 +242,8 @@ struct BenchRecord {
 #[derive(Debug, Serialize)]
 struct EvalRecord {
     metadata: Metadata,
-    layers: Vec<LayerReport>,
+    references: Vec<ReferenceReport>,
+    baseline: Vec<BaselineReport>,
 }
 
 impl FromStr for ModelId {
@@ -416,20 +424,44 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
 fn eval_command(args: &EvalArgs) -> Result<(), CliError> {
     let test_time = test_time()?;
     let git_commit = read_git_commit();
+    let references = args
+        .references
+        .iter()
+        .map(|dir| {
+            read_reference(dir).map_err(|error| {
+                error!(message = "Reading a reference failed.", dir = %dir.display(), %error);
+                CliError::Reference
+            })
+        })
+        .collect::<Result<Vec<Reference>, CliError>>()?;
+    if references
+        .iter()
+        .all(|reference| reference.activations.is_none())
+    {
+        error!(message = "No reference holds layer activations.");
+        return Err(CliError::NoActivations);
+    }
+    let max_cache_len = references
+        .iter()
+        .map(|reference| max_cache_len(&reference.generation))
+        .try_fold(0, |max_cache_len, cache_len| {
+            Some(max_cache_len.max(cache_len?))
+        })
+        .ok_or_else(|| {
+            error!(message = "Prompt and generated token counts overflow usize.");
+            CliError::SeqLenOverflow
+        })?;
+    let baseline = baselines(&references).map_err(|error| {
+        error!(message = "Comparing the references failed.", %error);
+        CliError::Eval
+    })?;
     let directory = resolve_snapshot(&args.model)?;
     let config = open_config(&directory)?;
     let weights = open_weights(&directory)?;
     let model_bytes = model_bytes(&args.model, &weights)?;
     let model_parameter_count = parameter_count(&args.model, &weights)?;
-    let activations = read_activations(&args.activations).map_err(|error| {
-        error!(
-            message = "Reading the reference activations failed.",
-            path = %args.activations.display(),
-            %error,
-        );
-        CliError::Activations
-    })?;
-    let (device_name, layers) = eval_on_platform(&args.model, &config, &weights, &activations)?;
+    let (device_name, reference_reports) =
+        eval_on_platform(&args.model, &config, &weights, &references, max_cache_len)?;
     let record = EvalRecord {
         metadata: Metadata {
             git_commit,
@@ -440,29 +472,25 @@ fn eval_command(args: &EvalArgs) -> Result<(), CliError> {
             model_bytes,
             model_parameter_count,
         },
-        layers,
+        references: reference_reports,
+        baseline,
     };
     let report_path = write_report(&args.out, EVAL_REPORT_FILE, &record)?;
-    let failed_count = record
-        .layers
+    let failed_engines: Vec<&str> = record
+        .references
         .iter()
-        .filter(|layer| layer.outcome.is_failure())
-        .count();
-    let skipped_count = record
-        .layers
-        .iter()
-        .filter(|layer| layer.outcome == LayerOutcome::Skipped)
-        .count();
+        .filter(|reference| reference.is_failure())
+        .map(|reference| reference.engine.as_str())
+        .collect();
     info!(
-        message = "Evaluated the submodules.",
+        message = "Evaluated the model against the references.",
         device = DEVICE,
         device_name = %record.metadata.device_name,
-        layer_count = record.layers.len(),
-        failed_count,
-        skipped_count,
+        reference_count = record.references.len(),
+        ?failed_engines,
         report = %report_path.display(),
     );
-    if failed_count > 0 {
+    if !failed_engines.is_empty() {
         return Err(CliError::EvalMismatch);
     }
     Ok(())
@@ -624,9 +652,17 @@ fn eval_on_platform(
     model: &ModelId,
     config: &LlamaConfig,
     weights: &Weights,
-    activations: &Weights<Vec<u8>>,
-) -> Result<(String, Vec<LayerReport>), CliError> {
-    eval_on(&mut metal_device()?, model, config, weights, activations)
+    references: &[Reference],
+    max_cache_len: usize,
+) -> Result<(String, Vec<ReferenceReport>), CliError> {
+    eval_on(
+        &mut metal_device()?,
+        model,
+        config,
+        weights,
+        references,
+        max_cache_len,
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -634,8 +670,9 @@ fn eval_on_platform(
     _model: &ModelId,
     _config: &LlamaConfig,
     _weights: &Weights,
-    _activations: &Weights<Vec<u8>>,
-) -> Result<(String, Vec<LayerReport>), CliError> {
+    _references: &[Reference],
+    _max_cache_len: usize,
+) -> Result<(String, Vec<ReferenceReport>), CliError> {
     error!(message = "No device is available on this platform.");
     Err(CliError::DeviceUnavailable)
 }
@@ -649,16 +686,27 @@ fn eval_on<D: Device>(
     model: &ModelId,
     config: &LlamaConfig,
     weights: &Weights,
-    activations: &Weights<Vec<u8>>,
-) -> Result<(String, Vec<LayerReport>), CliError> {
+    references: &[Reference],
+    max_cache_len: usize,
+) -> Result<(String, Vec<ReferenceReport>), CliError> {
     let device_name = device.device_name();
     info!(message = "Selected the device.", %device_name);
-    let llama = load_llama(device, model, config, weights, EVAL_MAX_CACHE_LEN)?;
-    let layers = eval_layers(device, &llama, activations).map_err(|error| {
-        error!(message = "Evaluation failed.", %model, %error);
-        CliError::Eval
-    })?;
-    Ok((device_name, layers))
+    let llama = load_llama(device, model, config, weights, max_cache_len)?;
+    let reports = references
+        .iter()
+        .map(|reference| {
+            eval_reference(device, &llama, config.eos_token_id(), reference).map_err(|error| {
+                error!(
+                    message = "Evaluation failed.",
+                    %model,
+                    dir = %reference.dir.display(),
+                    %error,
+                );
+                CliError::Eval
+            })
+        })
+        .collect::<Result<Vec<ReferenceReport>, CliError>>()?;
+    Ok((device_name, reports))
 }
 
 #[cfg_attr(
@@ -1095,15 +1143,17 @@ mod tests {
     }
 
     #[test]
-    fn eval_parses_model_activations_and_out() {
+    fn eval_parses_repeated_references() {
         assert_eq!(
             Cli::try_parse_from([
                 "foundry",
                 "eval",
                 "--model",
                 "a/b",
-                "--activations",
-                "fixtures/activations.safetensors",
+                "--reference",
+                "fixtures/transformers",
+                "--reference",
+                "fixtures/mlx",
                 "--out",
                 "reports",
             ])
@@ -1114,25 +1164,21 @@ mod tests {
                     owner: "a".to_owned(),
                     name: "b".to_owned(),
                 },
-                activations: PathBuf::from("fixtures/activations.safetensors"),
+                references: vec![
+                    PathBuf::from("fixtures/transformers"),
+                    PathBuf::from("fixtures/mlx")
+                ],
                 out: PathBuf::from("reports"),
             })),
-            "the activations path is taken as given"
+            "two reference directories in the given order"
         );
     }
 
     #[test]
-    fn eval_rejects_missing_activations_or_out() {
+    fn eval_rejects_missing_references_or_out() {
         [
             vec!["foundry", "eval", "--model", "a/b", "--out", "r"],
-            vec![
-                "foundry",
-                "eval",
-                "--model",
-                "a/b",
-                "--activations",
-                "a.safetensors",
-            ],
+            vec!["foundry", "eval", "--model", "a/b", "--reference", "ref"],
         ]
         .into_iter()
         .for_each(|args| {

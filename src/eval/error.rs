@@ -1,13 +1,34 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
-    #[error("Reading the activations file failed.")]
-    ActivationsRead,
+    #[error("Reading a reference file failed.")]
+    FileRead,
 
-    #[error("Activations file exceeds the maximum size.")]
-    ActivationsTooLarge,
+    #[error("Reference file exceeds the maximum size.")]
+    FileTooLarge,
 
-    #[error("Activations file is not a valid safetensors file.")]
-    ActivationsInvalid,
+    #[error("Reference file is not a valid safetensors file.")]
+    SafetensorsInvalid,
+
+    #[error("Reference generation is not valid JSON or misses a field.")]
+    GenerationJson,
+
+    #[error("Reference generation is inconsistent.")]
+    GenerationInvalid,
+
+    #[error("Reference first-step logits are missing.")]
+    LastLogitsMissing,
+
+    #[error("References do not hold the same prompts.")]
+    PromptMismatch,
+
+    #[error("Generating with the model failed.")]
+    Generate,
+
+    #[error("Token position overflows usize.")]
+    PositionOverflow,
+
+    #[error("Vocabulary index does not fit in u32.")]
+    VocabOverflow,
 
     #[error("Activation has no matching input or output.")]
     UnpairedActivation,
