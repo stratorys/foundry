@@ -14,6 +14,11 @@ use std::ops::Range;
 use std::path::Path;
 
 use memmap2::Mmap;
+use safetensors::tensor::TensorInfo;
+use safetensors::{
+    Dtype,
+    SafeTensors,
+};
 use serde::Deserialize;
 use tracing::error;
 
@@ -25,9 +30,7 @@ use crate::core::{
 
 const INDEX_FILE: &str = "model.safetensors.index.json";
 const SINGLE_FILE: &str = "model.safetensors";
-const METADATA_KEY: &str = "__metadata__";
 const HEADER_LEN_BYTES: usize = 8;
-const HEADER_BYTES_MAX: usize = 100 * 1024 * 1024;
 const INDEX_BYTES_MAX: u64 = 100 * 1024 * 1024;
 
 pub struct Shard<S> {
@@ -79,13 +82,6 @@ struct IndexFile {
 struct IndexMetadata {
     #[serde(default)]
     total_size: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct TensorHeader {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: [usize; 2],
 }
 
 impl Weights {
@@ -292,121 +288,45 @@ fn parse_shard(
     path: &Path,
     bytes: &[u8],
 ) -> Result<Vec<ShardTensor>, WeightsError> {
-    let truncated = || {
+    let (header_bytes, metadata) = SafeTensors::read_metadata(bytes).map_err(|error| {
         error!(
-            message = "Safetensors header is truncated.",
+            message = "Safetensors header is invalid.",
             path = %path.display(),
-            bytes = bytes.len(),
+            %error,
         );
-        WeightsError::TruncatedHeader
-    };
-    let header_len: [u8; HEADER_LEN_BYTES] = bytes
-        .get(..HEADER_LEN_BYTES)
-        .and_then(|prefix| prefix.try_into().ok())
-        .ok_or_else(truncated)?;
-    let header_bytes_declared = u64::from_le_bytes(header_len);
-    let header_bytes = usize::try_from(header_bytes_declared)
-        .ok()
-        .filter(|&header_bytes| header_bytes <= HEADER_BYTES_MAX)
-        .ok_or_else(|| {
-            error!(
-                message = "Safetensors header exceeds the maximum size.",
-                path = %path.display(),
-                bytes = header_bytes_declared,
-                bytes_max = HEADER_BYTES_MAX,
-            );
-            WeightsError::HeaderTooLarge
-        })?;
+        WeightsError::InvalidHeader
+    })?;
     let data_start = HEADER_LEN_BYTES
         .checked_add(header_bytes)
-        .ok_or_else(truncated)?;
-    let header = bytes
-        .get(HEADER_LEN_BYTES..data_start)
-        .ok_or_else(truncated)?;
-    let bytes_data = bytes.len().checked_sub(data_start).ok_or_else(truncated)?;
-    let entries: BTreeMap<String, serde_json::Value> =
-        serde_json::from_slice(header).map_err(|error| {
-            error!(
-                message = "Safetensors header is not valid JSON.",
-                path = %path.display(),
-                %error,
-            );
-            WeightsError::HeaderJson
-        })?;
-    let tensors = entries
+        .ok_or(WeightsError::InvalidHeader)?;
+    metadata
+        .tensors()
         .into_iter()
-        .filter(|(name, _)| name != METADATA_KEY)
-        .map(|(name, value)| parse_tensor(path, name, value, data_start, bytes_data))
-        .collect::<Result<Vec<ShardTensor>, WeightsError>>()?;
-    check_overlaps(&tensors)?;
-    Ok(tensors)
+        .map(|(name, info)| parse_tensor(name, info, data_start))
+        .collect()
 }
 
 fn parse_tensor(
-    path: &Path,
     name: String,
-    value: serde_json::Value,
+    info: &TensorInfo,
     data_start: usize,
-    bytes_data: usize,
 ) -> Result<ShardTensor, WeightsError> {
-    let header: TensorHeader = match serde_json::from_value(value) {
-        Ok(header) => header,
-        Err(error) => {
-            error!(
-                message = "Tensor header entry is malformed.",
-                path = %path.display(),
-                name,
-                %error,
-            );
-            return Err(WeightsError::TensorHeaderJson);
-        }
-    };
-    let Some(dtype) = parse_dtype(&header.dtype) else {
+    let Some(dtype) = parse_dtype(info.dtype) else {
         error!(
             message = "Tensor has an unknown dtype.",
             name,
-            dtype = header.dtype
+            dtype = ?info.dtype,
         );
         return Err(WeightsError::UnknownDType);
     };
-    let shape = Shape::try_from(header.shape.as_slice()).map_err(|error| {
+    let shape = Shape::try_from(info.shape.as_slice()).map_err(|error| {
         error!(message = "Tensor has an invalid shape.", name, %error);
         WeightsError::InvalidShape
     })?;
-    let [begin, end] = header.data_offsets;
-    let Some(bytes) = end.checked_sub(begin) else {
-        error!(
-            message = "Tensor data offsets begin after they end.",
-            name, begin, end,
-        );
-        return Err(WeightsError::InvalidRange);
-    };
-    let out_of_data_region = || {
-        error!(
-            message = "Tensor ends outside the data region.",
-            name, end, bytes_data,
-        );
-        WeightsError::OutOfDataRegion
-    };
-    if end > bytes_data {
-        return Err(out_of_data_region());
-    }
-    let Some(bytes_expected) = shape.element_count().checked_mul(dtype.size_bytes()) else {
-        error!(message = "Tensor byte count overflows usize.", name);
-        return Err(WeightsError::TensorByteCountOverflow);
-    };
-    if bytes != bytes_expected {
-        error!(
-            message = "Tensor byte count does not match its shape and dtype.",
-            name, bytes, bytes_expected,
-        );
-        return Err(WeightsError::SizeMismatch);
-    }
-    let Some(start) = data_start.checked_add(begin) else {
-        return Err(out_of_data_region());
-    };
-    let Some(stop) = data_start.checked_add(end) else {
-        return Err(out_of_data_region());
+    let (begin, end) = info.data_offsets;
+    let (Some(start), Some(stop)) = (data_start.checked_add(begin), data_start.checked_add(end))
+    else {
+        return Err(WeightsError::InvalidHeader);
     };
     Ok(ShardTensor {
         name,
@@ -416,33 +336,15 @@ fn parse_tensor(
     })
 }
 
-fn parse_dtype(dtype: &str) -> Option<DType> {
-    match dtype {
-        "F32" => Some(DType::F32),
-        "F16" => Some(DType::F16),
-        "BF16" => Some(DType::BF16),
-        "U32" => Some(DType::U32),
-        _ => None,
-    }
-}
-
-fn check_overlaps(tensors: &[ShardTensor]) -> Result<(), WeightsError> {
-    let mut sorted: Vec<&ShardTensor> = tensors.iter().collect();
-    sorted.sort_by_key(|tensor| (tensor.byte_range.start, tensor.byte_range.end));
-    sorted
-        .windows(2)
-        .find_map(|pair| match pair {
-            [first, second] if second.byte_range.start < first.byte_range.end => {
-                error!(
-                    message = "Tensors have overlapping byte ranges.",
-                    first = first.name,
-                    second = second.name,
-                );
-                Some(WeightsError::OverlappingRanges)
-            }
-            _ => None,
-        })
-        .map_or(Ok(()), Err)
+fn parse_dtype(dtype: Dtype) -> Option<DType> {
+    [
+        (Dtype::F32, DType::F32),
+        (Dtype::F16, DType::F16),
+        (Dtype::BF16, DType::BF16),
+        (Dtype::U32, DType::U32),
+    ]
+    .into_iter()
+    .find_map(|(file_dtype, foundry_dtype)| (file_dtype == dtype).then_some(foundry_dtype))
 }
 
 fn check_index<S>(
@@ -476,7 +378,6 @@ mod tests {
         Shape,
     };
     use crate::weights::{
-        HEADER_BYTES_MAX,
         Shard,
         WeightView,
         Weights,
@@ -771,74 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn file_shorter_than_the_length_prefix_is_truncated() {
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: vec![1, 0, 0, 0]
-                }]
-            )
-            .err(),
-            Some(WeightsError::TruncatedHeader),
-            "four bytes cannot hold the length prefix"
-        );
-    }
-
-    #[test]
-    fn header_longer_than_the_file_is_truncated() {
-        let file: Vec<u8> = 100_u64.to_le_bytes().into_iter().chain(*b"{}").collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::TruncatedHeader),
-            "a header of 100 bytes does not fit in 10 bytes"
-        );
-    }
-
-    #[test]
-    fn header_above_the_limit_is_rejected() {
-        let header_bytes = 100_u64 * 1024 * 1024 + 1;
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: header_bytes.to_le_bytes().to_vec()
-                }]
-            )
-            .err(),
-            Some(WeightsError::HeaderTooLarge),
-            "a header one byte above the limit is rejected"
-        );
-    }
-
-    #[test]
-    fn header_at_the_limit_is_not_too_large() {
-        let header_bytes = u64::try_from(HEADER_BYTES_MAX).expect("the limit fits in u64");
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: header_bytes.to_le_bytes().to_vec()
-                }]
-            )
-            .err(),
-            Some(WeightsError::TruncatedHeader),
-            "a header at the limit passes the size check and is then truncated"
-        );
-    }
-
-    #[test]
-    fn invalid_header_json_is_rejected() {
+    fn header_rejected_by_the_parser_is_invalid() {
         [b"{".as_slice(), b"[]", b"null", &[0xFF]]
             .into_iter()
             .for_each(|header| {
@@ -857,47 +691,16 @@ mod tests {
                         }]
                     )
                     .err(),
-                    Some(WeightsError::HeaderJson),
+                    Some(WeightsError::InvalidHeader),
                     "header {header:?} is rejected"
                 );
             });
     }
 
     #[test]
-    fn malformed_tensor_entry_is_rejected() {
-        [
-            json!({ "dtype": "F32", "shape": [1] }),
-            json!({ "dtype": "F32", "shape": [1], "data_offsets": [0, 4, 8] }),
-        ]
-        .into_iter()
-        .for_each(|entry| {
-            let header = serde_json::to_vec(&json!({ "a": entry })).expect("the header serializes");
-            let file: Vec<u8> = u64::try_from(header.len())
-                .expect("the header length fits in u64")
-                .to_le_bytes()
-                .into_iter()
-                .chain(header)
-                .chain(0..8)
-                .collect();
-            assert_eq!(
-                Weights::from_shards(
-                    None,
-                    vec![Shard {
-                        name: "model.safetensors".to_owned(),
-                        bytes: file
-                    }]
-                )
-                .err(),
-                Some(WeightsError::TensorHeaderJson),
-                "entry {entry} is rejected"
-            );
-        });
-    }
-
-    #[test]
     fn unknown_dtype_is_rejected() {
         let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "Q4", "shape": [2], "data_offsets": [0, 1] } }),
+            &json!({ "a": { "dtype": "I64", "shape": [1], "data_offsets": [0, 8] } }),
         )
         .expect("the header serializes");
         let file: Vec<u8> = u64::try_from(header.len())
@@ -905,7 +708,7 @@ mod tests {
             .to_le_bytes()
             .into_iter()
             .chain(header)
-            .chain(0..1)
+            .chain(0..8)
             .collect();
         assert_eq!(
             Weights::from_shards(
@@ -917,34 +720,7 @@ mod tests {
             )
             .err(),
             Some(WeightsError::UnknownDType),
-            "dtype Q4 is unknown"
-        );
-    }
-
-    #[test]
-    fn lowercase_dtype_is_rejected() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "bf16", "shape": [2], "data_offsets": [0, 4] } }),
-        )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::UnknownDType),
-            "dtype names are case sensitive"
+            "dtype I64 is not supported"
         );
     }
 
@@ -1010,87 +786,6 @@ mod tests {
     }
 
     #[test]
-    fn reversed_range_is_rejected() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [8, 4] } }),
-        )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..8)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::InvalidRange),
-            "a range that begins after its end is rejected"
-        );
-    }
-
-    #[test]
-    fn range_outside_the_data_region_is_rejected() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] } }),
-        )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::OutOfDataRegion),
-            "a range ending after the data is rejected"
-        );
-    }
-
-    #[test]
-    fn range_not_matching_shape_and_dtype_is_rejected() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 8] } }),
-        )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..8)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::SizeMismatch),
-            "8 bytes do not hold six bf16 values"
-        );
-    }
-
-    #[test]
     fn empty_header_has_no_tensors() {
         let file: Vec<u8> = 2_u64.to_le_bytes().into_iter().chain(*b"{}").collect();
         let weights = Weights::from_shards(
@@ -1149,62 +844,6 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_ranges_are_rejected() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] },
-            "b": { "dtype": "F32", "shape": [2], "data_offsets": [4, 12] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..12)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::OverlappingRanges),
-            "ranges [0, 8] and [4, 12] overlap"
-        );
-    }
-
-    #[test]
-    fn ranges_listed_out_of_offset_order_are_checked() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "F32", "shape": [2], "data_offsets": [4, 12] },
-            "b": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..12)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::OverlappingRanges),
-            "ranges are compared in offset order, not in name order"
-        );
-    }
-
-    #[test]
     fn empty_ranges_at_the_same_offset_are_accepted() {
         let header = serde_json::to_vec(&json!({
             "a": { "dtype": "F32", "shape": [0], "data_offsets": [4, 4] },
@@ -1228,34 +867,6 @@ mod tests {
         )
         .expect("empty ranges do not overlap");
         assert_eq!(weights.tensors().count(), 3, "three tensors");
-    }
-
-    #[test]
-    fn empty_range_inside_another_is_rejected() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] },
-            "b": { "dtype": "F32", "shape": [0], "data_offsets": [4, 4] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..8)
-            .collect();
-        assert_eq!(
-            Weights::from_shards(
-                None,
-                vec![Shard {
-                    name: "model.safetensors".to_owned(),
-                    bytes: file
-                }]
-            )
-            .err(),
-            Some(WeightsError::OverlappingRanges),
-            "an empty range that starts inside another range is rejected"
-        );
     }
 
     #[test]

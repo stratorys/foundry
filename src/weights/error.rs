@@ -15,38 +15,14 @@ pub enum WeightsError {
     #[error("Shard name is not a plain file name.")]
     InvalidShardName,
 
-    #[error("Safetensors header is truncated.")]
-    TruncatedHeader,
-
-    #[error("Safetensors header exceeds the maximum size.")]
-    HeaderTooLarge,
-
-    #[error("Safetensors header is not valid JSON.")]
-    HeaderJson,
-
-    #[error("Tensor header entry is malformed.")]
-    TensorHeaderJson,
+    #[error("Safetensors header is invalid.")]
+    InvalidHeader,
 
     #[error("Tensor has an unknown dtype.")]
     UnknownDType,
 
     #[error("Tensor has an invalid shape.")]
     InvalidShape,
-
-    #[error("Tensor data offsets begin after they end.")]
-    InvalidRange,
-
-    #[error("Tensor ends outside the data region.")]
-    OutOfDataRegion,
-
-    #[error("Tensor byte count overflows usize.")]
-    TensorByteCountOverflow,
-
-    #[error("Tensor byte count does not match its shape and dtype.")]
-    SizeMismatch,
-
-    #[error("Tensors have overlapping byte ranges.")]
-    OverlappingRanges,
 
     #[error("Tensor appears in more than one shard.")]
     DuplicateTensor,
