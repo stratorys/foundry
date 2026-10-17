@@ -1,10 +1,5 @@
-mod bench;
+mod command;
 mod error;
-mod eval;
-mod platform;
-mod report;
-mod run;
-mod snapshot;
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -16,13 +11,18 @@ use clap::{
     Parser,
     Subcommand,
 };
+#[cfg(target_os = "macos")]
+use foundry::metal::MetalDevice;
 use tracing::error;
 
-use self::bench::bench_command;
+#[cfg(target_os = "macos")]
+use self::command::{
+    bench_command,
+    eval_command,
+    run,
+};
 pub use self::error::CliError;
 use self::error::ModelIdError;
-use self::eval::eval_command;
-use self::run::run;
 
 #[derive(Parser)]
 #[command(about = "Foundry LLM inference engine.")]
@@ -151,16 +151,29 @@ impl fmt::Display for ModelId {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn execute(command: Command) -> Result<(), CliError> {
+    let open_device = || {
+        MetalDevice::new().map_err(|error| {
+            error!(message = "Creating the Metal device failed.", %error);
+            CliError::Device
+        })
+    };
     match command {
         Command::Run {
             model,
             prompt_ids,
             max_new_tokens,
-        } => run(&model, &prompt_ids, max_new_tokens),
-        Command::Bench(args) => bench_command(&args),
-        Command::Eval(args) => eval_command(&args),
+        } => run(open_device, &model, &prompt_ids, max_new_tokens),
+        Command::Bench(args) => bench_command(open_device, &args),
+        Command::Eval(args) => eval_command(open_device, &args),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn execute(_command: Command) -> Result<(), CliError> {
+    error!(message = "No device is available on this platform.");
+    Err(CliError::DeviceUnavailable)
 }
 
 #[cfg(test)]

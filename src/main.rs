@@ -1,3 +1,7 @@
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no device on this platform")
+)]
 mod cli;
 
 use std::process::ExitCode;
