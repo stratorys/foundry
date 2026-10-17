@@ -25,21 +25,21 @@ impl<B: Backend> Linear<B> {
 }
 
 pub struct Embedding<B: Backend> {
-    table: Tensor<B>,
+    weight: Tensor<B>,
 }
 
 impl<B: Backend> Embedding<B> {
-    pub fn new(table: Tensor<B>) -> Self {
+    pub fn new(weight: Tensor<B>) -> Self {
         Self {
-            table,
+            weight,
         }
     }
 
     pub fn forward(
         &self,
         backend: &mut B,
-        token_ids: &Tensor<B>,
+        input_ids: &Tensor<B>,
     ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        self.table.index_select(backend, 0, token_ids)
+        self.weight.index_select(backend, 0, input_ids)
     }
 }

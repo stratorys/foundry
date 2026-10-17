@@ -31,7 +31,7 @@ use crate::core::{
 const INDEX_FILE: &str = "model.safetensors.index.json";
 const SINGLE_FILE: &str = "model.safetensors";
 const HEADER_LEN_BYTES: usize = 8;
-const INDEX_BYTES_MAX: u64 = 100 * 1024 * 1024;
+const MAX_INDEX_BYTES: u64 = 100 * 1024 * 1024;
 
 pub struct Shard<S> {
     pub name: String,
@@ -41,7 +41,7 @@ pub struct Shard<S> {
 pub struct Weights<S = Mmap> {
     shards: Vec<Shard<S>>,
     tensors: HashMap<String, TensorEntry>,
-    bytes_declared: Option<u64>,
+    total_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +126,7 @@ impl<S: AsRef<[u8]>> Weights<S> {
         Self::assemble(Path::new(""), index, shards)
     }
 
-    pub fn get(
+    pub fn tensor(
         &self,
         name: &str,
     ) -> Option<WeightView<'_>> {
@@ -142,7 +142,7 @@ impl<S: AsRef<[u8]>> Weights<S> {
 
     pub fn shard_count(&self) -> usize { self.shards.len() }
 
-    pub fn bytes_declared(&self) -> Option<u64> { self.bytes_declared }
+    pub fn total_size(&self) -> Option<u64> { self.total_size }
 
     fn view<'weights>(
         &'weights self,
@@ -207,13 +207,13 @@ impl<S: AsRef<[u8]>> Weights<S> {
         if let Some(index) = &index {
             check_index(&index.weight_map, &shards, &tensors)?;
         }
-        let bytes_declared = index
+        let total_size = index
             .and_then(|index| index.metadata)
             .and_then(|metadata| metadata.total_size);
         Ok(Self {
             shards,
             tensors,
-            bytes_declared,
+            total_size,
         })
     }
 }
@@ -228,12 +228,12 @@ fn read_index(path: &Path) -> Result<Vec<u8>, WeightsError> {
         WeightsError::IndexRead
     };
     let bytes = fs::metadata(path).map_err(read_error)?.len();
-    if bytes > INDEX_BYTES_MAX {
+    if bytes > MAX_INDEX_BYTES {
         error!(
             message = "Safetensors index exceeds the maximum size.",
             path = %path.display(),
             bytes,
-            bytes_max = INDEX_BYTES_MAX,
+            max_bytes = MAX_INDEX_BYTES,
         );
         return Err(WeightsError::IndexTooLarge);
     }
@@ -411,7 +411,7 @@ mod tests {
         let a_bytes: Vec<u8> = (0..12).collect();
         let b_bytes: Vec<u8> = (12..28).collect();
         assert_eq!(
-            weights.get("a"),
+            weights.tensor("a"),
             Some(WeightView {
                 name: "a",
                 dtype: DType::BF16,
@@ -421,7 +421,7 @@ mod tests {
             "tensor a"
         );
         assert_eq!(
-            weights.get("b"),
+            weights.tensor("b"),
             Some(WeightView {
                 name: "b",
                 dtype: DType::F32,
@@ -432,7 +432,7 @@ mod tests {
         );
         assert_eq!(weights.tensors().count(), 2, "metadata is not a tensor");
         assert_eq!(weights.shard_count(), 1, "single file is one shard");
-        assert_eq!(weights.bytes_declared(), None, "no index, no declared size");
+        assert_eq!(weights.total_size(), None, "no index, no declared size");
     }
 
     #[test]
@@ -486,17 +486,17 @@ mod tests {
         )
         .expect("the shards are valid");
         assert_eq!(
-            weights.get("a").map(|view| view.bytes),
+            weights.tensor("a").map(|view| view.bytes),
             Some([0, 1, 2, 3].as_slice()),
             "bytes of a"
         );
         assert_eq!(
-            weights.get("b").map(|view| view.bytes),
+            weights.tensor("b").map(|view| view.bytes),
             Some([9, 8, 7, 6].as_slice()),
             "bytes of b"
         );
         assert_eq!(weights.shard_count(), 2, "two shards");
-        assert_eq!(weights.bytes_declared(), Some(8), "declared total size");
+        assert_eq!(weights.total_size(), Some(8), "declared total size");
     }
 
     #[test]
@@ -592,11 +592,7 @@ mod tests {
             }],
         )
         .expect("the shard is valid");
-        assert_eq!(
-            weights.bytes_declared(),
-            None,
-            "no metadata, no declared size"
-        );
+        assert_eq!(weights.total_size(), None, "no metadata, no declared size");
     }
 
     #[test]
@@ -747,12 +743,12 @@ mod tests {
         )
         .expect("the file is valid");
         assert_eq!(
-            weights.get("a").map(|view| view.dtype),
+            weights.tensor("a").map(|view| view.dtype),
             Some(DType::F16),
             "dtype of a"
         );
         assert_eq!(
-            weights.get("b").map(|view| view.dtype),
+            weights.tensor("b").map(|view| view.dtype),
             Some(DType::U32),
             "dtype of b"
         );
@@ -822,7 +818,7 @@ mod tests {
         )
         .expect("the file is valid");
         assert_eq!(
-            weights.get("s"),
+            weights.tensor("s"),
             Some(WeightView {
                 name: "s",
                 dtype: DType::F32,
@@ -832,7 +828,7 @@ mod tests {
             "a scalar holds one element"
         );
         assert_eq!(
-            weights.get("z"),
+            weights.tensor("z"),
             Some(WeightView {
                 name: "z",
                 dtype: DType::F32,
@@ -890,6 +886,6 @@ mod tests {
             }],
         )
         .expect("the file is valid");
-        assert_eq!(weights.get("b"), None, "tensor b is not in the file");
+        assert_eq!(weights.tensor("b"), None, "tensor b is not in the file");
     }
 }

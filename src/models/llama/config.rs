@@ -7,7 +7,7 @@ use tracing::error;
 use crate::models::llama::LlamaConfigError;
 
 const CONFIG_FILE: &str = "config.json";
-const CONFIG_BYTES_MAX: u64 = 1024 * 1024;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MODEL_TYPE: &str = "llama";
 const ROPE_TYPE: &str = "llama3";
 
@@ -24,7 +24,7 @@ pub struct LlamaConfig {
     rope_scaling: Option<Llama3RopeScaling>,
     max_position_embeddings: usize,
     vocab_size: usize,
-    eos_token_ids: Vec<u32>,
+    eos_token_id: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,10 +70,10 @@ enum EosTokenIds {
 }
 
 impl From<EosTokenIds> for Vec<u32> {
-    fn from(eos_token_ids: EosTokenIds) -> Self {
-        match eos_token_ids {
+    fn from(eos_token_id: EosTokenIds) -> Self {
+        match eos_token_id {
             EosTokenIds::One(eos_token_id) => vec![eos_token_id],
-            EosTokenIds::Many(eos_token_ids) => eos_token_ids,
+            EosTokenIds::Many(eos_token_id) => eos_token_id,
         }
     }
 }
@@ -90,12 +90,12 @@ impl LlamaConfig {
             LlamaConfigError::ConfigRead
         };
         let bytes = fs::metadata(&path).map_err(read_error)?.len();
-        if bytes > CONFIG_BYTES_MAX {
+        if bytes > MAX_CONFIG_BYTES {
             error!(
                 message = "Config file exceeds the maximum size.",
                 path = %path.display(),
                 bytes,
-                bytes_max = CONFIG_BYTES_MAX,
+                max_bytes = MAX_CONFIG_BYTES,
             );
             return Err(LlamaConfigError::ConfigTooLarge);
         }
@@ -130,7 +130,7 @@ impl LlamaConfig {
 
     pub const fn vocab_size(&self) -> usize { self.vocab_size }
 
-    pub fn eos_token_ids(&self) -> &[u32] { &self.eos_token_ids }
+    pub fn eos_token_id(&self) -> &[u32] { &self.eos_token_id }
 }
 
 impl TryFrom<ConfigFile> for LlamaConfig {
@@ -195,7 +195,7 @@ impl TryFrom<ConfigFile> for LlamaConfig {
             }),
             max_position_embeddings: file.max_position_embeddings,
             vocab_size: file.vocab_size,
-            eos_token_ids: file.eos_token_id.into(),
+            eos_token_id: file.eos_token_id.into(),
         })
     }
 }
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(config.max_position_embeddings(), 131_072, "max positions");
         assert_eq!(config.vocab_size(), 128_256, "vocab size");
         assert_eq!(
-            config.eos_token_ids(),
+            config.eos_token_id(),
             &[128_001, 128_008, 128_009],
             "eos token ids"
         );
@@ -314,7 +314,7 @@ mod tests {
     fn single_eos_token_id_becomes_a_list() {
         let config = parse(&with(instruct_config(), "eos_token_id", json!(128_001)))
             .expect("the config is valid");
-        assert_eq!(config.eos_token_ids(), &[128_001], "eos token ids");
+        assert_eq!(config.eos_token_id(), &[128_001], "eos token ids");
     }
 
     #[test]
@@ -430,7 +430,7 @@ mod tests {
                 rope_scaling: None,
                 max_position_embeddings: 8192,
                 vocab_size: 49_152,
-                eos_token_ids: vec![2],
+                eos_token_id: vec![2],
             }),
             "head dim is hidden size over attention heads"
         );

@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const MIX_MULTIPLIER_1: u64 = 0xbf58_476d_1ce4_e5b9;
 const MIX_MULTIPLIER_2: u64 = 0x94d0_49bb_1331_11eb;
-const DRAW_COUNT_MAX: usize = 64;
+const MAX_DRAW_COUNT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitMix64 {
@@ -33,10 +33,10 @@ impl SplitMix64 {
             .checked_rem(bound)
             .and_then(|remainder| remainder.checked_add(1))
             .and_then(|remainder| remainder.checked_rem(bound))?;
-        let accepted_max = u64::MAX.checked_sub(rejected_count)?;
-        (0..DRAW_COUNT_MAX)
+        let max_accepted = u64::MAX.checked_sub(rejected_count)?;
+        (0..MAX_DRAW_COUNT)
             .map(|_| self.next_u64())
-            .find(|&draw| draw <= accepted_max)
+            .find(|&draw| draw <= max_accepted)
             .and_then(|draw| draw.checked_rem(bound))
             .and_then(|draw| u32::try_from(draw).ok())
     }

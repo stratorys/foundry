@@ -22,10 +22,10 @@ impl<B: Backend> KvCache<B> {
         dtype: DType,
         batch_size: usize,
         kv_heads: usize,
-        seq_len_max: usize,
+        max_cache_len: usize,
         head_dim: usize,
     ) -> Result<Self, TensorError<B::Error>> {
-        let shape = Shape::try_from([batch_size, kv_heads, seq_len_max, head_dim].as_slice())?;
+        let shape = Shape::try_from([batch_size, kv_heads, max_cache_len, head_dim].as_slice())?;
         Ok(Self {
             keys: Tensor::zeros(backend, dtype, shape)?,
             values: Tensor::zeros(backend, dtype, shape)?,
@@ -37,7 +37,7 @@ impl<B: Backend> KvCache<B> {
         backend: &mut B,
         keys: &Tensor<B>,
         values: &Tensor<B>,
-        position: usize,
+        past_seen_tokens: usize,
     ) -> Result<(), TensorError<B::Error>> {
         if keys.shape() != values.shape() {
             error!(
@@ -55,9 +55,10 @@ impl<B: Backend> KvCache<B> {
             );
             return Err(CoreError::DTypeMismatch.into());
         }
-        self.keys.slice_scatter(backend, keys, SEQ_DIM, position)?;
+        self.keys
+            .slice_scatter(backend, keys, SEQ_DIM, past_seen_tokens)?;
         self.values
-            .slice_scatter(backend, values, SEQ_DIM, position)
+            .slice_scatter(backend, values, SEQ_DIM, past_seen_tokens)
     }
 
     pub fn keys(&self) -> &Tensor<B> { &self.keys }

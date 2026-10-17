@@ -30,7 +30,7 @@ struct AttentionDims {
     kv_heads: usize,
     group: usize,
     seq_len: usize,
-    seq_len_total: usize,
+    kv_length: usize,
     head_dim: usize,
 }
 
@@ -56,23 +56,23 @@ impl<B: Backend> Attention<B> {
         backend: &mut B,
         query: &Tensor<B>,
         cache: &KvCache<B>,
-        seq_len_total: usize,
-        mask: &Tensor<B>,
+        kv_length: usize,
+        attention_mask: &Tensor<B>,
     ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        let keys = &cache.keys().narrow(SEQ_DIM, 0, seq_len_total)?;
-        let values = &cache.values().narrow(SEQ_DIM, 0, seq_len_total)?;
+        let keys = &cache.keys().narrow(SEQ_DIM, 0, kv_length)?;
+        let values = &cache.values().narrow(SEQ_DIM, 0, kv_length)?;
         let AttentionDims {
             batch,
             heads,
             kv_heads,
             group,
             seq_len,
-            seq_len_total,
+            kv_length,
             head_dim,
         } = attention_dims(self.head_dim, query.shape(), keys.shape(), values.shape())?;
         let rows = group.saturating_mul(seq_len);
         let keys_t = keys.permute(&[0, 1, 3, 2])?;
-        let mask_f32 = mask.to_dtype(backend, DType::F32)?;
+        let attention_mask_f32 = attention_mask.to_dtype(backend, DType::F32)?;
         let scores = query
             .contiguous(backend)?
             .reshape(Shape::try_from(
@@ -80,21 +80,15 @@ impl<B: Backend> Attention<B> {
             )?)?
             .matmul(backend, &keys_t)?
             .reshape(Shape::try_from(
-                [
-                    batch.saturating_mul(kv_heads),
-                    group,
-                    seq_len,
-                    seq_len_total,
-                ]
-                .as_slice(),
+                [batch.saturating_mul(kv_heads), group, seq_len, kv_length].as_slice(),
             )?)?
             .to_dtype(backend, DType::F32)?
             .mul(backend, &self.scale)?
-            .add(backend, &mask_f32)?;
+            .add(backend, &attention_mask_f32)?;
         Ok(softmax(backend, &scores, scores.shape().last_dim()?)?
             .to_dtype(backend, query.dtype())?
             .reshape(Shape::try_from(
-                [batch, kv_heads, rows, seq_len_total].as_slice(),
+                [batch, kv_heads, rows, kv_length].as_slice(),
             )?)?
             .matmul(backend, values)?
             .reshape(Shape::try_from(
@@ -130,13 +124,13 @@ fn attention_dims(
     let &[batch, heads, seq_len, head_dim] = query.dims() else {
         return Err(incompatible());
     };
-    let &[key_batch, kv_heads, seq_len_total, key_head_dim] = keys.dims() else {
+    let &[key_batch, kv_heads, kv_length, key_head_dim] = keys.dims() else {
         return Err(incompatible());
     };
     let is_grouped = heads.checked_rem(kv_heads) == Some(0);
     let is_compatible = batch == key_batch
         && is_grouped
-        && seq_len <= seq_len_total
+        && seq_len <= kv_length
         && head_dim == key_head_dim
         && keys == values;
     if !is_compatible {
@@ -156,7 +150,7 @@ fn attention_dims(
         kv_heads,
         group: heads.checked_div(kv_heads).ok_or_else(incompatible)?,
         seq_len,
-        seq_len_total,
+        kv_length,
         head_dim,
     })
 }
@@ -191,7 +185,7 @@ mod tests {
                 kv_heads: 2,
                 group: 2,
                 seq_len: 1,
-                seq_len_total: 3,
+                kv_length: 3,
                 head_dim: 2,
             }),
             "in each of two sequences, four query heads share two key-value heads"

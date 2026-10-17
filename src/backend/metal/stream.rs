@@ -24,7 +24,7 @@ use crate::backend::metal::{
 
 const DISPATCHES_PER_BUFFER: usize = 64;
 
-const IN_FLIGHT_MAX: usize = 3;
+const MAX_IN_FLIGHT: usize = 3;
 
 pub struct CommandStream {
     queue: Queue,
@@ -44,7 +44,7 @@ impl CommandStream {
         Self {
             queue,
             open: None,
-            in_flight: VecDeque::with_capacity(IN_FLIGHT_MAX.saturating_add(1)),
+            in_flight: VecDeque::with_capacity(MAX_IN_FLIGHT.saturating_add(1)),
             failed: false,
         }
     }
@@ -134,7 +134,7 @@ impl CommandStream {
             .in_flight
             .front()
             .is_some_and(|command_buffer| is_finished(command_buffer.status()))
-            || self.in_flight.len() > IN_FLIGHT_MAX
+            || self.in_flight.len() > MAX_IN_FLIGHT
         {
             if let Some(command_buffer) = self.in_flight.pop_front() {
                 self.retire(&command_buffer)?;

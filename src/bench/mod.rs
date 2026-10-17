@@ -300,16 +300,16 @@ fn run<B: Backend, M: CausalLm<B>>(
     if !depth_ids.is_empty() {
         step(&mut decoder, &depth_ids, 0)?;
     }
-    let mut position = inputs.depth_ids.first().map_or(0, Vec::len);
+    let mut past_seen_tokens = inputs.depth_ids.first().map_or(0, Vec::len);
     let mut token_ids =
         vec![Vec::with_capacity(inputs.gen_token_count.saturating_add(1)); inputs.batch_size.get()];
     let prompt_ids = inputs.prompt_ids.concat();
     let prompt_len = inputs.prompt_ids.first().map_or(0, Vec::len);
     let (prefill_ns, mut tokens) = match (NonZeroUsize::new(prompt_len), &inputs.start_ids) {
         (Some(prompt_len), _) => {
-            let (tokens, prefill_ns) = timed_step(&mut decoder, &prompt_ids, position)?;
+            let (tokens, prefill_ns) = timed_step(&mut decoder, &prompt_ids, past_seen_tokens)?;
             push_tokens(&mut token_ids, &tokens);
-            position = advance(position, prompt_len.get())?;
+            past_seen_tokens = advance(past_seen_tokens, prompt_len.get())?;
             (Some(prefill_ns), tokens)
         }
         (None, Some(start_ids)) => (None, start_ids.clone()),
@@ -320,10 +320,10 @@ fn run<B: Backend, M: CausalLm<B>>(
     };
     let decode_ns = (0..inputs.gen_token_count)
         .map(|_| {
-            let (next_tokens, step_ns) = timed_step(&mut decoder, &tokens, position)?;
+            let (next_tokens, step_ns) = timed_step(&mut decoder, &tokens, past_seen_tokens)?;
             push_tokens(&mut token_ids, &next_tokens);
             tokens = next_tokens;
-            position = advance(position, 1)?;
+            past_seen_tokens = advance(past_seen_tokens, 1)?;
             Ok(step_ns)
         })
         .collect::<Result<Vec<u64>, BenchError>>()?;
@@ -349,11 +349,11 @@ fn push_tokens(
 
 fn timed_step<B: Backend, M: CausalLm<B>>(
     decoder: &mut Decoder<'_, B, M>,
-    token_ids: &[u32],
-    position: usize,
+    input_ids: &[u32],
+    past_seen_tokens: usize,
 ) -> Result<(Vec<u32>, u64), BenchError> {
     let start = Instant::now();
-    let tokens = step(decoder, token_ids, position)?;
+    let tokens = step(decoder, input_ids, past_seen_tokens)?;
     let elapsed = start.elapsed();
     let elapsed_ns = u64::try_from(elapsed.as_nanos()).map_err(|_| {
         error!(
@@ -367,14 +367,14 @@ fn timed_step<B: Backend, M: CausalLm<B>>(
 
 fn step<B: Backend, M: CausalLm<B>>(
     decoder: &mut Decoder<'_, B, M>,
-    token_ids: &[u32],
-    position: usize,
+    input_ids: &[u32],
+    past_seen_tokens: usize,
 ) -> Result<Vec<u32>, BenchError> {
-    decoder.step(token_ids, position).map_err(|error| {
+    decoder.step(input_ids, past_seen_tokens).map_err(|error| {
         error!(
             message = "Benchmark step failed.",
-            position,
-            token_count = token_ids.len(),
+            past_seen_tokens,
+            token_count = input_ids.len(),
             %error,
         );
         BenchError::Step
@@ -384,13 +384,13 @@ fn step<B: Backend, M: CausalLm<B>>(
 fn ns_to_ms(ns: u64) -> f64 { ns_to_f64(ns) / NS_PER_MS }
 
 fn advance(
-    position: usize,
+    past_seen_tokens: usize,
     seq_len: usize,
 ) -> Result<usize, BenchError> {
-    position.checked_add(seq_len).ok_or_else(|| {
+    past_seen_tokens.checked_add(seq_len).ok_or_else(|| {
         error!(
             message = "Token position overflows usize.",
-            position, seq_len
+            past_seen_tokens, seq_len
         );
         BenchError::PositionOverflow
     })

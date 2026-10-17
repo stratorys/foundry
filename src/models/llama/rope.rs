@@ -17,7 +17,7 @@ use crate::models::llama::{
     LlamaError,
 };
 
-const POSITION_COUNT_MAX: usize = 1 << f32::MANTISSA_DIGITS;
+const MAX_POSITION_COUNT: usize = 1 << f32::MANTISSA_DIGITS;
 const LAST_DIM: usize = 3;
 
 pub struct LlamaRope<B: Backend> {
@@ -36,13 +36,13 @@ impl<B: Backend> LlamaRope<B> {
     pub fn new(
         backend: &mut B,
         config: &LlamaConfig,
-        seq_len_max: usize,
+        max_cache_len: usize,
     ) -> Result<Self, LlamaError<B::Error>> {
         let head_dim = config.head_dim();
         let angles = angles(
             &inv_frequencies(head_dim, config.rope_theta(), config.rope_scaling())?,
-            seq_len_max,
-            config.max_position_embeddings().min(POSITION_COUNT_MAX),
+            max_cache_len,
+            config.max_position_embeddings().min(MAX_POSITION_COUNT),
         )?;
         let functions: [fn(f32) -> f32; 2] = [f32::cos, f32::sin];
         let [cos, sin] = functions.map(|function| {
@@ -53,7 +53,7 @@ impl<B: Backend> LlamaRope<B> {
                     .flat_map(|&angle| function(angle).to_le_bytes())
                     .collect::<Vec<u8>>(),
                 DType::F32,
-                Shape::try_from([seq_len_max, head_dim].as_slice())?,
+                Shape::try_from([max_cache_len, head_dim].as_slice())?,
             )?
             .to_dtype(backend, DType::BF16)
         });
@@ -67,12 +67,14 @@ impl<B: Backend> LlamaRope<B> {
     pub fn at(
         &self,
         backend: &mut B,
-        positions: &Tensor<B>,
+        position_ids: &Tensor<B>,
     ) -> Result<RopeAngles<B>, TensorError<B::Error>> {
-        let shape = Shape::try_from([positions.shape().numel(), 1, self.head_dim].as_slice())?;
+        let shape = Shape::try_from([position_ids.shape().numel(), 1, self.head_dim].as_slice())?;
         let [cos, sin] = [&self.cos, &self.sin].map(|table| {
             Ok::<_, TensorError<B::Error>>(
-                table.index_select(backend, 0, positions)?.reshape(shape)?,
+                table
+                    .index_select(backend, 0, position_ids)?
+                    .reshape(shape)?,
             )
         });
         Ok(RopeAngles {
@@ -100,19 +102,19 @@ impl<B: Backend> RopeAngles<B> {
 
 fn angles<E: std::error::Error + 'static>(
     inv_frequencies: &[f32],
-    seq_len_max: usize,
-    seq_len_max_allowed: usize,
+    max_cache_len: usize,
+    max_positions: usize,
 ) -> Result<Vec<f32>, LlamaError<E>> {
-    if seq_len_max > seq_len_max_allowed {
+    if max_cache_len > max_positions {
         error!(
             message = "Maximum sequence length exceeds the allowed length.",
-            seq_len_max, seq_len_max_allowed,
+            max_cache_len, max_positions,
         );
-        return Err(LlamaError::SeqLenMaxTooLarge);
+        return Err(LlamaError::MaxCacheLenTooLarge);
     }
     Ok(
         iter::successors(Some(0.0_f32), |position| Some(position + 1.0))
-            .take(seq_len_max)
+            .take(max_cache_len)
             .flat_map(|position| {
                 inv_frequencies
                     .iter()
@@ -273,7 +275,7 @@ mod tests {
     fn angles_reject_a_cache_beyond_the_allowed_length() {
         assert_eq!(
             angles::<Infallible>(&[1.0], 9, 8),
-            Err(LlamaError::SeqLenMaxTooLarge),
+            Err(LlamaError::MaxCacheLenTooLarge),
             "9 positions where 8 are allowed"
         );
     }

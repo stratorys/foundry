@@ -429,14 +429,14 @@ fn model_bytes<S: AsRef<[u8]>>(
                 CliError::TotalByteCountOverflow
             })
     })?;
-    if let Some(bytes_declared) = weights.bytes_declared()
-        && bytes != bytes_declared
+    if let Some(total_size) = weights.total_size()
+        && bytes != total_size
     {
         error!(
             message = "Tensor byte count does not match the index declaration.",
             %model,
             bytes,
-            bytes_declared,
+            total_size,
         );
         return Err(CliError::BytesMismatch);
     }
@@ -538,16 +538,16 @@ fn bench_on<B: Backend>(
     vocab_size: NonZeroU32,
     bench_config: &BenchConfig,
 ) -> Result<(String, Report), CliError> {
-    let seq_len_max = [
+    let max_cache_len = [
         bench_config.depth_token_count,
         bench_config.prompt_token_count,
         bench_config.gen_token_count,
     ]
     .into_iter()
-    .try_fold(0_usize, |seq_len_max, token_count| {
+    .try_fold(0_usize, |max_cache_len, token_count| {
         usize::try_from(token_count)
             .ok()
-            .and_then(|token_count| seq_len_max.checked_add(token_count))
+            .and_then(|token_count| max_cache_len.checked_add(token_count))
     })
     .ok_or_else(|| {
         error!(
@@ -558,7 +558,7 @@ fn bench_on<B: Backend>(
     })?;
     let device = backend.device_name();
     info!(message = "Selected the device.", %device);
-    let llama = load_llama(backend, model, config, weights, seq_len_max)?;
+    let llama = load_llama(backend, model, config, weights, max_cache_len)?;
     let report = bench(backend, &llama, vocab_size, bench_config).map_err(|error| {
         error!(message = "Benchmark failed.", %model, %error);
         CliError::Bench
@@ -598,7 +598,7 @@ fn load_llama<B: Backend>(
     model: &ModelId,
     config: &LlamaConfig,
     weights: &Weights,
-    seq_len_max: usize,
+    max_cache_len: usize,
 ) -> Result<Llama<B>, CliError> {
     info!(message = "Loading the model.", %model);
     let load_start = Instant::now();
@@ -606,14 +606,14 @@ fn load_llama<B: Backend>(
         error!(message = "Loading the model weights failed.", %model, %error);
         CliError::Load
     })?;
-    let llama = Llama::new(backend, config, llama_weights, seq_len_max).map_err(|error| {
-        error!(message = "Building the model failed.", %model, seq_len_max, %error);
+    let llama = Llama::new(backend, config, llama_weights, max_cache_len).map_err(|error| {
+        error!(message = "Building the model failed.", %model, max_cache_len, %error);
         CliError::Model
     })?;
     info!(
         message = "Loaded the model.",
         %model,
-        seq_len_max,
+        max_cache_len,
         load_ms = %load_start.elapsed().as_millis(),
     );
     Ok(llama)
@@ -631,7 +631,7 @@ fn generate_on<B: Backend>(
     prompt_ids: &[u32],
     max_new_tokens: usize,
 ) -> Result<Generation, CliError> {
-    let seq_len_max = prompt_ids
+    let max_cache_len = prompt_ids
         .len()
         .checked_add(max_new_tokens)
         .ok_or_else(|| {
@@ -642,13 +642,13 @@ fn generate_on<B: Backend>(
             );
             CliError::SeqLenOverflow
         })?;
-    let llama = load_llama(backend, model, config, weights, seq_len_max)?;
+    let llama = load_llama(backend, model, config, weights, max_cache_len)?;
     generate(
         backend,
         &llama,
         &[prompt_ids],
         max_new_tokens,
-        config.eos_token_ids(),
+        config.eos_token_id(),
     )
     .map_err(|error| {
         error!(message = "Generation failed.", %model, %error);

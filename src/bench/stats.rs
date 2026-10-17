@@ -3,7 +3,7 @@ use tracing::error;
 
 use crate::bench::error::BenchError;
 
-const PERCENT_MAX: u32 = 100;
+const MAX_PERCENT: u32 = 100;
 const U32_SPAN: f64 = 4_294_967_296.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -97,15 +97,15 @@ pub fn percentile(
     percent: u32,
 ) -> Option<f64> {
     let last = u32::try_from(sorted.len()).ok()?.checked_sub(1)?;
-    let rank_scaled = percent.min(PERCENT_MAX).checked_mul(last)?;
-    let lower_index = usize::try_from(rank_scaled.checked_div(PERCENT_MAX)?).ok()?;
-    let fraction_scaled = rank_scaled.checked_rem(PERCENT_MAX)?;
+    let rank_scaled = percent.min(MAX_PERCENT).checked_mul(last)?;
+    let lower_index = usize::try_from(rank_scaled.checked_div(MAX_PERCENT)?).ok()?;
+    let fraction_scaled = rank_scaled.checked_rem(MAX_PERCENT)?;
     let lower = *sorted.get(lower_index)?;
     let upper = sorted
         .get(lower_index.checked_add(1)?)
         .copied()
         .unwrap_or(lower);
-    Some(lower + (upper - lower) * f64::from(fraction_scaled) / f64::from(PERCENT_MAX))
+    Some(lower + (upper - lower) * f64::from(fraction_scaled) / f64::from(MAX_PERCENT))
 }
 
 pub fn ns_to_f64(ns: u64) -> f64 {

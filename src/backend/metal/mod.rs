@@ -279,12 +279,12 @@ impl MetalBackend {
         &mut self,
         nbytes: usize,
     ) -> Result<MetalStorage, MetalError> {
-        let bytes_max = self.device.maxBufferLength();
-        if nbytes > bytes_max {
+        let max_bytes = self.device.maxBufferLength();
+        if nbytes > max_bytes {
             error!(
                 message = "Buffer exceeds the maximum Metal buffer length.",
                 bytes = nbytes,
-                bytes_max,
+                max_bytes,
             );
             return Err(MetalError::BufferTooLarge);
         }

@@ -48,7 +48,7 @@ pub enum LlamaError<E: std::error::Error + 'static> {
     UploadedBytesOverflow,
 
     #[error("Maximum sequence length exceeds the allowed length.")]
-    SeqLenMaxTooLarge,
+    MaxCacheLenTooLarge,
 
     #[error("Head dim is not a positive even number.")]
     HeadDimInvalid,

@@ -36,16 +36,16 @@ pub struct Llama<B: Backend> {
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
-    seq_len_max: usize,
+    max_cache_len: usize,
 }
 
 struct ForwardStep<'input, B: Backend> {
     angles: RopeAngles<B>,
-    mask: &'input Tensor<B>,
-    position: usize,
+    attention_mask: &'input Tensor<B>,
+    past_seen_tokens: usize,
     batch_size: usize,
     seq_len: usize,
-    seq_len_total: usize,
+    kv_length: usize,
 }
 
 impl<B: Backend> Llama<B> {
@@ -53,10 +53,10 @@ impl<B: Backend> Llama<B> {
         backend: &mut B,
         config: &LlamaConfig,
         weights: LlamaWeights<B>,
-        seq_len_max: usize,
+        max_cache_len: usize,
     ) -> Result<Self, LlamaError<B::Error>> {
         let head_dim = config.head_dim();
-        let rope = LlamaRope::new(backend, config, seq_len_max)?;
+        let rope = LlamaRope::new(backend, config, max_cache_len)?;
         let head_dim_non_zero = NonZeroUsize::new(head_dim).ok_or_else(|| {
             error!(
                 message = "Head dim is not a positive even number.",
@@ -71,7 +71,7 @@ impl<B: Backend> Llama<B> {
             heads: config.num_attention_heads(),
             kv_heads: config.num_key_value_heads(),
             head_dim,
-            seq_len_max,
+            max_cache_len,
         })
     }
 }
@@ -94,7 +94,7 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
                     CACHE_DTYPE,
                     batch_size.get(),
                     self.kv_heads,
-                    self.seq_len_max,
+                    self.max_cache_len,
                     self.head_dim,
                 )
             })
@@ -105,29 +105,29 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
     fn forward(
         &self,
         backend: &mut B,
-        token_ids: &Tensor<B>,
-        positions: &Tensor<B>,
-        mask: &Tensor<B>,
-        cache: &mut Self::Cache,
-        position: usize,
+        input_ids: &Tensor<B>,
+        position_ids: &Tensor<B>,
+        attention_mask: &Tensor<B>,
+        past_key_values: &mut Self::Cache,
+        past_seen_tokens: usize,
     ) -> Result<Tensor<B>, Self::Error> {
-        let (batch_size, seq_len_total) = forward_dims(
-            token_ids.shape().numel(),
-            positions.shape().numel(),
-            position,
-            self.seq_len_max,
-            cache.len(),
+        let (batch_size, kv_length) = forward_dims(
+            input_ids.shape().numel(),
+            position_ids.shape().numel(),
+            past_seen_tokens,
+            self.max_cache_len,
+            past_key_values.len(),
             self.weights.layers().len(),
         )?;
         let step = ForwardStep {
-            angles: self.rope.at(backend, positions)?,
-            mask,
-            position,
+            angles: self.rope.at(backend, position_ids)?,
+            attention_mask,
+            past_seen_tokens,
             batch_size,
-            seq_len: positions.shape().numel(),
-            seq_len_total,
+            seq_len: position_ids.shape().numel(),
+            kv_length,
         };
-        self.logits(backend, token_ids, cache, &step)
+        self.logits(backend, input_ids, past_key_values, &step)
             .map_err(LlamaError::from)
     }
 }
@@ -135,8 +135,8 @@ impl<B: Backend> CausalLm<B> for Llama<B> {
 fn forward_dims<E: std::error::Error + 'static>(
     token_count: usize,
     seq_len: usize,
-    position: usize,
-    seq_len_max: usize,
+    past_seen_tokens: usize,
+    max_cache_len: usize,
     cache_count: usize,
     layer_count: usize,
 ) -> Result<(usize, usize), LlamaError<E>> {
@@ -154,13 +154,13 @@ fn forward_dims<E: std::error::Error + 'static>(
         );
         return Err(LlamaError::BatchMismatch);
     };
-    let seq_len_total = position
+    let kv_length = past_seen_tokens
         .checked_add(seq_len)
-        .filter(|&seq_len_total| seq_len_total <= seq_len_max)
+        .filter(|&kv_length| kv_length <= max_cache_len)
         .ok_or_else(|| {
             error!(
                 message = "Tokens exceed the cache length.",
-                position, seq_len, seq_len_max,
+                past_seen_tokens, seq_len, max_cache_len,
             );
             LlamaError::CacheOverflow
         })?;
@@ -171,19 +171,19 @@ fn forward_dims<E: std::error::Error + 'static>(
         );
         return Err(LlamaError::CacheLayerCount);
     }
-    Ok((batch_size, seq_len_total))
+    Ok((batch_size, kv_length))
 }
 
 impl<B: Backend> Llama<B> {
     fn logits(
         &self,
         backend: &mut B,
-        token_ids: &Tensor<B>,
-        cache: &mut [KvCache<B>],
+        input_ids: &Tensor<B>,
+        past_key_values: &mut [KvCache<B>],
         step: &ForwardStep<'_, B>,
     ) -> Result<Tensor<B>, TensorError<B::Error>> {
-        let embedded = self.weights.embedding().forward(backend, token_ids)?;
-        let hidden = self.weights.layers().iter().zip(cache).try_fold(
+        let embedded = self.weights.embedding().forward(backend, input_ids)?;
+        let hidden = self.weights.layers().iter().zip(past_key_values).try_fold(
             embedded,
             |hidden, (layer, layer_cache)| {
                 self.decoder_layer(backend, layer, layer_cache, &hidden, step)
@@ -236,10 +236,10 @@ impl<B: Backend> Llama<B> {
             .forward(backend, &normed)?
             .reshape(kv_shape)?
             .permute(&HEAD_MAJOR)?;
-        cache.update(backend, &key, &value, step.position)?;
+        cache.update(backend, &key, &value, step.past_seen_tokens)?;
         let attended =
             self.attention
-                .forward(backend, &query, cache, step.seq_len_total, step.mask)?;
+                .forward(backend, &query, cache, step.kv_length, step.attention_mask)?;
         let attention_output = layer.o_proj().forward(backend, &attended)?;
         let hidden = hidden.add(backend, &attention_output)?;
         let mlp_input = layer.post_attention_norm().forward(backend, &hidden)?;

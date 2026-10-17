@@ -185,7 +185,7 @@ impl<B: Backend, S: AsRef<[u8]>> Loader<'_, B, S> {
         name: &str,
         dims_expected: &[usize],
     ) -> Result<Tensor<B>, LlamaError<B::Error>> {
-        let view = checked_view(self.weights.get(name), name, dims_expected)?;
+        let view = checked_view(self.weights.tensor(name), name, dims_expected)?;
         let tensor = Tensor::from_bytes(self.backend, view.bytes, view.dtype, view.shape)?;
         self.bytes_uploaded = self
             .bytes_uploaded

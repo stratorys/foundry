@@ -58,7 +58,7 @@ pub fn exact_f32(value: usize) -> Result<f32, CoreError> {
         error!(
             message = "Value exceeds the largest value converted exactly to f32.",
             value,
-            value_max = u16::MAX,
+            max_value = u16::MAX,
         );
         CoreError::DimensionTooLargeForF32
     })
