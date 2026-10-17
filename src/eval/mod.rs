@@ -175,13 +175,14 @@ pub fn eval_reference<D: Device, M: CausalLm<D>>(
     device: &mut D,
     model: &M,
     modules: &[(String, &dyn Module<D>)],
+    module_atol: fn(&str) -> f32,
     eos_token_id: &[u32],
     reference: &Reference,
 ) -> Result<ReferenceReport, EvalError> {
     let layers = reference
         .activations
         .as_ref()
-        .map(|activations| eval_layers(device, modules, activations))
+        .map(|activations| eval_layers(device, modules, module_atol, activations))
         .transpose()?;
     let generation = reference
         .generation
@@ -211,17 +212,19 @@ pub fn eval_reference<D: Device, M: CausalLm<D>>(
 pub fn eval_layers<D: Device, S: AsRef<[u8]>>(
     device: &mut D,
     modules: &[(String, &dyn Module<D>)],
+    module_atol: fn(&str) -> f32,
     weights: &Weights<S>,
 ) -> Result<Vec<LayerReport>, EvalError> {
     activations(weights)?
         .iter()
-        .map(|activation| eval_layer(device, modules, activation))
+        .map(|activation| eval_layer(device, modules, module_atol, activation))
         .collect()
 }
 
 fn eval_layer<D: Device>(
     device: &mut D,
     modules: &[(String, &dyn Module<D>)],
+    module_atol: fn(&str) -> f32,
     activation: &Activation<'_>,
 ) -> Result<LayerReport, EvalError> {
     let Activation {
@@ -229,9 +232,13 @@ fn eval_layer<D: Device>(
         input,
         output: expected,
     } = *activation;
+    let tolerance = Tolerance {
+        atol: module_atol(name),
+        rtol: RTOL,
+    };
     let report = |outcome| LayerReport {
         name: name.to_owned(),
-        tolerance: tolerance(name),
+        tolerance,
         outcome,
     };
     let Some((_, module)) = modules.iter().find(|(module_name, _)| module_name == name) else {
@@ -264,7 +271,7 @@ fn eval_layer<D: Device>(
     let close = compare_close(
         &to_f32(actual.dtype(), &actual_bytes)?,
         &to_f32(expected.dtype, expected.bytes)?,
-        tolerance(name),
+        tolerance,
     )?;
     Ok(report(if close.passed() {
         LayerOutcome::Passed(close)
@@ -379,18 +386,6 @@ fn eval_prompt<D: Device, M: CausalLm<D>>(
     })
 }
 
-fn tolerance(name: &str) -> Tolerance {
-    let atol = match name.rsplit('.').next() {
-        Some("embed_tokens") => 1e-3,
-        Some("q_proj" | "k_proj" | "o_proj") => 2e-2,
-        _ => 1e-2,
-    };
-    Tolerance {
-        atol,
-        rtol: RTOL,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -400,26 +395,7 @@ mod tests {
         LayerOutcome,
         LayerReport,
         Tolerance,
-        tolerance,
     };
-
-    #[test]
-    fn tolerance_depends_on_the_last_module_name() {
-        assert_eq!(
-            [
-                "model.embed_tokens",
-                "model.layers.0.self_attn.q_proj",
-                "model.layers.0.self_attn.k_proj",
-                "model.layers.0.self_attn.o_proj",
-                "model.layers.0.self_attn.v_proj",
-                "model.layers.0.mlp",
-                "model.layers.0.input_layernorm",
-            ]
-            .map(|name| tolerance(name).atol),
-            [1e-3, 2e-2, 2e-2, 2e-2, 1e-2, 1e-2, 1e-2],
-            "embedding, three projections, then the other modules"
-        );
-    }
 
     #[test]
     fn is_failure_holds_for_failed_and_mismatched_layers() {

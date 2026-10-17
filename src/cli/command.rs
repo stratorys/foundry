@@ -36,6 +36,7 @@ use foundry::generate::generate;
 use foundry::models::llama::{
     LlamaConfig,
     LlamaForCausalLm,
+    module_atol,
 };
 use foundry::nn::Device;
 use foundry::weights::Weights;
@@ -244,6 +245,7 @@ pub fn eval_command<D: Device>(
                 &mut device,
                 &llama,
                 &modules,
+                module_atol,
                 config.eos_token_id(),
                 reference,
             )

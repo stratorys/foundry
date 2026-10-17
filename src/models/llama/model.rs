@@ -359,13 +359,40 @@ fn logits_range(
     (seq_len.saturating_sub(kept), kept)
 }
 
+pub fn module_atol(name: &str) -> f32 {
+    match name.rsplit('.').next() {
+        Some("embed_tokens") => 1e-3,
+        Some("q_proj" | "k_proj" | "o_proj") => 2e-2,
+        _ => 1e-2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::models::llama::LlamaError;
     use crate::models::llama::model::{
         check_forward,
         logits_range,
+        module_atol,
     };
+
+    #[test]
+    fn module_atol_depends_on_the_last_module_name() {
+        assert_eq!(
+            [
+                "model.embed_tokens",
+                "model.layers.0.self_attn.q_proj",
+                "model.layers.0.self_attn.k_proj",
+                "model.layers.0.self_attn.o_proj",
+                "model.layers.0.self_attn.v_proj",
+                "model.layers.0.mlp",
+                "model.layers.0.input_layernorm",
+            ]
+            .map(module_atol),
+            [1e-3, 2e-2, 2e-2, 2e-2, 1e-2, 1e-2, 1e-2],
+            "embedding, three projections, then the other modules"
+        );
+    }
 
     #[test]
     fn check_forward_accepts_whole_batches_that_fit_the_cache() {

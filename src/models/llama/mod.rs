@@ -14,4 +14,7 @@ pub use self::error::{
     LlamaConfigError,
     LlamaError,
 };
-pub use self::model::LlamaForCausalLm;
+pub use self::model::{
+    LlamaForCausalLm,
+    module_atol,
+};
