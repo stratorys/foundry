@@ -2,6 +2,7 @@ use std::num::NonZeroUsize;
 
 use tracing::error;
 
+use crate::eval::Submodules;
 use crate::generate::CausalLm;
 use crate::models::llama::attention::LlamaAttention;
 use crate::models::llama::error::tensor_failed;
@@ -120,6 +121,24 @@ impl<B: Backend> CausalLm<B> for LlamaForCausalLm<B> {
     }
 }
 
+impl<B: Backend> Submodules<B> for LlamaForCausalLm<B> {
+    type Error = LlamaError;
+
+    fn forward_submodule(
+        &self,
+        backend: &mut B,
+        target: &str,
+        input: &Tensor<B>,
+    ) -> Result<Option<Tensor<B>>, Self::Error> {
+        let Some(target) = target.strip_prefix("model.") else {
+            return Ok(None);
+        };
+        self.model
+            .forward_submodule(backend, target, input)
+            .map_err(tensor_failed)
+    }
+}
+
 impl<B: Backend> LlamaForCausalLm<B> {
     fn last_token_logits(
         &self,
@@ -220,6 +239,47 @@ impl<B: Backend> LlamaModel<B> {
     }
 }
 
+impl<B: Backend> LlamaModel<B> {
+    fn forward_submodule(
+        &self,
+        backend: &mut B,
+        target: &str,
+        input: &Tensor<B>,
+    ) -> Result<Option<Tensor<B>>, TensorError> {
+        if target == "embed_tokens" {
+            return self.embed(backend, input).map(Some);
+        }
+        let Some((layer_idx, target)) = layer_target(target) else {
+            return Ok(None);
+        };
+        match self.layers.get(layer_idx) {
+            Some(layer) => layer.forward_submodule(backend, target, input),
+            None => Ok(None),
+        }
+    }
+
+    fn embed(
+        &self,
+        backend: &mut B,
+        input_ids: &Tensor<B>,
+    ) -> Result<Tensor<B>, TensorError> {
+        let flat_ids =
+            input_ids.reshape(Shape::try_from([input_ids.shape().numel()].as_slice())?)?;
+        let inputs_embeds = self.embed_tokens.forward(backend, &flat_ids)?;
+        let hidden_size = inputs_embeds
+            .shape()
+            .size(inputs_embeds.shape().last_dim()?)?;
+        let dims: Vec<usize> = input_ids
+            .shape()
+            .dims()
+            .iter()
+            .copied()
+            .chain([hidden_size])
+            .collect();
+        inputs_embeds.reshape(Shape::try_from(dims.as_slice())?)
+    }
+}
+
 impl<B: Backend> LlamaDecoderLayer<B> {
     fn load<S: AsRef<[u8]>>(
         backend: &mut B,
@@ -283,6 +343,33 @@ impl<B: Backend> LlamaDecoderLayer<B> {
     }
 }
 
+impl<B: Backend> LlamaDecoderLayer<B> {
+    fn forward_submodule(
+        &self,
+        backend: &mut B,
+        target: &str,
+        input: &Tensor<B>,
+    ) -> Result<Option<Tensor<B>>, TensorError> {
+        match target {
+            "input_layernorm" => self.input_layernorm.forward(backend, input).map(Some),
+            "post_attention_layernorm" => self
+                .post_attention_layernorm
+                .forward(backend, input)
+                .map(Some),
+            "mlp" => self.mlp.forward(backend, input).map(Some),
+            _ => match target.strip_prefix("self_attn.") {
+                Some(target) => self.self_attn.forward_submodule(backend, target, input),
+                None => Ok(None),
+            },
+        }
+    }
+}
+
+fn layer_target(target: &str) -> Option<(usize, &str)> {
+    let (layer_idx, target) = target.strip_prefix("layers.")?.split_once('.')?;
+    Some((layer_idx.parse().ok()?, target))
+}
+
 fn load_rms_norm<B: Backend, S: AsRef<[u8]>>(
     backend: &mut B,
     config: &LlamaConfig,
@@ -339,7 +426,31 @@ fn check_forward(
 #[cfg(test)]
 mod tests {
     use crate::models::llama::LlamaError;
-    use crate::models::llama::model::check_forward;
+    use crate::models::llama::model::{
+        check_forward,
+        layer_target,
+    };
+
+    #[test]
+    fn layer_target_splits_the_layer_index_from_the_submodule() {
+        assert_eq!(
+            [
+                layer_target("layers.0.mlp"),
+                layer_target("layers.27.self_attn.q_proj"),
+                layer_target("layers.x.mlp"),
+                layer_target("layers.0"),
+                layer_target("norm"),
+            ],
+            [
+                Some((0, "mlp")),
+                Some((27, "self_attn.q_proj")),
+                None,
+                None,
+                None,
+            ],
+            "a layer submodule, a nested one, a non-numeric index, no submodule, no layer"
+        );
+    }
 
     #[test]
     fn check_forward_accepts_whole_batches_that_fit_the_cache() {

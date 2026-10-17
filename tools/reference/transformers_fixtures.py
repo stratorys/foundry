@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--out", type=Path, help="Output directory. Defaults to .private-data/fixtures/<owner>--<name>/transformers.")
+    parser.add_argument("--out", type=Path, required=True, help="Output directory.")
     return parser.parse_args()
 
 
@@ -86,7 +86,8 @@ def layer_0_activations(model, prompt_ids, device):
 
     def record(name):
         def hook(_module, inputs, output):
-            activations[f"{name}.input"] = inputs[0].detach().cpu().clone()
+            input = inputs[0].detach().cpu()
+            activations[f"{name}.input"] = (input.to(torch.uint32) if input.dtype == torch.int64 else input).clone()
             activations[f"{name}.output"] = output.detach().cpu().clone()
 
         return hook
@@ -102,8 +103,7 @@ def layer_0_activations(model, prompt_ids, device):
 def main():
     args = parse_args()
     snapshot = Path(snapshot_download(args.model, local_files_only=True))
-    owner, name = args.model.split("/")
-    out = args.out or Path(".private-data/fixtures") / f"{owner}--{name}" / ENGINE
+    out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(snapshot)

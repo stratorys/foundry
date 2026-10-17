@@ -137,6 +137,22 @@ impl<B: Backend> LlamaAttention<B> {
         )?)?;
         self.o_proj.forward(backend, &attn_output)
     }
+
+    pub fn forward_submodule(
+        &self,
+        backend: &mut B,
+        target: &str,
+        input: &Tensor<B>,
+    ) -> Result<Option<Tensor<B>>, TensorError> {
+        let proj = match target {
+            "q_proj" => &self.q_proj,
+            "k_proj" => &self.k_proj,
+            "v_proj" => &self.v_proj,
+            "o_proj" => &self.o_proj,
+            _ => return Ok(None),
+        };
+        proj.forward(backend, input).map(Some)
+    }
 }
 
 fn scaling<B: Backend>(

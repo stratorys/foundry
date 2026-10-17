@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--prompt-ids", action="append", default=[], help="Comma-separated prompt token IDs. Repeatable.")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--out", type=Path, help="Output directory. Defaults to .private-data/fixtures/<owner>--<name>/mlx.")
+    parser.add_argument("--out", type=Path, required=True, help="Output directory.")
     return parser.parse_args()
 
 
@@ -73,8 +73,7 @@ def generate(model, prompt_ids, args, eos):
 def main():
     args = parse_args()
     snapshot = Path(snapshot_download(args.model, local_files_only=True))
-    owner, name = args.model.split("/")
-    out = args.out or Path(".private-data/fixtures") / f"{owner}--{name}" / ENGINE
+    out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
     model, tokenizer = load(str(snapshot))

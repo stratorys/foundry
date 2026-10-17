@@ -33,6 +33,12 @@ use foundry::bench::{
     git_commit,
     rfc3339_utc,
 };
+use foundry::eval::{
+    LayerOutcome,
+    LayerReport,
+    eval_layers,
+    read_activations,
+};
 use foundry::generate::{
     Generation,
     generate,
@@ -52,6 +58,9 @@ use tracing::{
 };
 
 const BACKEND_NAME: &str = "metal";
+const BENCH_REPORT_FILE: &str = "report.json";
+const EVAL_REPORT_FILE: &str = "eval.json";
+const EVAL_MAX_CACHE_LEN: usize = 1;
 
 #[derive(Parser)]
 #[command(about = "Foundry LLM inference engine.")]
@@ -83,6 +92,10 @@ enum Command {
         about = "Benchmark prefill and greedy decode on random token IDs and write report.json."
     )]
     Bench(BenchArgs),
+    #[command(
+        about = "Compare each submodule with reference activations on Metal and write eval.json."
+    )]
+    Eval(EvalArgs),
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]
@@ -124,6 +137,19 @@ struct BenchArgs {
     #[arg(long, default_value_t = 0, help = "Seed of the random token IDs.")]
     seed: u64,
     #[arg(long, help = "Directory that receives report.json.")]
+    out: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+struct EvalArgs {
+    #[arg(long, help = "Hugging Face repository id, as owner/name.")]
+    model: ModelId,
+    #[arg(
+        long,
+        help = "Safetensors file of {module}.input and {module}.output reference activations."
+    )]
+    activations: PathBuf,
+    #[arg(long, help = "Directory that receives eval.json.")]
     out: PathBuf,
 }
 
@@ -180,8 +206,17 @@ enum CliError {
     #[error("Benchmark failed.")]
     Bench,
 
-    #[error("Writing the benchmark report failed.")]
+    #[error("Writing the report failed.")]
     Report,
+
+    #[error("Reading the reference activations failed.")]
+    Activations,
+
+    #[error("Evaluation failed.")]
+    Eval,
+
+    #[error("A submodule does not match the reference activations.")]
+    EvalMismatch,
 
     #[error("System clock cannot be formatted as an RFC 3339 time.")]
     Timestamp,
@@ -195,6 +230,12 @@ struct BenchRecord {
     metadata: Metadata,
     #[serde(flatten)]
     report: Report,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalRecord {
+    metadata: Metadata,
+    layers: Vec<LayerReport>,
 }
 
 impl FromStr for ModelId {
@@ -237,6 +278,7 @@ fn main() -> ExitCode {
             max_new_tokens,
         } => run(&model, &prompt_ids, max_new_tokens),
         Command::Bench(args) => bench_command(&args),
+        Command::Eval(args) => eval_command(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -354,7 +396,7 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
         },
         report,
     };
-    let report_path = write_bench_report(&args.out, &record)?;
+    let report_path = write_report(&args.out, BENCH_REPORT_FILE, &record)?;
     info!(
         message = "Benchmarked the model.",
         backend = BACKEND_NAME,
@@ -368,6 +410,61 @@ fn bench_command(args: &BenchArgs) -> Result<(), CliError> {
         peak_memory_source = ?record.report.peak_memory_source,
         report = %report_path.display(),
     );
+    Ok(())
+}
+
+fn eval_command(args: &EvalArgs) -> Result<(), CliError> {
+    let test_time = test_time()?;
+    let git_commit = read_git_commit();
+    let directory = resolve_snapshot(&args.model)?;
+    let config = open_config(&directory)?;
+    let weights = open_weights(&directory)?;
+    let model_bytes = model_bytes(&args.model, &weights)?;
+    let model_parameter_count = parameter_count(&args.model, &weights)?;
+    let activations = read_activations(&args.activations).map_err(|error| {
+        error!(
+            message = "Reading the reference activations failed.",
+            path = %args.activations.display(),
+            %error,
+        );
+        CliError::Activations
+    })?;
+    let (device, layers) = eval_on_platform(&args.model, &config, &weights, &activations)?;
+    let record = EvalRecord {
+        metadata: Metadata {
+            git_commit,
+            test_time,
+            backend: BACKEND_NAME.to_owned(),
+            device,
+            model_id: args.model.to_string(),
+            model_bytes,
+            model_parameter_count,
+        },
+        layers,
+    };
+    let report_path = write_report(&args.out, EVAL_REPORT_FILE, &record)?;
+    let failed_count = record
+        .layers
+        .iter()
+        .filter(|layer| layer.outcome.is_failure())
+        .count();
+    let skipped_count = record
+        .layers
+        .iter()
+        .filter(|layer| layer.outcome == LayerOutcome::Skipped)
+        .count();
+    info!(
+        message = "Evaluated the submodules.",
+        backend = BACKEND_NAME,
+        device = %record.metadata.device,
+        layer_count = record.layers.len(),
+        failed_count,
+        skipped_count,
+        report = %report_path.display(),
+    );
+    if failed_count > 0 {
+        return Err(CliError::EvalMismatch);
+    }
     Ok(())
 }
 
@@ -522,6 +619,48 @@ fn bench_on_platform(
     Err(CliError::BackendUnavailable)
 }
 
+#[cfg(target_os = "macos")]
+fn eval_on_platform(
+    model: &ModelId,
+    config: &LlamaConfig,
+    weights: &Weights,
+    activations: &Weights<Vec<u8>>,
+) -> Result<(String, Vec<LayerReport>), CliError> {
+    eval_on(&mut metal_backend()?, model, config, weights, activations)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn eval_on_platform(
+    _model: &ModelId,
+    _config: &LlamaConfig,
+    _weights: &Weights,
+    _activations: &Weights<Vec<u8>>,
+) -> Result<(String, Vec<LayerReport>), CliError> {
+    error!(message = "No backend is available on this platform.");
+    Err(CliError::BackendUnavailable)
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no backend on this platform")
+)]
+fn eval_on<B: Backend>(
+    backend: &mut B,
+    model: &ModelId,
+    config: &LlamaConfig,
+    weights: &Weights,
+    activations: &Weights<Vec<u8>>,
+) -> Result<(String, Vec<LayerReport>), CliError> {
+    let device = backend.device_name();
+    info!(message = "Selected the device.", %device);
+    let llama = load_llama(backend, model, config, weights, EVAL_MAX_CACHE_LEN)?;
+    let layers = eval_layers(backend, &llama, activations).map_err(|error| {
+        error!(message = "Evaluation failed.", %model, %error);
+        CliError::Eval
+    })?;
+    Ok((device, layers))
+}
+
 #[cfg_attr(
     not(target_os = "macos"),
     expect(dead_code, reason = "no backend on this platform")
@@ -562,14 +701,15 @@ fn bench_on<B: Backend>(
     Ok((device, report))
 }
 
-fn write_bench_report(
+fn write_report(
     out: &Path,
-    record: &BenchRecord,
+    file_name: &str,
+    record: &impl Serialize,
 ) -> Result<PathBuf, CliError> {
-    let report_path = out.join("report.json");
+    let report_path = out.join(file_name);
     let write_error = |error: &dyn std::error::Error| {
         error!(
-            message = "Writing the benchmark report failed.",
+            message = "Writing the report failed.",
             path = %report_path.display(),
             %error,
         );
@@ -682,6 +822,7 @@ mod tests {
         Cli,
         CliError,
         Command,
+        EvalArgs,
         ModelId,
         ModelIdError,
         model_bytes,
@@ -893,7 +1034,8 @@ mod tests {
                 Command::Bench(args) => Some(args.batch_size),
                 Command::Run {
                     ..
-                } => None,
+                }
+                | Command::Eval(_) => None,
             })
             .map_err(|error| error.kind()),
             Ok(NonZeroU32::new(8)),
@@ -950,6 +1092,58 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn eval_parses_model_activations_and_out() {
+        assert_eq!(
+            Cli::try_parse_from([
+                "foundry",
+                "eval",
+                "--model",
+                "a/b",
+                "--activations",
+                "fixtures/activations.safetensors",
+                "--out",
+                "reports",
+            ])
+            .map(|cli| cli.command)
+            .map_err(|error| error.kind()),
+            Ok(Command::Eval(EvalArgs {
+                model: ModelId {
+                    owner: "a".to_owned(),
+                    name: "b".to_owned(),
+                },
+                activations: PathBuf::from("fixtures/activations.safetensors"),
+                out: PathBuf::from("reports"),
+            })),
+            "the activations path is taken as given"
+        );
+    }
+
+    #[test]
+    fn eval_rejects_missing_activations_or_out() {
+        [
+            vec!["foundry", "eval", "--model", "a/b", "--out", "r"],
+            vec![
+                "foundry",
+                "eval",
+                "--model",
+                "a/b",
+                "--activations",
+                "a.safetensors",
+            ],
+        ]
+        .into_iter()
+        .for_each(|args| {
+            assert_eq!(
+                Cli::try_parse_from(&args)
+                    .map(|cli| cli.command)
+                    .map_err(|error| error.kind()),
+                Err(ErrorKind::MissingRequiredArgument),
+                "args {args:?}"
+            );
+        });
     }
 
     #[test]

@@ -30,7 +30,7 @@ By default, the scripts use the eight prompts in `prompts.txt`, taken from vLLM'
 | `--max-tokens N` | 32 | Maximum number of greedy tokens per prompt, as in vLLM's model tests. |
 | `--top-k K` | 5 | Number of top logprobs recorded at each step, as in vLLM's model tests. |
 | `--device DEVICE` | `cpu` | Torch device. transformers only. |
-| `--out DIR` | `.private-data/fixtures/<owner>--<name>/<engine>/` | Output directory. |
+| `--out DIR` | required | Output directory. |
 
 Passing `--prompt` or `--prompt-ids` replaces the default prompts. To keep them, pass them again
 with `--prompt`.
