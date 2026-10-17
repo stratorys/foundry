@@ -1,5 +1,6 @@
 mod error;
 
+use std::collections::hash_map::Entry;
 use std::collections::{
     BTreeMap,
     BTreeSet,
@@ -50,11 +51,6 @@ pub struct WeightView<'weights> {
     pub dtype: DType,
     pub shape: Shape,
     pub bytes: &'weights [u8],
-}
-
-struct IndexedTensor {
-    shard_index: usize,
-    tensor: ShardTensor,
 }
 
 struct TensorEntry {
@@ -168,42 +164,17 @@ impl<S: AsRef<[u8]>> Weights<S> {
         index: Option<IndexFile>,
         shards: Vec<Shard<S>>,
     ) -> Result<Self, WeightsError> {
-        let shard_tensors = shards
-            .iter()
-            .map(|shard| parse_shard(&directory.join(&shard.name), shard.bytes.as_ref()))
-            .collect::<Result<Vec<Vec<ShardTensor>>, WeightsError>>()?;
-        let tensors = shard_tensors
-            .into_iter()
-            .enumerate()
-            .flat_map(|(shard_index, tensors)| {
-                tensors.into_iter().map(move |tensor| IndexedTensor {
-                    shard_index,
-                    tensor,
-                })
-            })
-            .try_fold(HashMap::new(), |mut tensors, indexed| {
-                let IndexedTensor {
-                    shard_index,
-                    tensor,
-                } = indexed;
-                if tensors.contains_key(&tensor.name) {
-                    error!(
-                        message = "Tensor appears in more than one shard.",
-                        name = tensor.name,
-                    );
-                    return Err(WeightsError::DuplicateTensor);
-                }
-                tensors.insert(
-                    tensor.name,
-                    TensorEntry {
-                        dtype: tensor.dtype,
-                        shape: tensor.shape,
-                        shard_index,
-                        byte_range: tensor.byte_range,
-                    },
-                );
-                Ok(tensors)
-            })?;
+        let tensors =
+            shards
+                .iter()
+                .zip(0..)
+                .try_fold(HashMap::new(), |tensors, (shard, shard_index)| {
+                    parse_shard(&directory.join(&shard.name), shard.bytes.as_ref())?
+                        .into_iter()
+                        .try_fold(tensors, |tensors, tensor| {
+                            insert_tensor(tensors, shard_index, tensor)
+                        })
+                })?;
         if let Some(index) = &index {
             check_index(&index.weight_map, &shards, &tensors)?;
         }
@@ -334,6 +305,31 @@ fn parse_tensor(
         shape,
         byte_range: start..stop,
     })
+}
+
+fn insert_tensor(
+    mut tensors: HashMap<String, TensorEntry>,
+    shard_index: usize,
+    tensor: ShardTensor,
+) -> Result<HashMap<String, TensorEntry>, WeightsError> {
+    match tensors.entry(tensor.name) {
+        Entry::Occupied(occupied) => {
+            error!(
+                message = "Tensor appears in more than one shard.",
+                name = occupied.key(),
+            );
+            return Err(WeightsError::DuplicateTensor);
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(TensorEntry {
+                dtype: tensor.dtype,
+                shape: tensor.shape,
+                shard_index,
+                byte_range: tensor.byte_range,
+            });
+        }
+    }
+    Ok(tensors)
 }
 
 fn parse_dtype(dtype: Dtype) -> Option<DType> {
