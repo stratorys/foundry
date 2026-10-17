@@ -23,5 +23,6 @@ pub trait CausalLm<D: Device> {
         input_ids: &Tensor<D>,
         past_key_values: &mut Self::Cache,
         past_seen_tokens: usize,
+        logits_to_keep: usize,
     ) -> Result<Tensor<D>, Self::Error>;
 }

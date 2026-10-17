@@ -19,7 +19,6 @@ use crate::nn::{
     Linear,
     Module,
     RmsNorm,
-    Shape,
     StaticCache,
     Tensor,
     TensorError,
@@ -96,8 +95,9 @@ impl<D: Device> CausalLm<D> for LlamaForCausalLm<D> {
         input_ids: &Tensor<D>,
         past_key_values: &mut Self::Cache,
         past_seen_tokens: usize,
+        logits_to_keep: usize,
     ) -> Result<Tensor<D>, Self::Error> {
-        check_forward(
+        let seq_len = check_forward(
             input_ids.shape().dims(),
             past_seen_tokens,
             self.model.max_cache_len,
@@ -106,9 +106,19 @@ impl<D: Device> CausalLm<D> for LlamaForCausalLm<D> {
         )?;
         let hidden_states = self
             .model
-            .forward(device, input_ids, past_key_values, past_seen_tokens)
+            .forward(
+                device,
+                input_ids,
+                past_key_values,
+                past_seen_tokens,
+                seq_len,
+            )
             .map_err(tensor_failed)?;
-        self.last_token_logits(device, &hidden_states)
+        let (start, kept) = logits_range(seq_len, logits_to_keep);
+        hidden_states
+            .narrow(SEQ_DIM, start, kept)
+            .and_then(|hidden_states| hidden_states.contiguous(device))
+            .and_then(|hidden_states| self.lm_head.forward(device, &hidden_states))
             .map_err(tensor_failed)
     }
 }
@@ -116,25 +126,6 @@ impl<D: Device> CausalLm<D> for LlamaForCausalLm<D> {
 impl<D: Device> LlamaForCausalLm<D> {
     pub fn named_modules(&self) -> Vec<(String, &dyn Module<D>)> {
         self.model.named_modules("model")
-    }
-
-    fn last_token_logits(
-        &self,
-        device: &mut D,
-        hidden_states: &Tensor<D>,
-    ) -> Result<Tensor<D>, TensorError> {
-        let &[batch_size, seq_len, hidden_size] = hidden_states.shape().dims() else {
-            error!(
-                message = "Model output is not [batch, seq, hidden].",
-                dims = ?hidden_states.shape().dims(),
-            );
-            return Err(TensorError::DimOutOfRange);
-        };
-        let last_hidden_state = hidden_states
-            .narrow(SEQ_DIM, seq_len.saturating_sub(1), 1)?
-            .contiguous(device)?
-            .reshape(Shape::try_from([batch_size, hidden_size].as_slice())?)?;
-        self.lm_head.forward(device, &last_hidden_state)
     }
 }
 
@@ -180,8 +171,8 @@ impl<D: Device> LlamaModel<D> {
         input_ids: &Tensor<D>,
         past_key_values: &mut StaticCache<D>,
         past_seen_tokens: usize,
+        seq_len: usize,
     ) -> Result<Tensor<D>, TensorError> {
-        let seq_len = input_ids.shape().size(SEQ_DIM)?;
         let position_ids = position_ids(device, past_seen_tokens, seq_len)?;
         let attention_mask = create_causal_mask(device, past_seen_tokens, seq_len)?;
         let inputs_embeds = self.embed_tokens.forward(device, input_ids)?;
@@ -325,7 +316,7 @@ fn check_forward(
     max_cache_len: usize,
     cache_count: usize,
     layer_count: usize,
-) -> Result<(), LlamaError> {
+) -> Result<usize, LlamaError> {
     let &[batch_size, seq_len] = dims else {
         error!(message = "Input IDs are not [batch, seq_len].", ?dims);
         return Err(LlamaError::InputIdsShape);
@@ -354,13 +345,27 @@ fn check_forward(
         );
         return Err(LlamaError::CacheLayerCount);
     }
-    Ok(())
+    Ok(seq_len)
+}
+
+fn logits_range(
+    seq_len: usize,
+    logits_to_keep: usize,
+) -> (usize, usize) {
+    let kept = match logits_to_keep {
+        0 => seq_len,
+        logits_to_keep => logits_to_keep.min(seq_len),
+    };
+    (seq_len.saturating_sub(kept), kept)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::models::llama::LlamaError;
-    use crate::models::llama::model::check_forward;
+    use crate::models::llama::model::{
+        check_forward,
+        logits_range,
+    };
 
     #[test]
     fn check_forward_accepts_whole_batches_that_fit_the_cache() {
@@ -369,7 +374,7 @@ mod tests {
                 check_forward(&[2, 3], 4, 8, 2, 2),
                 check_forward(&[2, 3], 5, 8, 2, 2)
             ],
-            [Ok(()), Ok(())],
+            [Ok(3), Ok(3)],
             "two sequences of three tokens from position 4, then up to the cache end"
         );
     }
@@ -395,6 +400,16 @@ mod tests {
             ],
             "flat ids, no position, no sequence, past the cache end, position overflow, missing \
              layer cache"
+        );
+    }
+
+    #[test]
+    fn logits_range_keeps_the_last_positions() {
+        assert_eq!(
+            [(5, 0), (5, 1), (5, 3), (5, 5), (5, 9)]
+                .map(|(seq_len, logits_to_keep)| logits_range(seq_len, logits_to_keep)),
+            [(0, 5), (4, 1), (2, 3), (0, 5), (0, 5)],
+            "every position, the last one, the last three, exactly all, more than the sequence"
         );
     }
 }

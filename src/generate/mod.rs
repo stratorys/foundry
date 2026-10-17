@@ -17,7 +17,8 @@ use crate::nn::{
     Tensor,
 };
 
-const VOCAB_DIM: usize = 1;
+const VOCAB_DIM: usize = 2;
+const LOGITS_TO_KEEP: usize = 1;
 const TOKEN_ID_BYTES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +151,13 @@ impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
         let input_ids =
             self.tensor_from_bytes(&token_bytes, DType::U32, &[self.batch_size.get(), seq_len])?;
         self.model
-            .forward(self.device, &input_ids, &mut self.cache, past_seen_tokens)
+            .forward(
+                self.device,
+                &input_ids,
+                &mut self.cache,
+                past_seen_tokens,
+                LOGITS_TO_KEEP,
+            )
             .map_err(|error| {
                 error!(message = "Model forward failed.", past_seen_tokens, seq_len, %error);
                 GenerateError::Forward
