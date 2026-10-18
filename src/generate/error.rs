@@ -12,7 +12,7 @@ pub enum GenerateError {
     #[error("Token count is not a multiple of the batch size.")]
     BatchMismatch,
 
-    #[error("Token position does not fit in u32.")]
+    #[error("Token position overflows usize.")]
     PositionOverflow,
 
     #[error("Creating the key-value cache failed.")]

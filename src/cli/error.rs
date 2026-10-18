@@ -16,7 +16,7 @@ pub enum CliError {
     #[error("Measuring the model weights failed.")]
     WeightsSize,
 
-    #[error("Writing the report to stdout failed.")]
+    #[error("Writing the token IDs to stdout failed.")]
     Output,
 
     #[cfg(target_os = "macos")]
