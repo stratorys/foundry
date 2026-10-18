@@ -5,8 +5,8 @@ using namespace metal;
 struct StridedArgs {
   uint count;
   uint ndim;
-  uint dims[4];
-  uint strides[4];
+  uint dims[MAX_RANK];
+  uint strides[MAX_RANK];
   uint offset;
 };
 

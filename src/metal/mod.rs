@@ -55,6 +55,7 @@ use crate::nn::{
     Device,
     Layout,
     MAX_ITEMSIZE,
+    MAX_RANK,
     Operand,
     Shape,
 };
@@ -104,7 +105,14 @@ impl MetalDevice {
     pub fn new() -> Result<Self, MetalError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::DeviceUnavailable)?;
         let queue = device.newCommandQueue().ok_or(MetalError::QueueCreation)?;
-        let source = NSString::from_str(&KERNEL_SOURCES.concat());
+        let prelude = [
+            ("MAX_RANK", MAX_RANK),
+            ("REDUCE_THREADS", REDUCE_THREADS),
+            ("MATMUL_TILE", MATMUL_TILE),
+        ]
+        .map(|(name, value)| format!("#define {name} {value}\n"))
+        .concat();
+        let source = NSString::from_str(&[prelude.as_str(), &KERNEL_SOURCES.concat()].concat());
         let library = device
             .newLibraryWithSource_options_error(&source, None)
             .map_err(|error| {

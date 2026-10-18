@@ -1,5 +1,3 @@
-#define REDUCE_THREADS 256
-
 struct ReduceArgs {
   StridedArgs rows;
   uint dim_size;

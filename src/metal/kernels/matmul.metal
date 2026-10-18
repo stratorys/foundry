@@ -1,10 +1,8 @@
-#define MATMUL_TILE 16
-
 struct MatmulOperand {
   uint offset;
   uint row_stride;
   uint col_stride;
-  uint batch_strides[4];
+  uint batch_strides[MAX_RANK];
 };
 
 struct MatmulArgs {
@@ -12,7 +10,7 @@ struct MatmulArgs {
   uint n;
   uint k;
   uint batch_ndim;
-  uint batch_dims[4];
+  uint batch_dims[MAX_RANK];
   MatmulOperand lhs;
   MatmulOperand rhs;
 };
