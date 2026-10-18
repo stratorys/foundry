@@ -19,7 +19,7 @@ pub fn position_ids<D: Device>(
         device,
         &position_id_bytes(past_seen_tokens, kv_length)?,
         DType::U32,
-        Shape::try_from([seq_len].as_slice())?,
+        Shape::try_from([seq_len])?,
     )
 }
 
@@ -37,7 +37,7 @@ fn causal_mask(
     seq_len: usize,
 ) -> Result<(Shape, Vec<u8>), TensorError> {
     let kv_length = kv_length(past_seen_tokens, seq_len)?;
-    let shape = Shape::try_from([seq_len, kv_length].as_slice())?;
+    let shape = Shape::try_from([seq_len, kv_length])?;
     Ok((shape, causal_mask_bytes(past_seen_tokens, kv_length)))
 }
 

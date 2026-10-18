@@ -290,13 +290,13 @@ mod tests {
     #[test]
     fn matmul_geometry_reads_dims_and_operand_strides() {
         let geometry = MatmulGeometry::of(
-            &Layout::contiguous(Shape::try_from([5, 2, 3].as_slice()).expect("valid shape")),
-            &Layout::contiguous(Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")),
+            &Layout::contiguous(Shape::try_from([5, 2, 3]).expect("valid shape")),
+            &Layout::contiguous(Shape::try_from([5, 3, 4]).expect("valid shape")),
         );
         assert_eq!(
             geometry,
             Some(MatmulGeometry {
-                batch: Shape::try_from([5].as_slice()).expect("valid shape"),
+                batch: Shape::try_from([5]).expect("valid shape"),
                 m: 2,
                 k: 3,
                 n: 4,
@@ -319,12 +319,12 @@ mod tests {
 
     #[test]
     fn matmul_geometry_reads_transposed_operand_strides() {
-        let rhs = Layout::contiguous(Shape::try_from([4, 3].as_slice()).expect("valid shape"))
+        let rhs = Layout::contiguous(Shape::try_from([4, 3]).expect("valid shape"))
             .permute(&[1, 0])
             .expect("valid permutation");
         assert_eq!(
             MatmulGeometry::of(
-                &Layout::contiguous(Shape::try_from([2, 3].as_slice()).expect("valid shape")),
+                &Layout::contiguous(Shape::try_from([2, 3]).expect("valid shape")),
                 &rhs,
             )
             .map(|geometry| geometry.rhs),
@@ -340,12 +340,10 @@ mod tests {
 
     #[test]
     fn slice_offset_adds_start_times_stride_to_the_layout_offset() {
-        let target =
-            Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"))
-                .narrow(0, 1, 1)
-                .expect("valid narrow");
-        let cat_output =
-            Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"));
+        let target = Layout::contiguous(Shape::try_from([2, 8, 4]).expect("valid shape"))
+            .narrow(0, 1, 1)
+            .expect("valid narrow");
+        let cat_output = Layout::contiguous(Shape::try_from([2, 8, 4]).expect("valid shape"));
         assert_eq!(
             [
                 slice_offset(&target, 1, Some(3)),

@@ -85,11 +85,9 @@ impl<D: Device> LlamaAttention<D> {
             );
             return Err(TensorError::AttentionIncompatible);
         };
-        let query_shape =
-            Shape::try_from([batch_size, seq_len, self.num_heads, self.head_dim].as_slice())?;
-        let kv_shape = Shape::try_from(
-            [batch_size, seq_len, self.num_key_value_heads, self.head_dim].as_slice(),
-        )?;
+        let query_shape = Shape::try_from([batch_size, seq_len, self.num_heads, self.head_dim])?;
+        let kv_shape =
+            Shape::try_from([batch_size, seq_len, self.num_key_value_heads, self.head_dim])?;
         let query_states = self
             .q_proj
             .forward(device, hidden_states)?

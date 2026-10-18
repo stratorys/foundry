@@ -35,7 +35,7 @@ impl<D: Device> Module<D> for Linear<D> {
             .copied()
             .chain([out_features])
             .collect::<Vec<usize>>();
-        x.reshape(Shape::try_from([rows, in_features].as_slice())?)?
+        x.reshape(Shape::try_from([rows, in_features])?)?
             .matmul(device, &weight_t)?
             .reshape(Shape::try_from(output_dims.as_slice())?)
     }
@@ -61,8 +61,7 @@ impl<D: Device> Module<D> for Embedding<D> {
         device: &mut D,
         input_ids: &Tensor<D>,
     ) -> Result<Tensor<D>, TensorError> {
-        let flat_ids =
-            input_ids.reshape(Shape::try_from([input_ids.shape().numel()].as_slice())?)?;
+        let flat_ids = input_ids.reshape(Shape::try_from([input_ids.shape().numel()])?)?;
         let embeds = self.weight.index_select(device, 0, &flat_ids)?;
         let hidden_size = embeds.shape().size(embeds.shape().last_dim()?)?;
         let dims: Vec<usize> = input_ids

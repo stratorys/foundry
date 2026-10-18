@@ -432,7 +432,7 @@ mod tests {
             Some(WeightView {
                 name: "a",
                 dtype: DType::BF16,
-                shape: Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                shape: Shape::try_from([2, 3]).expect("the shape is valid"),
                 bytes: &a_bytes,
             }),
             "tensor a"
@@ -442,7 +442,7 @@ mod tests {
             Some(WeightView {
                 name: "b",
                 dtype: DType::F32,
-                shape: Shape::try_from([4].as_slice()).expect("the shape is valid"),
+                shape: Shape::try_from([4]).expect("the shape is valid"),
                 bytes: &b_bytes,
             }),
             "tensor b"
@@ -929,7 +929,7 @@ mod tests {
             Some(WeightView {
                 name: "s",
                 dtype: DType::F32,
-                shape: Shape::try_from([].as_slice()).expect("the shape is valid"),
+                shape: Shape::try_from([]).expect("the shape is valid"),
                 bytes: &[0, 1, 2, 3],
             }),
             "a scalar holds one element"
@@ -939,7 +939,7 @@ mod tests {
             Some(WeightView {
                 name: "z",
                 dtype: DType::F32,
-                shape: Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
+                shape: Shape::try_from([0, 3]).expect("the shape is valid"),
                 bytes: &[],
             }),
             "a zero dim holds no element"

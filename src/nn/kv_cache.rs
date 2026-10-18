@@ -24,8 +24,7 @@ impl<D: Device> StaticCache<D> {
         max_cache_len: usize,
         head_dim: usize,
     ) -> Result<Self, TensorError> {
-        let shape =
-            Shape::try_from([batch_size, num_key_value_heads, max_cache_len, head_dim].as_slice())?;
+        let shape = Shape::try_from([batch_size, num_key_value_heads, max_cache_len, head_dim])?;
         let layers = (0..num_layers)
             .map(|_| {
                 Ok((

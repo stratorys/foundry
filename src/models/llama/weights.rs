@@ -69,7 +69,7 @@ mod tests {
         let view = WeightView {
             name: "model.norm.weight",
             dtype: DType::BF16,
-            shape: Shape::try_from([4].as_slice()).expect("the shape is valid"),
+            shape: Shape::try_from([4]).expect("the shape is valid"),
             bytes: &[0; 8],
         };
         assert_eq!(
@@ -84,7 +84,7 @@ mod tests {
         let view = |dtype| WeightView {
             name: "model.norm.weight",
             dtype,
-            shape: Shape::try_from([4].as_slice()).expect("the shape is valid"),
+            shape: Shape::try_from([4]).expect("the shape is valid"),
             bytes: &[0; 16],
         };
         assert_eq!(

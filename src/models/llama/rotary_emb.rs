@@ -52,7 +52,7 @@ impl<D: Device> LlamaRotaryEmbedding<D> {
         device: &mut D,
         position_ids: &Tensor<D>,
     ) -> Result<[Tensor<D>; 2], TensorError> {
-        let shape = Shape::try_from([position_ids.shape().numel(), 1, self.head_dim].as_slice())?;
+        let shape = Shape::try_from([position_ids.shape().numel(), 1, self.head_dim])?;
         let [cos, sin] = [&self.cos_cached, &self.sin_cached]
             .map(|table| table.index_select(device, 0, position_ids)?.reshape(shape));
         Ok([cos?, sin?])
@@ -90,7 +90,7 @@ fn cached_tables<D: Device>(
     max_cache_len: usize,
     head_dim: usize,
 ) -> Result<[Tensor<D>; 2], TensorError> {
-    let shape = Shape::try_from([max_cache_len, head_dim].as_slice())?;
+    let shape = Shape::try_from([max_cache_len, head_dim])?;
     let functions: [fn(f32) -> f32; 2] = [f32::cos, f32::sin];
     let [cos, sin] = functions.map(|function| {
         Tensor::from_bytes(

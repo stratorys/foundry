@@ -271,7 +271,7 @@ fn index_select_output(
     let &[index_count] = indices.dims() else {
         return Err(incompatible());
     };
-    Ok((Shape::try_from([index_count, cols].as_slice())?, dtype))
+    Ok((Shape::try_from([index_count, cols])?, dtype))
 }
 
 fn cat_output(
@@ -375,15 +375,9 @@ mod tests {
         assert_eq!(
             output(
                 Op::Unary(UnaryOp::Exp),
-                &[(
-                    DType::BF16,
-                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                )]
+                &[(DType::BF16, Shape::try_from([2, 3]).expect("valid shape"))]
             ),
-            Ok((
-                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                DType::BF16
-            )),
+            Ok((Shape::try_from([2, 3]).expect("valid shape"), DType::BF16)),
             "a float dtype is kept"
         );
     }
@@ -393,10 +387,7 @@ mod tests {
         assert_eq!(
             output(
                 Op::Unary(UnaryOp::Neg),
-                &[(
-                    DType::U32,
-                    Shape::try_from([2].as_slice()).expect("valid shape")
-                )]
+                &[(DType::U32, Shape::try_from([2]).expect("valid shape"))]
             ),
             Err(TensorError::DTypeNotFloat),
             "unary needs a float dtype"
@@ -410,22 +401,13 @@ mod tests {
                 output(Op::Unary(UnaryOp::Neg), &[]),
                 output(
                     Op::Matmul,
-                    &[(
-                        DType::F32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    )]
+                    &[(DType::F32, Shape::try_from([2, 3]).expect("valid shape"))]
                 ),
                 output(
                     Op::Copy,
                     &[
-                        (
-                            DType::F32,
-                            Shape::try_from([2].as_slice()).expect("valid shape")
-                        ),
-                        (
-                            DType::F32,
-                            Shape::try_from([2].as_slice()).expect("valid shape")
-                        )
+                        (DType::F32, Shape::try_from([2]).expect("valid shape")),
+                        (DType::F32, Shape::try_from([2]).expect("valid shape"))
                     ]
                 ),
             ],
@@ -444,20 +426,11 @@ mod tests {
             output(
                 Op::Binary(BinaryOp::Add),
                 &[
-                    (
-                        DType::BF16,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::BF16,
-                        Shape::try_from([3].as_slice()).expect("valid shape")
-                    )
+                    (DType::BF16, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::BF16, Shape::try_from([3]).expect("valid shape"))
                 ]
             ),
-            Ok((
-                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                DType::BF16
-            )),
+            Ok((Shape::try_from([2, 3]).expect("valid shape"), DType::BF16)),
             "dtype and broadcast shape"
         );
     }
@@ -468,14 +441,8 @@ mod tests {
             output(
                 Op::Binary(BinaryOp::Mul),
                 &[
-                    (
-                        DType::BF16,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    )
+                    (DType::BF16, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([2, 3]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::DTypeMismatch),
@@ -489,14 +456,8 @@ mod tests {
             output(
                 Op::Binary(BinaryOp::Sub),
                 &[
-                    (
-                        DType::U32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::U32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    )
+                    (DType::U32, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::U32, Shape::try_from([2, 3]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::DTypeNotFloat),
@@ -510,14 +471,8 @@ mod tests {
             output(
                 Op::Binary(BinaryOp::Div),
                 &[
-                    (
-                        DType::BF16,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::BF16,
-                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
-                    )
+                    (DType::BF16, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::BF16, Shape::try_from([4, 3]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::BroadcastIncompatible),
@@ -535,11 +490,11 @@ mod tests {
                 },
                 &[(
                     DType::BF16,
-                    Shape::try_from([2, 3, 4].as_slice()).expect("valid shape")
+                    Shape::try_from([2, 3, 4]).expect("valid shape")
                 )]
             ),
             Ok((
-                Shape::try_from([2, 1, 4].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 1, 4]).expect("valid shape"),
                 DType::BF16
             )),
             "a sum keeps the dtype and the dim with size one"
@@ -554,15 +509,9 @@ mod tests {
                     op: ReduceOp::Argmax,
                     dim: 1,
                 },
-                &[(
-                    DType::F32,
-                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                )]
+                &[(DType::F32, Shape::try_from([2, 3]).expect("valid shape"))]
             ),
-            Ok((
-                Shape::try_from([2, 1].as_slice()).expect("valid shape"),
-                DType::U32
-            )),
+            Ok((Shape::try_from([2, 1]).expect("valid shape"), DType::U32)),
             "argmax outputs u32 indices"
         );
     }
@@ -575,10 +524,7 @@ mod tests {
                     op: ReduceOp::Sum,
                     dim: 1,
                 },
-                &[(
-                    DType::U32,
-                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                )]
+                &[(DType::U32, Shape::try_from([2, 3]).expect("valid shape"))]
             ),
             Err(TensorError::DTypeNotFloat),
             "reduce needs a float dtype"
@@ -593,10 +539,7 @@ mod tests {
                     op: ReduceOp::Sum,
                     dim: 2,
                 },
-                &[(
-                    DType::F32,
-                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                )]
+                &[(DType::F32, Shape::try_from([2, 3]).expect("valid shape"))]
             ),
             Err(TensorError::DimOutOfRange),
             "dim 2 does not exist"
@@ -614,10 +557,7 @@ mod tests {
                             op,
                             dim: 1,
                         },
-                        &[(
-                            DType::F32,
-                            Shape::try_from([2, 0].as_slice()).expect("valid shape")
-                        )]
+                        &[(DType::F32, Shape::try_from([2, 0]).expect("valid shape"))]
                     ),
                     Err(TensorError::EmptyReduction),
                     "{op:?} over an empty dim"
@@ -633,15 +573,9 @@ mod tests {
                     op: ReduceOp::Sum,
                     dim: 1,
                 },
-                &[(
-                    DType::F32,
-                    Shape::try_from([2, 0].as_slice()).expect("valid shape")
-                )]
+                &[(DType::F32, Shape::try_from([2, 0]).expect("valid shape"))]
             ),
-            Ok((
-                Shape::try_from([2, 1].as_slice()).expect("valid shape"),
-                DType::F32
-            )),
+            Ok((Shape::try_from([2, 1]).expect("valid shape"), DType::F32)),
             "a sum over an empty dim is zero"
         );
     }
@@ -654,16 +588,16 @@ mod tests {
                 &[
                     (
                         DType::BF16,
-                        Shape::try_from([5, 2, 3].as_slice()).expect("valid shape")
+                        Shape::try_from([5, 2, 3]).expect("valid shape")
                     ),
                     (
                         DType::BF16,
-                        Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")
+                        Shape::try_from([5, 3, 4]).expect("valid shape")
                     )
                 ]
             ),
             Ok((
-                Shape::try_from([5, 2, 4].as_slice()).expect("valid shape"),
+                Shape::try_from([5, 2, 4]).expect("valid shape"),
                 DType::BF16
             )),
             "batch kept, m by n output"
@@ -676,14 +610,8 @@ mod tests {
             output(
                 Op::Matmul,
                 &[
-                    (
-                        DType::F32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([4, 5].as_slice()).expect("valid shape")
-                    )
+                    (DType::F32, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([4, 5]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::MatmulIncompatible),
@@ -697,14 +625,8 @@ mod tests {
             output(
                 Op::Matmul,
                 &[
-                    (
-                        DType::F32,
-                        Shape::try_from([2, 2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([5, 3, 4].as_slice()).expect("valid shape")
-                    )
+                    (DType::F32, Shape::try_from([2, 2, 3]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([5, 3, 4]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::MatmulIncompatible),
@@ -719,27 +641,15 @@ mod tests {
                 output(
                     Op::Matmul,
                     &[
-                        (
-                            DType::F32,
-                            Shape::try_from([3].as_slice()).expect("valid shape")
-                        ),
-                        (
-                            DType::F32,
-                            Shape::try_from([3, 4].as_slice()).expect("valid shape")
-                        )
+                        (DType::F32, Shape::try_from([3]).expect("valid shape")),
+                        (DType::F32, Shape::try_from([3, 4]).expect("valid shape"))
                     ]
                 ),
                 output(
                     Op::Matmul,
                     &[
-                        (
-                            DType::F32,
-                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                        ),
-                        (
-                            DType::F32,
-                            Shape::try_from([3].as_slice()).expect("valid shape")
-                        )
+                        (DType::F32, Shape::try_from([2, 3]).expect("valid shape")),
+                        (DType::F32, Shape::try_from([3]).expect("valid shape"))
                     ]
                 ),
             ],
@@ -757,14 +667,8 @@ mod tests {
             output(
                 Op::Matmul,
                 &[
-                    (
-                        DType::U32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::U32,
-                        Shape::try_from([3, 4].as_slice()).expect("valid shape")
-                    )
+                    (DType::U32, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::U32, Shape::try_from([3, 4]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::DTypeNotFloat),
@@ -778,14 +682,8 @@ mod tests {
             output(
                 Op::Matmul,
                 &[
-                    (
-                        DType::BF16,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([3, 4].as_slice()).expect("valid shape")
-                    )
+                    (DType::BF16, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([3, 4]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::DTypeMismatch),
@@ -801,11 +699,11 @@ mod tests {
                 &[
                     (
                         DType::F32,
-                        Shape::try_from([1 << 16, 1].as_slice()).expect("valid shape")
+                        Shape::try_from([1 << 16, 1]).expect("valid shape")
                     ),
                     (
                         DType::F32,
-                        Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape")
+                        Shape::try_from([1, 1 << 16]).expect("valid shape")
                     )
                 ]
             ),
@@ -819,15 +717,9 @@ mod tests {
         assert_eq!(
             output(
                 Op::Copy,
-                &[(
-                    DType::U32,
-                    Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                )]
+                &[(DType::U32, Shape::try_from([2, 3]).expect("valid shape"))]
             ),
-            Ok((
-                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                DType::U32
-            )),
+            Ok((Shape::try_from([2, 3]).expect("valid shape"), DType::U32)),
             "copy accepts integers"
         );
     }
@@ -837,15 +729,9 @@ mod tests {
         assert_eq!(
             output(
                 Op::ToDtype(DType::BF16),
-                &[(
-                    DType::F32,
-                    Shape::try_from([3].as_slice()).expect("valid shape")
-                )]
+                &[(DType::F32, Shape::try_from([3]).expect("valid shape"))]
             ),
-            Ok((
-                Shape::try_from([3].as_slice()).expect("valid shape"),
-                DType::BF16
-            )),
+            Ok((Shape::try_from([3]).expect("valid shape"), DType::BF16)),
             "shape kept, target dtype"
         );
     }
@@ -856,17 +742,11 @@ mod tests {
             [
                 output(
                     Op::ToDtype(DType::F32),
-                    &[(
-                        DType::U32,
-                        Shape::try_from([3].as_slice()).expect("valid shape")
-                    )]
+                    &[(DType::U32, Shape::try_from([3]).expect("valid shape"))]
                 ),
                 output(
                     Op::ToDtype(DType::U32),
-                    &[(
-                        DType::F32,
-                        Shape::try_from([3].as_slice()).expect("valid shape")
-                    )]
+                    &[(DType::F32, Shape::try_from([3]).expect("valid shape"))]
                 ),
             ],
             [
@@ -885,20 +765,11 @@ mod tests {
                     dim: 0,
                 },
                 &[
-                    (
-                        DType::BF16,
-                        Shape::try_from([3, 4].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::U32,
-                        Shape::try_from([5].as_slice()).expect("valid shape")
-                    )
+                    (DType::BF16, Shape::try_from([3, 4]).expect("valid shape")),
+                    (DType::U32, Shape::try_from([5]).expect("valid shape"))
                 ]
             ),
-            Ok((
-                Shape::try_from([5, 4].as_slice()).expect("valid shape"),
-                DType::BF16
-            )),
+            Ok((Shape::try_from([5, 4]).expect("valid shape"), DType::BF16)),
             "one row of the table per index"
         );
     }
@@ -911,14 +782,8 @@ mod tests {
                     dim: 0,
                 },
                 &[
-                    (
-                        DType::U32,
-                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::U32,
-                        Shape::try_from([2].as_slice()).expect("valid shape")
-                    )
+                    (DType::U32, Shape::try_from([4, 3]).expect("valid shape")),
+                    (DType::U32, Shape::try_from([2]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::DTypeNotFloat),
@@ -934,14 +799,8 @@ mod tests {
                     dim: 0,
                 },
                 &[
-                    (
-                        DType::F32,
-                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([2].as_slice()).expect("valid shape")
-                    )
+                    (DType::F32, Shape::try_from([4, 3]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([2]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::IndicesNotU32),
@@ -953,16 +812,16 @@ mod tests {
     fn index_select_rejects_invalid_ranks() {
         [
             (
-                Shape::try_from([4].as_slice()).expect("valid shape"),
-                Shape::try_from([2].as_slice()).expect("valid shape"),
+                Shape::try_from([4]).expect("valid shape"),
+                Shape::try_from([2]).expect("valid shape"),
             ),
             (
-                Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
-                Shape::try_from([2].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 3, 4]).expect("valid shape"),
+                Shape::try_from([2]).expect("valid shape"),
             ),
             (
-                Shape::try_from([4, 3].as_slice()).expect("valid shape"),
-                Shape::try_from([2, 1].as_slice()).expect("valid shape"),
+                Shape::try_from([4, 3]).expect("valid shape"),
+                Shape::try_from([2, 1]).expect("valid shape"),
             ),
         ]
         .into_iter()
@@ -990,14 +849,8 @@ mod tests {
                     dim: 1,
                 },
                 &[
-                    (
-                        DType::F32,
-                        Shape::try_from([4, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::U32,
-                        Shape::try_from([2].as_slice()).expect("valid shape")
-                    )
+                    (DType::F32, Shape::try_from([4, 3]).expect("valid shape")),
+                    (DType::U32, Shape::try_from([2]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::IndexSelectIncompatible),
@@ -1015,12 +868,9 @@ mod tests {
                 &[
                     (
                         DType::F32,
-                        Shape::try_from([1, 1 << 16].as_slice()).expect("valid shape")
+                        Shape::try_from([1, 1 << 16]).expect("valid shape")
                     ),
-                    (
-                        DType::U32,
-                        Shape::try_from([1 << 16].as_slice()).expect("valid shape")
-                    )
+                    (DType::U32, Shape::try_from([1 << 16]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::NumelOverflow),
@@ -1038,16 +888,16 @@ mod tests {
                 &[
                     (
                         DType::BF16,
-                        Shape::try_from([2, 3, 4].as_slice()).expect("valid shape")
+                        Shape::try_from([2, 3, 4]).expect("valid shape")
                     ),
                     (
                         DType::BF16,
-                        Shape::try_from([2, 5, 4].as_slice()).expect("valid shape")
+                        Shape::try_from([2, 5, 4]).expect("valid shape")
                     )
                 ]
             ),
             Ok((
-                Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 8, 4]).expect("valid shape"),
                 DType::BF16
             )),
             "sizes 3 and 5 add along dim 1"
@@ -1062,14 +912,8 @@ mod tests {
                     dim: 1,
                 },
                 &[
-                    (
-                        DType::F32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([4, 5].as_slice()).expect("valid shape")
-                    )
+                    (DType::F32, Shape::try_from([2, 3]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([4, 5]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::CatIncompatible),
@@ -1085,14 +929,8 @@ mod tests {
                     dim: 0,
                 },
                 &[
-                    (
-                        DType::F32,
-                        Shape::try_from([2, 3, 4].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                    )
+                    (DType::F32, Shape::try_from([2, 3, 4]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([2, 3]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::CatIncompatible),
@@ -1110,27 +948,15 @@ mod tests {
                 output(
                     cat,
                     &[
-                        (
-                            DType::F32,
-                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                        ),
-                        (
-                            DType::BF16,
-                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                        )
+                        (DType::F32, Shape::try_from([2, 3]).expect("valid shape")),
+                        (DType::BF16, Shape::try_from([2, 3]).expect("valid shape"))
                     ]
                 ),
                 output(
                     cat,
                     &[
-                        (
-                            DType::U32,
-                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                        ),
-                        (
-                            DType::U32,
-                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                        )
+                        (DType::U32, Shape::try_from([2, 3]).expect("valid shape")),
+                        (DType::U32, Shape::try_from([2, 3]).expect("valid shape"))
                     ]
                 ),
             ],
@@ -1146,12 +972,12 @@ mod tests {
     fn cat_rejects_dim_out_of_range() {
         [
             (
-                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 3]).expect("valid shape"),
+                Shape::try_from([2, 3]).expect("valid shape"),
             ),
             (
-                Shape::try_from([2, 3, 4].as_slice()).expect("valid shape"),
-                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
+                Shape::try_from([2, 3, 4]).expect("valid shape"),
+                Shape::try_from([2, 3]).expect("valid shape"),
             ),
         ]
         .into_iter()
@@ -1179,14 +1005,8 @@ mod tests {
                     dim: 0,
                 },
                 &[
-                    (
-                        DType::F32,
-                        Shape::try_from([1 << 30].as_slice()).expect("valid shape")
-                    ),
-                    (
-                        DType::F32,
-                        Shape::try_from([1 << 30].as_slice()).expect("valid shape")
-                    )
+                    (DType::F32, Shape::try_from([1 << 30]).expect("valid shape")),
+                    (DType::F32, Shape::try_from([1 << 30]).expect("valid shape"))
                 ]
             ),
             Err(TensorError::NumelOverflow),
@@ -1196,11 +1016,10 @@ mod tests {
 
     #[test]
     fn slice_scatter_keeps_the_target() {
-        let target =
-            *Layout::contiguous(Shape::try_from([2, 8, 4].as_slice()).expect("valid shape"))
-                .narrow(0, 1, 1)
-                .expect("valid narrow")
-                .shape();
+        let target = *Layout::contiguous(Shape::try_from([2, 8, 4]).expect("valid shape"))
+            .narrow(0, 1, 1)
+            .expect("valid narrow")
+            .shape();
         assert_eq!(
             output(
                 Op::SliceScatter {
@@ -1211,12 +1030,12 @@ mod tests {
                     (DType::BF16, target),
                     (
                         DType::BF16,
-                        Shape::try_from([1, 2, 4].as_slice()).expect("valid shape")
+                        Shape::try_from([1, 2, 4]).expect("valid shape")
                     )
                 ]
             ),
             Ok((
-                Shape::try_from([1, 8, 4].as_slice()).expect("valid shape"),
+                Shape::try_from([1, 8, 4]).expect("valid shape"),
                 DType::BF16
             )),
             "the target shape and dtype"
@@ -1226,26 +1045,10 @@ mod tests {
     #[test]
     fn slice_scatter_rejects_out_of_bounds_and_mismatches() {
         [
-            (
-                Shape::try_from([1, 3].as_slice()).expect("valid shape"),
-                0,
-                usize::MAX,
-            ),
-            (
-                Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-                0,
-                1,
-            ),
-            (
-                Shape::try_from([1, 2].as_slice()).expect("valid shape"),
-                0,
-                0,
-            ),
-            (
-                Shape::try_from([1, 3, 1].as_slice()).expect("valid shape"),
-                0,
-                0,
-            ),
+            (Shape::try_from([1, 3]).expect("valid shape"), 0, usize::MAX),
+            (Shape::try_from([2, 3]).expect("valid shape"), 0, 1),
+            (Shape::try_from([1, 2]).expect("valid shape"), 0, 0),
+            (Shape::try_from([1, 3, 1]).expect("valid shape"), 0, 0),
         ]
         .into_iter()
         .for_each(|(src, dim, start)| {
@@ -1256,10 +1059,7 @@ mod tests {
                         start,
                     },
                     &[
-                        (
-                            DType::F32,
-                            Shape::try_from([2, 3].as_slice()).expect("valid shape")
-                        ),
+                        (DType::F32, Shape::try_from([2, 3]).expect("valid shape")),
                         (DType::F32, src)
                     ]
                 ),
@@ -1272,7 +1072,7 @@ mod tests {
 
     #[test]
     fn slice_scatter_rejects_dtype_and_dim() {
-        let target = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        let target = Shape::try_from([2, 3]).expect("valid shape");
         assert_eq!(
             [
                 output(

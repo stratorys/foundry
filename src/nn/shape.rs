@@ -142,6 +142,12 @@ impl TryFrom<&[usize]> for Shape {
     }
 }
 
+impl<const N: usize> TryFrom<[usize; N]> for Shape {
+    type Error = TensorError;
+
+    fn try_from(dims: [usize; N]) -> Result<Self, Self::Error> { Shape::try_from(dims.as_slice()) }
+}
+
 fn size_from_end(
     shape: &Shape,
     dim_from_end: usize,
@@ -165,8 +171,8 @@ mod tests {
     #[test]
     fn broadcast_aligns_dims_from_the_right() {
         let result = Shape::broadcast(
-            &Shape::try_from([2, 1, 4].as_slice()).expect("valid shape"),
-            &Shape::try_from([3, 1].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 1, 4]).expect("valid shape"),
+            &Shape::try_from([3, 1]).expect("valid shape"),
         )
         .expect("broadcastable");
         assert_eq!(result.dims(), &[2, 3, 4], "broadcast dims");
@@ -175,8 +181,8 @@ mod tests {
     #[test]
     fn broadcast_rejects_mismatched_dims() {
         let result = Shape::broadcast(
-            &Shape::try_from([2, 3].as_slice()).expect("valid shape"),
-            &Shape::try_from([4, 3].as_slice()).expect("valid shape"),
+            &Shape::try_from([2, 3]).expect("valid shape"),
+            &Shape::try_from([4, 3]).expect("valid shape"),
         );
         assert_eq!(
             result,
@@ -187,8 +193,8 @@ mod tests {
 
     #[test]
     fn broadcast_prepends_missing_dims_on_the_left() {
-        let short = Shape::try_from([3].as_slice()).expect("valid shape");
-        let long = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        let short = Shape::try_from([3]).expect("valid shape");
+        let long = Shape::try_from([2, 3]).expect("valid shape");
         assert_eq!(
             Shape::broadcast(&short, &long),
             Ok(long),
@@ -203,8 +209,8 @@ mod tests {
 
     #[test]
     fn broadcast_of_a_scalar_takes_the_other_shape() {
-        let scalar = Shape::try_from([].as_slice()).expect("valid shape");
-        let matrix = Shape::try_from([2, 3].as_slice()).expect("valid shape");
+        let scalar = Shape::try_from([]).expect("valid shape");
+        let matrix = Shape::try_from([2, 3]).expect("valid shape");
         assert_eq!(
             Shape::broadcast(&scalar, &matrix),
             Ok(matrix),
@@ -216,8 +222,8 @@ mod tests {
     fn broadcast_beyond_the_element_limit_is_rejected() {
         assert_eq!(
             Shape::broadcast(
-                &Shape::try_from([1 << 30, 1].as_slice()).expect("valid shape"),
-                &Shape::try_from([1, 4].as_slice()).expect("valid shape"),
+                &Shape::try_from([1 << 30, 1]).expect("valid shape"),
+                &Shape::try_from([1, 4]).expect("valid shape"),
             ),
             Err(TensorError::NumelOverflow),
             "two valid shapes can broadcast to an invalid one"
@@ -226,7 +232,7 @@ mod tests {
 
     #[test]
     fn broadcast_of_two_scalars_is_a_scalar() {
-        let scalar = Shape::try_from([].as_slice()).expect("valid shape");
+        let scalar = Shape::try_from([]).expect("valid shape");
         assert_eq!(
             Shape::broadcast(&scalar, &scalar),
             Ok(scalar),
@@ -238,10 +244,10 @@ mod tests {
     fn broadcast_of_rank_four_and_rank_one_aligns_the_last_dim() {
         assert_eq!(
             Shape::broadcast(
-                &Shape::try_from([2, 3, 4, 1].as_slice()).expect("valid shape"),
-                &Shape::try_from([5].as_slice()).expect("valid shape"),
+                &Shape::try_from([2, 3, 4, 1]).expect("valid shape"),
+                &Shape::try_from([5]).expect("valid shape"),
             ),
-            Shape::try_from([2, 3, 4, 5].as_slice()),
+            Shape::try_from([2, 3, 4, 5]),
             "the rank one shape stretches the last dim"
         );
     }
@@ -249,10 +255,10 @@ mod tests {
     #[test]
     fn with_dim_replaces_one_size() {
         assert_eq!(
-            Shape::try_from([2, 3, 4].as_slice())
+            Shape::try_from([2, 3, 4])
                 .expect("valid shape")
                 .with_dim(1, 7),
-            Shape::try_from([2, 7, 4].as_slice()),
+            Shape::try_from([2, 7, 4]),
             "dim 1 becomes 7"
         );
     }
@@ -260,7 +266,7 @@ mod tests {
     #[test]
     fn with_dim_to_zero_empties_the_shape() {
         assert_eq!(
-            Shape::try_from([2, 3].as_slice())
+            Shape::try_from([2, 3])
                 .expect("valid shape")
                 .with_dim(0, 0)
                 .map(|shape| shape.numel()),
@@ -272,9 +278,7 @@ mod tests {
     #[test]
     fn with_dim_on_a_scalar_is_rejected() {
         assert_eq!(
-            Shape::try_from([].as_slice())
-                .expect("valid shape")
-                .with_dim(0, 1),
+            Shape::try_from([]).expect("valid shape").with_dim(0, 1),
             Err(TensorError::DimOutOfRange),
             "a scalar has no dim"
         );
@@ -283,7 +287,7 @@ mod tests {
     #[test]
     fn with_dim_beyond_the_element_limit_is_rejected() {
         assert_eq!(
-            Shape::try_from([2, 3].as_slice())
+            Shape::try_from([2, 3])
                 .expect("valid shape")
                 .with_dim(0, 1 << 30),
             Err(TensorError::NumelOverflow),
@@ -294,7 +298,7 @@ mod tests {
     #[test]
     fn with_dim_reports_the_dim_before_the_element_limit() {
         assert_eq!(
-            Shape::try_from([2, 3].as_slice())
+            Shape::try_from([2, 3])
                 .expect("valid shape")
                 .with_dim(2, usize::MAX),
             Err(TensorError::DimOutOfRange),
@@ -305,7 +309,7 @@ mod tests {
     #[test]
     fn rank_above_max_is_rejected() {
         assert_eq!(
-            Shape::try_from([1, 2, 3, 4, 5].as_slice()),
+            Shape::try_from([1, 2, 3, 4, 5]),
             Err(TensorError::RankTooLarge),
             "rank 5 is rejected"
         );
@@ -314,16 +318,25 @@ mod tests {
     #[test]
     fn rank_at_max_is_accepted() {
         assert_eq!(
-            Shape::try_from([1, 2, 3, 4].as_slice()).map(|shape| shape.ndim()),
+            Shape::try_from([1, 2, 3, 4]).map(|shape| shape.ndim()),
             Ok(4),
             "rank 4 is accepted"
         );
     }
 
     #[test]
+    fn array_and_slice_build_the_same_shape() {
+        assert_eq!(
+            Shape::try_from([2, 3]),
+            Shape::try_from([2, 3].as_slice()),
+            "an array delegates to the slice conversion"
+        );
+    }
+
+    #[test]
     fn scalar_has_one_element() {
         assert_eq!(
-            Shape::try_from([].as_slice()).map(|shape| shape.numel()),
+            Shape::try_from([]).map(|shape| shape.numel()),
             Ok(1),
             "a rank 0 shape holds one element"
         );
@@ -332,7 +345,7 @@ mod tests {
     #[test]
     fn numel_overflow_is_rejected() {
         assert_eq!(
-            Shape::try_from([usize::MAX, 2].as_slice()),
+            Shape::try_from([usize::MAX, 2]),
             Err(TensorError::NumelOverflow),
             "the product overflows usize"
         );
@@ -341,7 +354,7 @@ mod tests {
     #[test]
     fn numel_above_i32_max_is_rejected() {
         assert_eq!(
-            Shape::try_from([1 << 31].as_slice()),
+            Shape::try_from([1 << 31]),
             Err(TensorError::NumelOverflow),
             "one element above i32::MAX"
         );
@@ -350,7 +363,7 @@ mod tests {
     #[test]
     fn numel_at_i32_max_is_accepted() {
         assert_eq!(
-            Shape::try_from([(1 << 31) - 1].as_slice())
+            Shape::try_from([(1 << 31) - 1])
                 .expect("valid shape")
                 .numel(),
             (1 << 31) - 1,

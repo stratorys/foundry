@@ -88,7 +88,7 @@ impl<D: Device> Tensor<D> {
             device,
             &value.to_le_bytes(),
             DType::F32,
-            Shape::try_from([1].as_slice())?,
+            Shape::try_from([1])?,
         )
     }
 

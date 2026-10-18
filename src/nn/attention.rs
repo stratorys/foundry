@@ -42,25 +42,22 @@ pub fn scaled_dot_product_attention<D: Device>(
     let attn_mask_f32 = attn_mask.to_dtype(device, DType::F32)?;
     let scores = query
         .contiguous(device)?
-        .reshape(Shape::try_from(
-            [batch, kv_heads, rows, head_dim].as_slice(),
-        )?)?
+        .reshape(Shape::try_from([batch, kv_heads, rows, head_dim])?)?
         .matmul(device, &key_t)?
-        .reshape(Shape::try_from(
-            [batch.saturating_mul(kv_heads), group, seq_len, kv_length].as_slice(),
-        )?)?
+        .reshape(Shape::try_from([
+            batch.saturating_mul(kv_heads),
+            group,
+            seq_len,
+            kv_length,
+        ])?)?
         .to_dtype(device, DType::F32)?
         .mul(device, scale)?
         .add(device, &attn_mask_f32)?;
     softmax(device, &scores, scores.shape().last_dim()?)?
         .to_dtype(device, query.dtype())?
-        .reshape(Shape::try_from(
-            [batch, kv_heads, rows, kv_length].as_slice(),
-        )?)?
+        .reshape(Shape::try_from([batch, kv_heads, rows, kv_length])?)?
         .matmul(device, value)?
-        .reshape(Shape::try_from(
-            [batch, heads, seq_len, head_dim].as_slice(),
-        )?)
+        .reshape(Shape::try_from([batch, heads, seq_len, head_dim])?)
 }
 
 fn attention_dims(
@@ -137,18 +134,18 @@ mod tests {
     fn attention_dims_rejects_rank_other_than_four() {
         assert_eq!(
             attention_dims(
-                &Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([4, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "a rank 3 query"
         );
         assert_eq!(
             attention_dims(
-                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([2, 2, 2]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "rank 3 keys"
@@ -159,9 +156,9 @@ mod tests {
     fn attention_dims_rejects_zero_kv_heads() {
         assert_eq!(
             attention_dims(
-                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 0, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 0, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 0, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 0, 2, 2]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "zero key-value heads"
@@ -172,9 +169,9 @@ mod tests {
     fn attention_dims_rejects_heads_not_a_multiple_of_kv_heads() {
         assert_eq!(
             attention_dims(
-                &Shape::try_from([1, 3, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 3, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "three query heads over two key-value heads"
@@ -185,9 +182,9 @@ mod tests {
     fn attention_dims_rejects_query_longer_than_keys() {
         assert_eq!(
             attention_dims(
-                &Shape::try_from([1, 4, 3, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 3, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "three query positions over two key positions"
@@ -198,9 +195,9 @@ mod tests {
     fn attention_dims_rejects_key_head_dim_mismatch() {
         assert_eq!(
             attention_dims(
-                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 4].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 4].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 4]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 4]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "head dims 2 and 4 differ"
@@ -211,9 +208,9 @@ mod tests {
     fn attention_dims_rejects_values_shaped_unlike_keys() {
         assert_eq!(
             attention_dims(
-                &Shape::try_from([1, 4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 3, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([1, 4, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 3, 2]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "values hold one more position than keys"
@@ -224,9 +221,9 @@ mod tests {
     fn attention_dims_rejects_query_and_keys_of_different_batches() {
         assert_eq!(
             attention_dims(
-                &Shape::try_from([2, 4, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
-                &Shape::try_from([1, 2, 2, 2].as_slice()).expect("the shape is valid"),
+                &Shape::try_from([2, 4, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
+                &Shape::try_from([1, 2, 2, 2]).expect("the shape is valid"),
             ),
             Err(TensorError::AttentionIncompatible),
             "a query of two sequences over keys of one sequence"

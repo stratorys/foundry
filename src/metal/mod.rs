@@ -803,7 +803,7 @@ mod tests {
                 let read_back = Tensor::zeros(
                     &mut device,
                     dtype,
-                    Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([2, 3]).expect("the shape is valid"),
                 )
                 .expect("zeros succeeds")
                 .to_bytes(&mut device)
@@ -831,13 +831,13 @@ mod tests {
             &mut device,
             &bytes,
             DType::U32,
-            Shape::try_from([3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         let zeros = Tensor::zeros(
             &mut device,
             DType::U32,
-            Shape::try_from([3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3]).expect("the shape is valid"),
         )
         .expect("zeros succeeds");
         assert_eq!(
@@ -861,14 +861,14 @@ mod tests {
                     &mut device,
                     &[0; 10],
                     DType::F32,
-                    Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([2, 2]).expect("the shape is valid"),
                 )
                 .err(),
                 Tensor::from_bytes(
                     &mut device,
                     &[],
                     DType::F32,
-                    Shape::try_from([(1 << 31) - 1].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([(1 << 31) - 1]).expect("the shape is valid"),
                 )
                 .err(),
             ],
@@ -885,7 +885,7 @@ mod tests {
             &mut device,
             &bytes,
             DType::U32,
-            Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3, 2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .narrow(0, 1, 2)
@@ -906,7 +906,7 @@ mod tests {
             &mut device,
             &bytes,
             DType::U32,
-            Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3, 2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
@@ -934,7 +934,7 @@ mod tests {
                 .flat_map(|value| f32::from(value).to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 3, 4]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         [DType::F32, DType::BF16].into_iter().for_each(|dtype| {
@@ -971,7 +971,7 @@ mod tests {
                 .flat_map(|value| f32::from(value).to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 3, 4]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .narrow(1, 1, 2)
@@ -1001,10 +1001,10 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([3, 1].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3, 1]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
-        .expand(Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"))
+        .expand(Shape::try_from([2, 3, 4]).expect("the shape is valid"))
         .expect("the broadcast is valid")
         .contiguous(&mut device)
         .expect("the copy succeeds");
@@ -1029,7 +1029,7 @@ mod tests {
             &mut device,
             &bytes,
             DType::U32,
-            Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3, 2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
@@ -1054,7 +1054,7 @@ mod tests {
             &mut device,
             &[],
             DType::F32,
-            Shape::try_from([0, 3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([0, 3]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         let copied = empty
@@ -1083,7 +1083,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .to_dtype(&mut device, DType::BF16)
@@ -1110,7 +1110,7 @@ mod tests {
                 .flat_map(|bits| f32::from_bits(bits).to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([4]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .to_dtype(&mut device, DType::BF16)
@@ -1139,7 +1139,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 3]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
@@ -1204,7 +1204,7 @@ mod tests {
                             .flat_map(|value| value.to_le_bytes())
                             .collect::<Vec<u8>>(),
                         DType::F32,
-                        Shape::try_from([3].as_slice()).expect("the shape is valid"),
+                        Shape::try_from([3]).expect("the shape is valid"),
                     )
                     .expect("from_bytes succeeds")
                     .to_dtype(&mut device, dtype)
@@ -1301,7 +1301,7 @@ mod tests {
                             .flat_map(|value| value.to_le_bytes())
                             .collect::<Vec<u8>>(),
                         DType::F32,
-                        Shape::try_from([4].as_slice()).expect("the shape is valid"),
+                        Shape::try_from([4]).expect("the shape is valid"),
                     )
                     .expect("from_bytes succeeds")
                     .to_dtype(&mut device, dtype)
@@ -1423,7 +1423,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 3]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
@@ -1509,13 +1509,13 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([4]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         let start = Tensor::zeros(
             &mut device,
             DType::F32,
-            Shape::try_from([4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([4]).expect("the shape is valid"),
         )
         .expect("zeros succeeds");
         let actual: Vec<f32> = (0..300)
@@ -1542,7 +1542,7 @@ mod tests {
                     .flat_map(|value| value.to_le_bytes())
                     .collect::<Vec<u8>>(),
                 DType::F32,
-                Shape::try_from([3].as_slice()).expect("the shape is valid"),
+                Shape::try_from([3]).expect("the shape is valid"),
             )
             .expect("from_bytes succeeds")
         });
@@ -1551,7 +1551,7 @@ mod tests {
                 let zeros = Tensor::zeros(
                     &mut device,
                     DType::F32,
-                    Shape::try_from([3].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([3]).expect("the shape is valid"),
                 )?;
                 sum.add(&mut device, &zeros)?.add(&mut device, &ones)
             })
@@ -1606,7 +1606,7 @@ mod tests {
                         .flat_map(|value| value.to_le_bytes())
                         .collect::<Vec<u8>>(),
                     DType::F32,
-                    Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([2, 3]).expect("the shape is valid"),
                 )
                 .expect("from_bytes succeeds")
                 .to_dtype(&mut device, dtype)
@@ -1711,7 +1711,7 @@ mod tests {
                             .flat_map(|value| value.to_le_bytes())
                             .collect::<Vec<u8>>(),
                         DType::F32,
-                        Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+                        Shape::try_from([2, 3]).expect("the shape is valid"),
                     )
                     .expect("from_bytes succeeds")
                     .to_dtype(&mut device, dtype)
@@ -1744,7 +1744,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([4096].as_slice()).expect("the shape is valid"),
+            Shape::try_from([4096]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .to_dtype(&mut device, DType::BF16)
@@ -1773,7 +1773,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([4]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .argmax_keepdim(&mut device, 0)
@@ -1803,7 +1803,7 @@ mod tests {
                 })
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([600].as_slice()).expect("the shape is valid"),
+            Shape::try_from([600]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .argmax_keepdim(&mut device, 0)
@@ -1832,7 +1832,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 3]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
@@ -1862,7 +1862,7 @@ mod tests {
             &mut device,
             &[],
             DType::F32,
-            Shape::try_from([2, 0].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 0]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .sum_keepdim(&mut device, 1)
@@ -2319,7 +2319,7 @@ mod tests {
                         .flat_map(|value| f32::from(value).to_le_bytes())
                         .collect::<Vec<u8>>(),
                     DType::F32,
-                    Shape::try_from([2, 3, 4].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([2, 3, 4]).expect("the shape is valid"),
                 )
                 .expect("from_bytes succeeds")
                 .to_dtype(&mut device, dtype)
@@ -2333,7 +2333,7 @@ mod tests {
                         .flat_map(|value| value.to_le_bytes())
                         .collect::<Vec<u8>>(),
                     DType::F32,
-                    Shape::try_from([4, 2, 2].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([4, 2, 2]).expect("the shape is valid"),
                 )
                 .expect("from_bytes succeeds")
                 .to_dtype(&mut device, dtype)
@@ -2484,7 +2484,7 @@ mod tests {
                 .flat_map(|index| index.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::U32,
-            Shape::try_from([2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         [
@@ -2509,7 +2509,7 @@ mod tests {
                         .flat_map(|value| f32::from(value).to_le_bytes())
                         .collect::<Vec<u8>>(),
                     DType::F32,
-                    Shape::try_from([3, 4].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([3, 4]).expect("the shape is valid"),
                 )
                 .expect("from_bytes succeeds")
                 .to_dtype(&mut device, dtype)
@@ -2555,7 +2555,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([3, 2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3, 2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         let indices = Tensor::from_bytes(
@@ -2565,7 +2565,7 @@ mod tests {
                 .flat_map(|index| index.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::U32,
-            Shape::try_from([2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         let actual: Vec<f32> = table
@@ -2595,7 +2595,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([2, 3].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 3]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
@@ -2607,7 +2607,7 @@ mod tests {
                 .flat_map(|index| index.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::U32,
-            Shape::try_from([2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         let actual: Vec<f32> = table
@@ -2903,8 +2903,7 @@ mod tests {
                 let mut cache = Tensor::zeros(
                     &mut device,
                     dtype,
-                    Shape::try_from([heads, positions, head_dim].as_slice())
-                        .expect("the shape is valid"),
+                    Shape::try_from([heads, positions, head_dim]).expect("the shape is valid"),
                 )
                 .expect("the zeros succeed");
                 let update = Tensor::from_bytes(
@@ -2914,7 +2913,7 @@ mod tests {
                         .flat_map(|value| value.to_le_bytes())
                         .collect::<Vec<u8>>(),
                     DType::F32,
-                    Shape::try_from([heads, 1, head_dim].as_slice()).expect("the shape is valid"),
+                    Shape::try_from([heads, 1, head_dim]).expect("the shape is valid"),
                 )
                 .expect("from_bytes succeeds")
                 .to_dtype(&mut device, dtype)
@@ -2954,7 +2953,7 @@ mod tests {
         let mut target = Tensor::zeros(
             &mut device,
             DType::F32,
-            Shape::try_from([2, 4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 4]).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
         let update = Tensor::from_bytes(
@@ -2964,7 +2963,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([2, 2].as_slice()).expect("the shape is valid"),
+            Shape::try_from([2, 2]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds")
         .permute(&[1, 0])
@@ -2993,10 +2992,10 @@ mod tests {
         let mut target = Tensor::zeros(
             &mut device,
             DType::F32,
-            Shape::try_from([1, 4].as_slice()).expect("the shape is valid"),
+            Shape::try_from([1, 4]).expect("the shape is valid"),
         )
         .expect("the zeros succeed")
-        .expand(Shape::try_from([3, 4].as_slice()).expect("the shape is valid"))
+        .expand(Shape::try_from([3, 4]).expect("the shape is valid"))
         .expect("the broadcast is valid");
         let update = Tensor::from_bytes(
             &mut device,
@@ -3005,7 +3004,7 @@ mod tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<u8>>(),
             DType::F32,
-            Shape::try_from([3, 1].as_slice()).expect("the shape is valid"),
+            Shape::try_from([3, 1]).expect("the shape is valid"),
         )
         .expect("from_bytes succeeds");
         assert_eq!(
@@ -3062,7 +3061,7 @@ mod tests {
     fn storage_from_another_device_cannot_be_read() {
         let mut producer = MetalDevice::new().expect("a Metal device is available");
         let mut consumer = MetalDevice::new().expect("a Metal device is available");
-        let shape = Shape::try_from(&[2_usize][..]).expect("the shape is valid");
+        let shape = Shape::try_from([2]).expect("the shape is valid");
         let tensor = Tensor::from_bytes(&mut producer, &[0_u8; 8], DType::F32, shape)
             .expect("from_bytes succeeds");
         assert_eq!(
@@ -3082,13 +3081,13 @@ mod tests {
         let mut target = Tensor::zeros(
             &mut producer,
             DType::F32,
-            Shape::try_from(&[2_usize, 2][..]).expect("the shape is valid"),
+            Shape::try_from([2, 2]).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
         let update = Tensor::zeros(
             &mut consumer,
             DType::F32,
-            Shape::try_from(&[2_usize, 1][..]).expect("the shape is valid"),
+            Shape::try_from([2, 1]).expect("the shape is valid"),
         )
         .expect("the zeros succeed");
         assert_eq!(
