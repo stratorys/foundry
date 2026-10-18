@@ -74,6 +74,9 @@ pub trait Device {
 
     fn max_memory_allocated(&self) -> Option<AllocatedMemory>;
 
+    /// Waits for all queued device work to complete without reading a tensor.
+    fn synchronize(&mut self) -> Result<(), Self::Error>;
+
     fn storage_from_bytes(
         &mut self,
         bytes: &[u8],

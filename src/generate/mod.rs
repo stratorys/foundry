@@ -138,7 +138,14 @@ impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
         ))
     }
 
-    fn forward_logits(
+    pub(crate) fn synchronize(&mut self) -> Result<(), GenerateError> {
+        self.device.synchronize().map_err(|error| {
+            error!(message = "Synchronizing device work failed.", %error);
+            GenerateError::Synchronize
+        })
+    }
+
+    pub(crate) fn forward_logits(
         &mut self,
         input_ids: &[u32],
         past_seen_tokens: usize,
@@ -179,7 +186,7 @@ impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
             .map_err(|error| tensor_from_bytes_error(&error))
     }
 
-    fn next_tokens(
+    pub(crate) fn next_tokens(
         &mut self,
         logits: &Tensor<D>,
     ) -> Result<Vec<u32>, GenerateError> {

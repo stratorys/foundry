@@ -17,6 +17,8 @@ pub struct Metrics {
     pub prompt_step_ns: Option<Summary>,
     pub decode_step_ns: Option<Summary>,
     pub step_sum_ns: Summary,
+    pub first_token_ns: Option<Summary>,
+    pub generation_ns: Option<Summary>,
     pub prompt_tokens_per_s: Option<Summary>,
     pub decode_tokens_per_s: Option<Summary>,
     pub output_tokens_per_s: Option<Summary>,
@@ -49,12 +51,18 @@ impl Metrics {
                     .iter()
                     .map(|row| count(row.len()))
                     .sum::<Result<f64, _>>()?;
-                let total_ns = run.total_ns();
+                let total_ns = run.step_sum_ns();
                 Ok(Throughputs {
-                    prompt: run.prefill_ns.and_then(|ns| throughput(prompt_tokens, ns)),
+                    prompt: run
+                        .prompt_step_ns
+                        .and_then(|ns| throughput(prompt_tokens, ns)),
                     decode: throughput(decode_tokens, sum_ns(&run.decode_ns)),
-                    output: throughput(output_tokens, total_ns),
-                    total: throughput(prompt_tokens + output_tokens, total_ns),
+                    output: run
+                        .generation_ns
+                        .and_then(|ns| throughput(output_tokens, ns)),
+                    total: run
+                        .generation_ns
+                        .and_then(|ns| throughput(prompt_tokens + output_tokens, ns)),
                     processed: throughput(prompt_tokens + decode_tokens, total_ns),
                 })
             })
@@ -63,15 +71,26 @@ impl Metrics {
             |select: fn(&Throughputs) -> Option<f64>| summary(rates.iter().filter_map(select));
         let step_sums = runs
             .iter()
-            .map(|run| u64_to_f64(run.total_ns()))
+            .map(|run| u64_to_f64(run.step_sum_ns()))
             .collect::<Vec<_>>();
         Ok(Self {
-            prompt_step_ns: summary(runs.iter().filter_map(|run| run.prefill_ns.map(u64_to_f64)))?,
+            prompt_step_ns: summary(
+                runs.iter()
+                    .filter_map(|run| run.prompt_step_ns.map(u64_to_f64)),
+            )?,
             decode_step_ns: summary(
                 runs.iter()
                     .flat_map(|run| run.decode_ns.iter().copied().map(u64_to_f64)),
             )?,
             step_sum_ns: Summary::try_from(step_sums.as_slice())?,
+            first_token_ns: summary(
+                runs.iter()
+                    .filter_map(|run| run.first_token_ns.map(u64_to_f64)),
+            )?,
+            generation_ns: summary(
+                runs.iter()
+                    .filter_map(|run| run.generation_ns.map(u64_to_f64)),
+            )?,
             prompt_tokens_per_s: rate_summary(|rates| rates.prompt)?,
             decode_tokens_per_s: rate_summary(|rates| rates.decode)?,
             output_tokens_per_s: rate_summary(|rates| rates.output)?,
@@ -116,6 +135,7 @@ mod tests {
         BenchError,
         Metrics,
         RunSamples,
+        TimingScope,
     };
 
     fn config(
@@ -124,7 +144,8 @@ mod tests {
     ) -> BenchConfig {
         BenchConfig {
             prompt_token_count: prompt,
-            gen_token_count: 3,
+            new_token_count: 4,
+            timing_scope: TimingScope::Generation,
             depth_token_count: 7,
             warmup_run_count: 0,
             warmup_ms: 0,
@@ -135,13 +156,19 @@ mod tests {
     }
 
     fn run(
-        prefill_ns: Option<u64>,
+        prompt_step_ns: Option<u64>,
         decode_ns: Vec<u64>,
         tokens: usize,
         batch: usize,
     ) -> RunSamples {
         RunSamples {
-            prefill_ns,
+            prompt_step_ns,
+            first_token_ns: prompt_step_ns.or_else(|| decode_ns.first().copied()),
+            generation_ns: Some(
+                prompt_step_ns
+                    .unwrap_or(0)
+                    .saturating_add(super::sum_ns(&decode_ns)),
+            ),
             decode_ns,
             token_ids: vec![vec![1; tokens]; batch],
             peak_memory_bytes: Some(2_000_000_000),
@@ -202,17 +229,23 @@ mod tests {
 
     #[test]
     fn prompt_only_and_decode_only_have_defined_metrics() {
-        let prompt = Metrics::from_runs(&[run(Some(250_000_000), vec![], 1, 1)], &config(2, 1))
-            .expect("prompt metrics");
+        let prompt = Metrics::from_runs(
+            &[RunSamples {
+                prompt_step_ns: Some(250_000_000),
+                token_ids: vec![vec![]],
+                ..RunSamples::default()
+            }],
+            &config(2, 1),
+        )
+        .expect("prompt metrics");
         assert_eq!(
             prompt.prompt_tokens_per_s.map(|s| s.mean),
             Some(8.0),
             "two prompt tokens"
         );
         assert_eq!(
-            prompt.output_tokens_per_s.map(|s| s.mean),
-            Some(4.0),
-            "prefill produces one token"
+            prompt.output_tokens_per_s, None,
+            "prompt-only processing produces no output"
         );
         assert_eq!(
             (prompt.decode_step_ns, prompt.decode_tokens_per_s),
@@ -265,13 +298,61 @@ mod tests {
     }
 
     #[test]
+    fn full_generation_rates_use_wall_time_and_are_unavailable_for_forward_passes() {
+        let mut run = run(Some(100_000_000), vec![100_000_000], 2, 1);
+        run.first_token_ns = Some(200_000_000);
+        run.generation_ns = Some(500_000_000);
+        let metrics =
+            Metrics::from_runs(&[run.clone()], &config(4, 1)).expect("generation metrics");
+        let measured = (
+            metrics.step_sum_ns.mean,
+            metrics.first_token_ns.map(|s| s.mean),
+            metrics.generation_ns.map(|s| s.mean),
+            metrics.output_tokens_per_s.map(|s| s.mean),
+            metrics.total_tokens_per_s.map(|s| s.mean),
+            metrics.processed_tokens_per_s.map(|s| s.mean),
+        );
+        let expected = (
+            200_000_000.0,
+            Some(200_000_000.0),
+            Some(500_000_000.0),
+            Some(4.0),
+            Some(12.0),
+            Some(25.0),
+        );
+        assert_eq!(
+            measured, expected,
+            "wall-time rates differ from step-sum rates"
+        );
+        run.first_token_ns = None;
+        run.generation_ns = None;
+        let metrics = Metrics::from_runs(
+            &[run],
+            &BenchConfig {
+                timing_scope: TimingScope::Forward,
+                ..config(4, 1)
+            },
+        )
+        .expect("forward metrics");
+        assert_eq!(
+            (
+                metrics.first_token_ns,
+                metrics.generation_ns,
+                metrics.output_tokens_per_s,
+                metrics.total_tokens_per_s
+            ),
+            (None, None, None, None),
+            "forward timing does not invent host latencies or full generation rates"
+        );
+    }
+
+    #[test]
     fn json_has_common_metrics_and_no_engine_names() {
         let config = config(2, 1);
         let samples = vec![run(Some(1), vec![], 1, 1)];
         let metrics = Metrics::from_runs(&samples, &config).expect("metrics");
         let report = crate::bench::Report {
             config,
-            mode: crate::bench::Mode::Pp,
             depth_ids: vec![vec![1; 7]],
             prompt_ids: vec![vec![1; 2]],
             start_ids: None,
@@ -289,7 +370,7 @@ mod tests {
             "raw generated IDs retained"
         );
         assert_eq!(
-            json.pointer("/runs/0/prefill_ns"),
+            json.pointer("/runs/0/prompt_step_ns"),
             Some(&serde_json::json!(1)),
             "raw timing retained"
         );
@@ -297,7 +378,7 @@ mod tests {
             .get("metrics")
             .and_then(serde_json::Value::as_object)
             .expect("metrics object");
-        assert_eq!(object.len(), 8, "one field per canonical metric");
+        assert_eq!(object.len(), 10, "one field per canonical metric");
         for name in ["mlx", "vllm", "llama_cpp", "sglang", "candle", "zml"] {
             assert!(!object.contains_key(name), "no engine projection {name}");
         }

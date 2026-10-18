@@ -488,6 +488,8 @@ impl Device for MetalDevice {
 
     fn device_name(&self) -> String { self.device.name().to_string() }
 
+    fn synchronize(&mut self) -> Result<(), MetalError> { self.stream.synchronize() }
+
     fn max_memory_allocated(&self) -> Option<AllocatedMemory> {
         Some(AllocatedMemory {
             bytes: self

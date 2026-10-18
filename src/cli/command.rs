@@ -135,7 +135,8 @@ pub fn bench_command<D: Device>(
     let vocab_size = vocab_size(&config)?;
     let bench_config = BenchConfig {
         prompt_token_count: args.prompt_tokens,
-        gen_token_count: args.gen_tokens,
+        new_token_count: args.new_tokens,
+        timing_scope: args.timing_scope,
         depth_token_count: args.depth,
         warmup_run_count: args.warmup_runs,
         warmup_ms: args.warmup_ms,
@@ -144,20 +145,24 @@ pub fn bench_command<D: Device>(
         seed: args.seed,
     };
     let mut device = open_device()?;
-    let max_cache_len = [args.depth, args.prompt_tokens, args.gen_tokens]
-        .into_iter()
-        .try_fold(0_usize, |max_cache_len, token_count| {
-            usize::try_from(token_count)
-                .ok()
-                .and_then(|token_count| max_cache_len.checked_add(token_count))
-        })
-        .ok_or_else(|| {
-            error!(
-                message = "Benchmark token counts overflow usize.",
-                ?bench_config
-            );
-            CliError::SeqLenOverflow
-        })?;
+    let max_cache_len = [
+        args.depth,
+        args.prompt_tokens,
+        bench_config.decode_step_count(),
+    ]
+    .into_iter()
+    .try_fold(0_usize, |max_cache_len, token_count| {
+        usize::try_from(token_count)
+            .ok()
+            .and_then(|token_count| max_cache_len.checked_add(token_count))
+    })
+    .ok_or_else(|| {
+        error!(
+            message = "Benchmark token counts overflow usize.",
+            ?bench_config
+        );
+        CliError::SeqLenOverflow
+    })?;
     let device_name = device.device_name();
     info!(message = "Selected the device.", %device_name);
     let llama = load_llama(&mut device, &args.model, &config, &weights, max_cache_len)?;
@@ -178,7 +183,8 @@ pub fn bench_command<D: Device>(
         device = DEVICE,
         device_name = %record.metadata.device_name,
         git_commit = ?record.metadata.git_commit,
-        mode = ?record.report.mode,
+        first_token_ms = ?record.report.metrics.first_token_ns.map(|s| s.mean / 1e6),
+        generation_ms = ?record.report.metrics.generation_ns.map(|s| s.mean / 1e6),
         prompt_tokens_per_s = ?record.report.metrics.prompt_tokens_per_s.map(|s| s.mean),
         decode_tokens_per_s = ?record.report.metrics.decode_tokens_per_s.map(|s| s.mean),
         output_tokens_per_s = ?record.report.metrics.output_tokens_per_s.map(|s| s.mean),

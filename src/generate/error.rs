@@ -32,4 +32,7 @@ pub enum GenerateError {
 
     #[error("Reading the logits failed.")]
     Logits,
+
+    #[error("Synchronizing device work failed.")]
+    Synchronize,
 }

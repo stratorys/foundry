@@ -11,6 +11,7 @@ use clap::{
     Parser,
     Subcommand,
 };
+use foundry::bench::TimingScope;
 #[cfg(target_os = "macos")]
 use foundry::metal::MetalDevice;
 use tracing::error;
@@ -71,9 +72,17 @@ pub struct BenchArgs {
     prompt_tokens: u32,
     #[arg(
         long,
-        help = "Decode steps after the prefill; 0 benchmarks the prefill only."
+        help = "Exactly N new tokens, including the prefill output; 0 measures only prompt \
+                processing."
     )]
-    gen_tokens: u32,
+    new_tokens: u32,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "generation",
+        help = "Time forwards through logits or generation through host token availability."
+    )]
+    timing_scope: TimingScope,
     #[arg(
         long,
         default_value_t = 0,
@@ -186,6 +195,7 @@ mod tests {
         CommandFactory,
         Parser,
     };
+    use foundry::bench::TimingScope;
 
     use crate::cli::error::ModelIdError;
     use crate::cli::{
@@ -345,57 +355,72 @@ mod tests {
 
     #[test]
     fn bench_parses_counts_with_defaults() {
+        let cli = Cli::try_parse_from(
+            "foundry bench --model a/b --prompt-tokens 512 --new-tokens 128 --out reports"
+                .split_whitespace(),
+        );
         assert_eq!(
-            Cli::try_parse_from([
-                "foundry",
-                "bench",
-                "--model",
-                "a/b",
-                "--prompt-tokens",
-                "512",
-                "--gen-tokens",
-                "128",
-                "--out",
-                "reports",
-            ])
-            .map(|cli| cli.command)
-            .map_err(|error| error.kind()),
+            cli.map(|cli| cli.command).map_err(|e| e.kind()),
             Ok(Command::Bench(BenchArgs {
                 model: ModelId {
                     owner: "a".to_owned(),
-                    name: "b".to_owned(),
+                    name: "b".to_owned()
                 },
                 prompt_tokens: 512,
-                gen_tokens: 128,
+                new_tokens: 128,
+                timing_scope: TimingScope::Generation,
                 depth: 0,
                 warmup_runs: 1,
                 warmup_ms: 0,
-                runs: NonZeroU32::new(10).expect("10 is not zero"),
+                runs: NonZeroU32::new(10).expect("positive run count"),
                 batch_size: NonZeroU32::MIN,
                 seed: 0,
                 out: PathBuf::from("reports"),
             })),
-            "pg 512/128 with one warmup run and ten measured runs"
+            "exact generation with one warmup and ten runs"
         );
     }
 
     #[test]
+    fn bench_parses_forward_scope_and_rejects_legacy_or_unknown_scopes() {
+        let base = "foundry bench --model a/b --prompt-tokens 4 --out r";
+        let forward = Cli::try_parse_from(
+            base.split_whitespace()
+                .chain("--new-tokens 1 --timing-scope forward".split_whitespace()),
+        );
+        assert!(
+            matches!(
+                forward.map(|cli| cli.command),
+                Ok(Command::Bench(BenchArgs {
+                    timing_scope: TimingScope::Forward,
+                    new_tokens: 1,
+                    ..
+                }))
+            ),
+            "forward and exact count parsed"
+        );
+        for (options, expected) in [
+            ("--gen-tokens 1", ErrorKind::UnknownArgument),
+            ("--new-tokens 1 --timing-scope gpu", ErrorKind::InvalidValue),
+        ] {
+            let cli =
+                Cli::try_parse_from(base.split_whitespace().chain(options.split_whitespace()));
+            assert_eq!(
+                cli.err().map(|e| e.kind()),
+                Some(expected),
+                "invalid options {options}"
+            );
+        }
+    }
+
+    #[test]
     fn bench_parses_the_batch_size() {
-        assert_eq!(
-            Cli::try_parse_from([
-                "foundry",
-                "bench",
-                "--model",
-                "a/b",
-                "--prompt-tokens",
-                "512",
-                "--gen-tokens",
-                "128",
-                "--batch-size",
-                "8",
-                "--out",
-                "reports",
-            ])
+        let cli = Cli::try_parse_from(
+            "foundry bench --model a/b --prompt-tokens 512 --new-tokens 128 --batch-size 8 --out \
+             reports"
+                .split_whitespace(),
+        );
+        let batch = cli
             .map(|cli| match cli.command {
                 Command::Bench(args) => Some(args.batch_size),
                 Command::Run {
@@ -403,61 +428,38 @@ mod tests {
                 }
                 | Command::Eval(_) => None,
             })
-            .map_err(|error| error.kind()),
-            Ok(NonZeroU32::new(8)),
-            "a batch of eight sequences"
-        );
+            .map_err(|e| e.kind());
+        assert_eq!(batch, Ok(NonZeroU32::new(8)), "batch of eight sequences");
     }
 
     #[test]
     fn bench_rejects_zero_runs_zero_batch_and_missing_arguments() {
-        struct ArgsKindCase {
-            args: Vec<&'static str>,
-            kind: ErrorKind,
+        for (options, expected) in [
+            (
+                "--prompt-tokens 1 --new-tokens 1 --out r --runs 0",
+                ErrorKind::ValueValidation,
+            ),
+            (
+                "--prompt-tokens 1 --new-tokens 1 --out r --batch-size 0",
+                ErrorKind::ValueValidation,
+            ),
+            (
+                "--prompt-tokens 1 --new-tokens 1",
+                ErrorKind::MissingRequiredArgument,
+            ),
+            ("--out r", ErrorKind::MissingRequiredArgument),
+        ] {
+            let cli = Cli::try_parse_from(
+                "foundry bench --model a/b"
+                    .split_whitespace()
+                    .chain(options.split_whitespace()),
+            );
+            assert_eq!(
+                cli.err().map(|e| e.kind()),
+                Some(expected),
+                "invalid options {options}"
+            );
         }
-        let base = [
-            "foundry",
-            "bench",
-            "--model",
-            "a/b",
-            "--prompt-tokens",
-            "1",
-            "--gen-tokens",
-            "1",
-        ];
-        [
-            ArgsKindCase {
-                args: [base.as_slice(), &["--out", "r", "--runs", "0"]].concat(),
-                kind: ErrorKind::ValueValidation,
-            },
-            ArgsKindCase {
-                args: [base.as_slice(), &["--out", "r", "--batch-size", "0"]].concat(),
-                kind: ErrorKind::ValueValidation,
-            },
-            ArgsKindCase {
-                args: base.to_vec(),
-                kind: ErrorKind::MissingRequiredArgument,
-            },
-            ArgsKindCase {
-                args: vec!["foundry", "bench", "--model", "a/b", "--out", "r"],
-                kind: ErrorKind::MissingRequiredArgument,
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |ArgsKindCase {
-                 args,
-                 kind,
-             }| {
-                assert_eq!(
-                    Cli::try_parse_from(&args)
-                        .map(|cli| cli.command)
-                        .map_err(|error| error.kind()),
-                    Err(kind),
-                    "args {args:?}"
-                );
-            },
-        );
     }
 
     #[test]

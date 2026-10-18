@@ -55,10 +55,10 @@ succeeds. Keep the machine on power and avoid other heavy workloads while measur
 ```sh
 ./target/release/foundry eval --model meta-llama/Llama-3.2-3B-Instruct --reference /tmp/llama-3.2-3B-transformers --reference /tmp/llama-3.2-3B-mlx --out "$OUT"
 
-./target/release/foundry bench --model meta-llama/Llama-3.2-3B-Instruct --prompt-tokens 512 --gen-tokens 128 --depth 0 --batch-size 1 --seed 0 --warmup-runs 1 --warmup-ms 0 --runs 10 --out "$OUT"
+./target/release/foundry bench --model meta-llama/Llama-3.2-3B-Instruct --prompt-tokens 512 --new-tokens 128 --timing-scope generation --depth 0 --batch-size 1 --seed 0 --warmup-runs 1 --warmup-ms 0 --runs 10 --out "$OUT"
 ```
 
-The benchmark uses random token IDs with a fixed seed: 512 prompt tokens, 128 decode steps,
+The benchmark uses random token IDs with a fixed seed: 512 prompt tokens, exactly 128 new tokens (127 decode steps),
 batch size 1 and no initial cache depth. It ignores EOS, runs one warmup, then measures ten runs.
 
 Results are written to `$OUT`:
@@ -82,33 +82,49 @@ not a reliable tail-latency estimate.
 
 For each run let **P** be prompt tokens across the batch, **D** be the number of decode steps
 times batch size, **O** be the actual number of output IDs across the batch, **Tp** be the prompt
-step duration, **Td** be the sum of all decode step durations, and **T = Tp + Td**. Rates below
-use seconds; stored latency values use nanoseconds.
+step duration, **Td** be the sum of all decode step durations, **T = Tp + Td**, and **G** be
+full generation wall time. Rates below use seconds; stored latency values use nanoseconds.
 
 | Field under `metrics` | Definition |
 |---|---|
-| `prompt_step_ns` | Prompt step through greedy selection and token availability on the host. |
+| `prompt_step_ns` | Prompt forward or host step, according to `config.timing_scope`. |
 | `decode_step_ns` | Distribution of all raw decode steps, across runs and positions. |
 | `step_sum_ns` | Per-run sum of the prompt and every decode step. |
 | `prompt_tokens_per_s` | P / Tp; unavailable without a prompt. |
 | `decode_tokens_per_s` | D / Td; unavailable without decode steps. |
-| `output_tokens_per_s` | O / T, including the first output produced by a prompt step. |
-| `total_tokens_per_s` | (P + O) / T, counting input and output tokens. |
+| `first_token_ns` | Decoder creation through the first token available on the host; generation scope only. |
+| `generation_ns` | Decoder creation through the final host token, excluding teardown; generation scope only. |
+| `output_tokens_per_s` | O / G; unavailable in forward scope or without output tokens. |
+| `total_tokens_per_s` | (P + O) / G, counting input and output tokens; generation scope only. |
 | `processed_tokens_per_s` | (P + D) / T, counting input tokens passed through timed forwards. |
 
-The timing boundary is the current **host step**: CPU preparation, allocations, command
-encoding, GPU execution, greedy selection and token readback. It is neither GPU-only time nor
-full request latency. Decoder/cache creation and initial `--depth` processing are outside the
-step timers; queued GPU cache initialization can still be waited on by the first timed step.
-Nanoseconds specify storage units, not measurement accuracy. Step sums exclude orchestration
-between steps. Prefill-to-logits, first-token latency, full generation latency, inter-token
-intervals and context-specific statistics require the subsequent instrumentation steps.
+Choose `--timing-scope generation` (default) or `--timing-scope forward`. Run them in separate
+invocations and output directories so synchronization used to isolate forwards does not
+perturb the generation pass. Both retain host wall times, not GPU-only times.
 
-`--gen-tokens` still means decode steps after the prompt: prompt 512 plus decode 128 produces
-129 output IDs per sequence. No final decode step is silently discarded. Initial cache depth
-is excluded from both rate numerators and timed step sums. Batch size multiplies token counts,
-not elapsed durations. Memory fields retain their current cumulative Metal high-water scope,
-including warmup; they are not independent run peaks or process resident memory.
+- **Generation:** step timers include CPU input preparation, allocations, encoding, GPU work,
+  greedy selection and token readback. `first_token_ns` and `generation_ns` additionally
+  include decoder/KV initialization, any initial cache depth and orchestration. Input drawing,
+  result-array preparation, model loading, report writing and decoder teardown are excluded.
+  Pending device work is synchronized before the decoder-creation clock starts.
+- **Forward:** each timer starts before input tensor preparation and ends after logits are
+  ready, with explicit synchronization. Cache/depth setup is completed before the first timer;
+  selection and readback happen outside the timer to supply the next input. Host first-token
+  and full-generation metrics are `null`, as are output/total wall-time throughputs.
+
+`--new-tokens N` means exactly N output tokens **per sequence**, including the first token
+from prefill. With a prompt, N = 1 executes no decode steps; N = 128 executes 127. N = 0
+processes only the prompt through ready logits, without selection or generated IDs. Without a
+prompt, a random start input is supplied and N decode steps produce N outputs. Prompt and
+output counts cannot both be zero. `--gen-tokens` is removed; there is no compatibility alias.
+The KV capacity is depth + prompt + actual decode steps.
+
+All decode steps are retained. Depth is excluded from step-throughput numerators and step
+sums, but included in full-generation latencies. Batch size multiplies token counts, not
+elapsed durations. Nanoseconds are storage units, not accuracy guarantees. Inter-token
+intervals and context-specific statistics are added in the next step. Memory fields still
+report a cumulative Metal high-water mark including warmup, not independent run peaks or
+process resident memory.
 
 ### Comparing engines
 
@@ -119,11 +135,11 @@ commands. Matching metric names alone do not establish equal measurement boundar
 | Engine / reference | Common quantities to compare | Boundary to check |
 |---|---|---|
 | [ZML](https://github.com/zml/zml/tree/master/examples) | Loading/execution latency and generation throughput from the chosen example. | Compilation, weight loading and execution are separate phases; identify what the selected example times. |
-| [llama.cpp `llama-bench`](https://github.com/ggml-org/llama.cpp/blob/master/tools/llama-bench/README.md) | Prompt/decode or combined processed-token throughput, run latencies, dispersion. | `llama-bench` excludes sampling; Foundry host steps include it. Forward-only timing is needed for an aligned comparison. |
+| [llama.cpp `llama-bench`](https://github.com/ggml-org/llama.cpp/blob/master/tools/llama-bench/README.md) | Prompt/decode or combined processed-token throughput, run latencies, dispersion. | `llama-bench` excludes sampling; Foundry host steps include it. Use forward scope for comparison; verify the remaining input-preparation and synchronization boundaries. |
 | [MLX-LM benchmark](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/benchmark.py) | Prompt throughput, generation throughput, peak memory. | Check the first-token numerator, final forward, synchronization and memory allocator scope in the pinned version. |
 | [Candle Llama example](https://github.com/huggingface/candle/blob/main/candle-examples/examples/llama/main.rs) | Generation throughput and output counts. | Check whether prefill/first output and decoding or printing are included. |
-| [vLLM benchmarks](https://github.com/vllm-project/vllm/tree/main/vllm/benchmarks) | Local latency and input/output throughput; TTFT, TPOT and ITL once instrumented. | Use a local benchmark for local inference comparisons. Client/server measurements include additional work. |
-| [SGLang benchmarks](https://docs.sglang.ai/developer_guide/bench_serving) | Latency and input/output throughput; TTFT, TPOT and ITL once instrumented. | Separate engine execution from streaming-client latency and concurrent serving throughput. |
+| [vLLM benchmarks](https://github.com/vllm-project/vllm/tree/main/vllm/benchmarks) | Local latency and input/output throughput; first-token latency, with TPOT and ITL in the next step. | Use a local benchmark for local inference comparisons. Client/server measurements include additional work. |
+| [SGLang benchmarks](https://docs.sglang.ai/developer_guide/bench_serving) | Latency and input/output throughput; first-token latency, with TPOT and ITL in the next step. | Separate engine execution from streaming-client latency and concurrent serving throughput. |
 
 Loading/compilation time, GPU-only time, process RSS and serving metrics are not currently
 instrumented in this report. No value is inferred for an unmeasured quantity. For external
