@@ -39,7 +39,6 @@ pub fn scaled_dot_product_attention<D: Device>(
     } = attention_dims(query.shape(), key.shape(), value.shape())?;
     let rows = group.saturating_mul(seq_len);
     let key_t = key.permute(&[0, 1, 3, 2])?;
-    let attn_mask_f32 = attn_mask.to_dtype(device, DType::F32)?;
     let scores = query
         .contiguous(device)?
         .reshape(Shape::try_from([batch, kv_heads, rows, head_dim])?)?
@@ -52,7 +51,7 @@ pub fn scaled_dot_product_attention<D: Device>(
         ])?)?
         .to_dtype(device, DType::F32)?
         .mul(device, scale)?
-        .add(device, &attn_mask_f32)?;
+        .add(device, attn_mask)?;
     softmax(device, &scores, scores.shape().last_dim()?)?
         .to_dtype(device, query.dtype())?
         .reshape(Shape::try_from([batch, kv_heads, rows, kv_length])?)?

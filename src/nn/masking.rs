@@ -1,4 +1,3 @@
-use half::bf16;
 use tracing::error;
 
 use crate::nn::{
@@ -29,7 +28,7 @@ pub fn create_causal_mask<D: Device>(
     seq_len: usize,
 ) -> Result<Tensor<D>, TensorError> {
     let (shape, bytes) = causal_mask(past_seen_tokens, seq_len)?;
-    Tensor::from_bytes(device, &bytes, DType::BF16, shape)
+    Tensor::from_bytes(device, &bytes, DType::F32, shape)
 }
 
 fn causal_mask(
@@ -82,20 +81,18 @@ fn causal_mask_bytes(
         .flat_map(|query_position| {
             (0..kv_length).map(move |key_position| {
                 if key_position <= query_position {
-                    bf16::ZERO
+                    0.0_f32
                 } else {
-                    bf16::NEG_INFINITY
+                    f32::NEG_INFINITY
                 }
             })
         })
-        .flat_map(bf16::to_le_bytes)
+        .flat_map(f32::to_le_bytes)
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use half::bf16;
-
     use crate::nn::TensorError;
     use crate::nn::masking::{
         causal_mask,
@@ -106,13 +103,13 @@ mod tests {
 
     #[test]
     fn causal_mask_bytes_of_a_prefill_hide_later_keys() {
-        let zero = bf16::ZERO;
-        let hidden = bf16::NEG_INFINITY;
+        let zero = 0.0_f32;
+        let hidden = f32::NEG_INFINITY;
         assert_eq!(
             causal_mask_bytes(0, 3),
             [zero, hidden, hidden, zero, zero, hidden, zero, zero, zero]
                 .into_iter()
-                .flat_map(bf16::to_le_bytes)
+                .flat_map(f32::to_le_bytes)
                 .collect::<Vec<u8>>(),
             "three queries over three keys, lower triangle visible"
         );
@@ -122,9 +119,9 @@ mod tests {
     fn causal_mask_bytes_of_a_decode_step_show_every_key() {
         assert_eq!(
             causal_mask_bytes(4, 5),
-            [bf16::ZERO; 5]
+            [0.0_f32; 5]
                 .into_iter()
-                .flat_map(bf16::to_le_bytes)
+                .flat_map(f32::to_le_bytes)
                 .collect::<Vec<u8>>(),
             "one query at position 4 sees keys 0 to 4"
         );
@@ -141,15 +138,15 @@ mod tests {
             [
                 Ok((
                     vec![1, 5],
-                    [bf16::ZERO; 5]
+                    [0.0_f32; 5]
                         .into_iter()
-                        .flat_map(bf16::to_le_bytes)
+                        .flat_map(f32::to_le_bytes)
                         .collect::<Vec<u8>>()
                 )),
                 Err(TensorError::NumelOverflow),
             ],
             "one decode step over five keys, then a 100 000 token prefill that would build about \
-             20 GB of mask bytes"
+             40 GB of mask bytes"
         );
     }
 

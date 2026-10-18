@@ -174,8 +174,7 @@ impl<D: Device> LlamaModel<D> {
         seq_len: usize,
     ) -> Result<Tensor<D>, TensorError> {
         let position_ids = position_ids(device, past_seen_tokens, seq_len)?;
-        let attention_mask =
-            create_causal_mask(device, past_seen_tokens, seq_len)?.to_dtype(device, DType::F32)?;
+        let attention_mask = create_causal_mask(device, past_seen_tokens, seq_len)?;
         let inputs_embeds = self.embed_tokens.forward(device, input_ids)?;
         let [cos, sin] = self.rotary_emb.forward(device, &position_ids)?;
         let hidden_states =
