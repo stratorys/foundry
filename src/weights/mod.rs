@@ -546,9 +546,9 @@ mod tests {
 
     #[test]
     fn index_with_two_shards_loads_both() {
-        struct HeaderDataCase<T0, T1> {
-            header: T0,
-            data: T1,
+        struct HeaderDataCase {
+            header: serde_json::Value,
+            data: Vec<u8>,
         }
         let [first, second] = [
             HeaderDataCase {

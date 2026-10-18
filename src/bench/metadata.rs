@@ -86,9 +86,9 @@ mod tests {
 
     #[test]
     fn rfc3339_utc_formats_unix_seconds() {
-        struct UnixExpectedCase<T0, T1> {
-            unix_s: T0,
-            expected: T1,
+        struct UnixExpectedCase {
+            unix_s: u64,
+            expected: &'static str,
         }
         [
             UnixExpectedCase {
@@ -129,9 +129,9 @@ mod tests {
 
     #[test]
     fn git_commit_accepts_only_a_full_hash() {
-        struct StdoutExpectedCase<T0, T1> {
-            stdout: T0,
-            expected: T1,
+        struct StdoutExpectedCase {
+            stdout: &'static str,
+            expected: Option<String>,
         }
         [
             StdoutExpectedCase {

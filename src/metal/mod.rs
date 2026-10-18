@@ -736,10 +736,10 @@ mod tests {
 
     #[test]
     fn round_trip_returns_the_same_bytes_for_each_dtype() {
-        struct DtypeBytesDimsCase<T0, T1, T2> {
-            dtype: T0,
-            bytes: T1,
-            dims: T2,
+        struct DtypeBytesDimsCase {
+            dtype: DType,
+            bytes: Vec<u8>,
+            dims: Vec<usize>,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let cases = [
@@ -748,7 +748,7 @@ mod tests {
                 bytes: [1.0_f32, -2.5, 1.5e-3, f32::MIN_POSITIVE, -0.0, f32::MAX]
                     .iter()
                     .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<u8>>(),
+                    .collect(),
                 dims: vec![2, 3],
             },
             DtypeBytesDimsCase {
@@ -1164,20 +1164,20 @@ mod tests {
 
     #[test]
     fn unary_ops_match_hand_computed_values_for_each_float_dtype() {
-        struct NameOutputExpectedCase<T0, T1, T2> {
-            name: T0,
-            output: T1,
-            expected: T2,
+        struct NameOutputExpectedCase {
+            name: &'static str,
+            output: Result<Tensor<MetalDevice>, TensorError>,
+            expected: [f32; 3],
         }
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -1214,7 +1214,7 @@ mod tests {
                     NameOutputExpectedCase {
                         name: "neg",
                         output: neg_input.neg(&mut device),
-                        expected: [-1.0_f32, 2.5, 0.0],
+                        expected: [-1.0, 2.5, 0.0],
                     },
                     NameOutputExpectedCase {
                         name: "exp",
@@ -1267,20 +1267,20 @@ mod tests {
 
     #[test]
     fn binary_ops_match_hand_computed_values_for_each_float_dtype() {
-        struct NameOutputExpectedCase<T0, T1, T2> {
-            name: T0,
-            output: T1,
-            expected: T2,
+        struct NameOutputExpectedCase {
+            name: &'static str,
+            output: Result<Tensor<MetalDevice>, TensorError>,
+            expected: [f32; 4],
         }
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -1311,7 +1311,7 @@ mod tests {
                     NameOutputExpectedCase {
                         name: "add",
                         output: lhs.add(&mut device, &rhs),
-                        expected: [3.0_f32, 6.0, 3.5, 3.0],
+                        expected: [3.0, 6.0, 3.5, 3.0],
                     },
                     NameOutputExpectedCase {
                         name: "sub",
@@ -1364,14 +1364,14 @@ mod tests {
 
     #[test]
     fn add_broadcasts_a_row_over_a_matrix() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [matrix, row] = [
             ValuesDimsCase {
-                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
                 dims: vec![2, 3],
             },
             ValuesDimsCase {
@@ -1448,14 +1448,14 @@ mod tests {
 
     #[test]
     fn mul_of_permuted_and_contiguous_operands_reads_both_layouts() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [transposed, contiguous] = [
             ValuesDimsCase {
-                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
                 dims: vec![3, 2],
             },
             ValuesDimsCase {
@@ -1572,21 +1572,21 @@ mod tests {
 
     #[test]
     fn sum_and_amax_over_each_dim_match_hand_computed_values_for_each_float_dtype() {
-        struct NameReducedDimsExpectedCase<T0, T1, T2, T3> {
-            name: T0,
-            reduced: T1,
-            dims: T2,
-            expected: T3,
+        struct NameReducedDimsExpectedCase {
+            name: &'static str,
+            reduced: Result<Tensor<MetalDevice>, TensorError>,
+            dims: &'static [usize],
+            expected: &'static [f32],
         }
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -1615,8 +1615,8 @@ mod tests {
                     NameReducedDimsExpectedCase {
                         name: "sum dim 0",
                         reduced: input.sum_keepdim(&mut device, 0),
-                        dims: &[1, 3][..],
-                        expected: &[5.0_f32, 7.0, 9.0][..],
+                        dims: &[1, 3],
+                        expected: &[5.0, 7.0, 9.0],
                     },
                     NameReducedDimsExpectedCase {
                         name: "sum dim 1",
@@ -1678,18 +1678,18 @@ mod tests {
 
     #[test]
     fn argmax_over_each_dim_matches_hand_computed_indices_for_each_float_dtype() {
-        struct DimDimsExpectedCase<T0, T1, T2> {
-            dim: T0,
-            dims: T1,
-            expected: T2,
+        struct DimDimsExpectedCase {
+            dim: usize,
+            dims: &'static [usize],
+            expected: &'static [u32],
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         [DType::F32, DType::BF16].into_iter().for_each(|dtype| {
             [
                 DimDimsExpectedCase {
                     dim: 0,
-                    dims: &[1, 3][..],
-                    expected: &[1_u32, 0, 1][..],
+                    dims: &[1, 3],
+                    expected: &[1, 0, 1],
                 },
                 DimDimsExpectedCase {
                     dim: 1,
@@ -1881,19 +1881,19 @@ mod tests {
 
     #[test]
     fn matmul_matches_hand_computed_values_for_each_float_dtype() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -1908,7 +1908,7 @@ mod tests {
              }| {
                 let [lhs, rhs] = [
                     ValuesDimsCase {
-                        values: vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+                        values: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                         dims: vec![2, 3],
                     },
                     ValuesDimsCase {
@@ -1966,14 +1966,14 @@ mod tests {
 
     #[test]
     fn matmul_reads_a_transposed_left_or_right_operand_without_copy() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: [f32; 6],
+            dims: [usize; 2],
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [x, weight, lhs, rhs] = [
             ValuesDimsCase {
-                values: [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+                values: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 dims: [2, 3],
             },
             ValuesDimsCase {
@@ -2042,23 +2042,23 @@ mod tests {
 
     #[test]
     fn batched_matmul_matches_sum_of_products() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase<'values> {
+            values: &'values [f32],
+            dims: [usize; 3],
         }
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
-        struct CountSeedCase<T0, T1> {
-            count: T0,
-            seed: T1,
+        struct CountSeedCase {
+            count: u16,
+            seed: u16,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [lhs_values, rhs_values] = [
             CountSeedCase {
                 count: 2 * 3 * 40,
-                seed: 7_u16,
+                seed: 7,
             },
             CountSeedCase {
                 count: 2 * 40 * 5,
@@ -2095,7 +2095,7 @@ mod tests {
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -2171,19 +2171,19 @@ mod tests {
 
     #[test]
     fn matmul_spans_several_tiles() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase<'values> {
+            values: &'values [f32],
+            dims: [usize; 2],
         }
-        struct CountSeedCase<T0, T1> {
-            count: T0,
-            seed: T1,
+        struct CountSeedCase {
+            count: u16,
+            seed: u16,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [lhs_values, rhs_values] = [
             CountSeedCase {
                 count: 37 * 20,
-                seed: 3_u16,
+                seed: 3,
             },
             CountSeedCase {
                 count: 20 * 33,
@@ -2270,9 +2270,9 @@ mod tests {
 
     #[test]
     fn matmul_copies_operand_without_unit_stride() {
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let rhs_contiguous: Vec<f32> = [
@@ -2300,7 +2300,7 @@ mod tests {
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -2378,14 +2378,14 @@ mod tests {
 
     #[test]
     fn matmul_reads_permuted_batch_dims_in_place() {
-        struct CountDimsCase<T0, T1> {
-            count: T0,
-            dims: T1,
+        struct CountDimsCase {
+            count: u16,
+            dims: [usize; 4],
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [lhs, rhs] = [
             CountDimsCase {
-                count: 48_u16,
+                count: 48,
                 dims: [2, 3, 2, 4],
             },
             CountDimsCase {
@@ -2427,9 +2427,9 @@ mod tests {
 
     #[test]
     fn matmul_with_empty_output_reads_nothing() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [lhs, rhs] = [
@@ -2438,7 +2438,7 @@ mod tests {
                 dims: vec![0, 3],
             },
             ValuesDimsCase {
-                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
                 dims: vec![3, 2],
             },
         ]
@@ -2472,9 +2472,9 @@ mod tests {
 
     #[test]
     fn index_select_selects_rows_for_each_float_dtype() {
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let indices = Tensor::from_bytes(
@@ -2490,7 +2490,7 @@ mod tests {
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -2629,25 +2629,25 @@ mod tests {
 
     #[test]
     fn cat_on_first_and_last_dim_for_each_float_dtype() {
-        struct NameOutputDimsExpectedCase<T0, T1, T2, T3> {
-            name: T0,
-            output: T1,
-            dims: T2,
-            expected: T3,
+        struct NameOutputDimsExpectedCase {
+            name: &'static str,
+            output: Result<Tensor<MetalDevice>, TensorError>,
+            dims: [usize; 2],
+            expected: Vec<f32>,
         }
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -2662,7 +2662,7 @@ mod tests {
              }| {
                 let [top, bottom, left, right] = [
                     ValuesDimsCase {
-                        values: vec![0.0_f32, 1.0, 2.0],
+                        values: vec![0.0, 1.0, 2.0],
                         dims: vec![1, 3],
                     },
                     ValuesDimsCase {
@@ -2702,7 +2702,7 @@ mod tests {
                         name: "cat on dim 0",
                         output: Tensor::cat(&mut device, [&top, &bottom], 0),
                         dims: [3, 3],
-                        expected: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                        expected: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                     },
                     NameOutputDimsExpectedCase {
                         name: "cat on the last dim",
@@ -2751,14 +2751,14 @@ mod tests {
 
     #[test]
     fn cat_of_permuted_input_reads_strided_values() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [lhs, rhs] = [
             ValuesDimsCase {
-                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
                 dims: vec![2, 3],
             },
             ValuesDimsCase {
@@ -2802,9 +2802,9 @@ mod tests {
 
     #[test]
     fn cat_with_empty_input_keeps_the_other_input() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [empty, rows] = [
@@ -2813,7 +2813,7 @@ mod tests {
                 dims: vec![0, 3],
             },
             ValuesDimsCase {
-                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+                values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
                 dims: vec![2, 3],
             },
         ]
@@ -2857,9 +2857,9 @@ mod tests {
 
     #[test]
     fn slice_scatter_writes_one_position_and_keeps_the_others_for_each_float_dtype() {
-        struct DtypeToleranceCase<T0, T1> {
-            dtype: T0,
-            tolerance: T1,
+        struct DtypeToleranceCase {
+            dtype: DType,
+            tolerance: f32,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let heads = 2_usize;
@@ -2887,7 +2887,7 @@ mod tests {
         [
             DtypeToleranceCase {
                 dtype: DType::F32,
-                tolerance: 1e-5_f32,
+                tolerance: 1e-5,
             },
             DtypeToleranceCase {
                 dtype: DType::BF16,
@@ -3016,14 +3016,14 @@ mod tests {
 
     #[test]
     fn slice_scatter_while_another_view_of_the_target_is_alive_is_rejected() {
-        struct ValuesDimsCase<T0, T1> {
-            values: T0,
-            dims: T1,
+        struct ValuesDimsCase {
+            values: Vec<f32>,
+            dims: Vec<usize>,
         }
         let mut device = MetalDevice::new().expect("a Metal device is available");
         let [mut target, update] = [
             ValuesDimsCase {
-                values: vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 dims: vec![2, 4],
             },
             ValuesDimsCase {

@@ -303,9 +303,9 @@ mod tests {
 
     #[test]
     fn run_rejects_missing_or_malformed_prompt_ids() {
-        struct ArgsKindCase<T0, T1> {
-            args: T0,
-            kind: T1,
+        struct ArgsKindCase {
+            args: Vec<&'static str>,
+            kind: ErrorKind,
         }
         [
             ArgsKindCase {
@@ -411,9 +411,9 @@ mod tests {
 
     #[test]
     fn bench_rejects_zero_runs_zero_batch_and_missing_arguments() {
-        struct ArgsKindCase<T0, T1> {
-            args: T0,
-            kind: T1,
+        struct ArgsKindCase {
+            args: Vec<&'static str>,
+            kind: ErrorKind,
         }
         let base = [
             "foundry",
