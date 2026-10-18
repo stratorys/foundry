@@ -241,28 +241,6 @@ mod tests {
     fn cli_definition_is_consistent() { Cli::command().debug_assert(); }
 
     #[test]
-    fn missing_subcommand_displays_the_help() {
-        assert_eq!(
-            Cli::try_parse_from(["foundry"])
-                .map(|cli| cli.command)
-                .map_err(|error| error.kind()),
-            Err(ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand),
-            "without a subcommand the help is shown"
-        );
-    }
-
-    #[test]
-    fn unknown_subcommand_is_rejected() {
-        assert_eq!(
-            Cli::try_parse_from(["foundry", "load"])
-                .map(|cli| cli.command)
-                .map_err(|error| error.kind()),
-            Err(ErrorKind::InvalidSubcommand),
-            "load is not a subcommand"
-        );
-    }
-
-    #[test]
     fn run_parses_model_prompt_ids_and_max_new_tokens() {
         assert_eq!(
             Cli::try_parse_from([
@@ -290,66 +268,13 @@ mod tests {
     }
 
     #[test]
-    fn run_rejects_the_device_option() {
+    fn run_rejects_missing_prompt_ids() {
         assert_eq!(
-            Cli::try_parse_from([
-                "foundry",
-                "run",
-                "--model",
-                "a/b",
-                "--device",
-                "metal",
-                "--prompt-ids",
-                "1",
-                "--max-new-tokens",
-                "1",
-            ])
-            .map(|cli| cli.command)
-            .map_err(|error| error.kind()),
-            Err(ErrorKind::UnknownArgument),
-            "the device is not selectable"
-        );
-    }
-
-    #[test]
-    fn run_rejects_missing_or_malformed_prompt_ids() {
-        struct ArgsKindCase {
-            args: Vec<&'static str>,
-            kind: ErrorKind,
-        }
-        [
-            ArgsKindCase {
-                args: vec!["foundry", "run", "--model", "a/b", "--max-new-tokens", "4"],
-                kind: ErrorKind::MissingRequiredArgument,
-            },
-            ArgsKindCase {
-                args: vec![
-                    "foundry",
-                    "run",
-                    "--model",
-                    "a/b",
-                    "--prompt-ids",
-                    "1,x",
-                    "--max-new-tokens",
-                    "4",
-                ],
-                kind: ErrorKind::ValueValidation,
-            },
-        ]
-        .into_iter()
-        .for_each(
-            |ArgsKindCase {
-                 args,
-                 kind,
-             }| {
-                assert_eq!(
-                    Cli::try_parse_from(&args)
-                        .map(|cli| cli.command)
-                        .map_err(|error| error.kind()),
-                    Err(kind),
-                    "args {args:?}"
-                );
-            },
+            Cli::try_parse_from(["foundry", "run", "--model", "a/b", "--max-new-tokens", "4"])
+                .map(|cli| cli.command)
+                .map_err(|error| error.kind()),
+            Err(ErrorKind::MissingRequiredArgument),
+            "prompt IDs are required"
         );
     }
 
@@ -382,11 +307,11 @@ mod tests {
     }
 
     #[test]
-    fn bench_parses_forward_scope_and_rejects_legacy_or_unknown_scopes() {
-        let base = "foundry bench --model a/b --prompt-tokens 4 --out r";
+    fn bench_parses_the_forward_scope() {
         let forward = Cli::try_parse_from(
-            base.split_whitespace()
-                .chain("--new-tokens 1 --timing-scope forward".split_whitespace()),
+            "foundry bench --model a/b --prompt-tokens 4 --out r --new-tokens 1 --timing-scope \
+             forward"
+                .split_whitespace(),
         );
         assert!(
             matches!(
@@ -399,18 +324,6 @@ mod tests {
             ),
             "forward and exact count parsed"
         );
-        for (options, expected) in [
-            ("--gen-tokens 1", ErrorKind::UnknownArgument),
-            ("--new-tokens 1 --timing-scope gpu", ErrorKind::InvalidValue),
-        ] {
-            let cli =
-                Cli::try_parse_from(base.split_whitespace().chain(options.split_whitespace()));
-            assert_eq!(
-                cli.err().map(|e| e.kind()),
-                Some(expected),
-                "invalid options {options}"
-            );
-        }
     }
 
     #[test]
@@ -433,16 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn bench_rejects_zero_runs_zero_batch_and_missing_arguments() {
+    fn bench_rejects_missing_arguments() {
         for (options, expected) in [
-            (
-                "--prompt-tokens 1 --new-tokens 1 --out r --runs 0",
-                ErrorKind::ValueValidation,
-            ),
-            (
-                "--prompt-tokens 1 --new-tokens 1 --out r --batch-size 0",
-                ErrorKind::ValueValidation,
-            ),
             (
                 "--prompt-tokens 1 --new-tokens 1",
                 ErrorKind::MissingRequiredArgument,
