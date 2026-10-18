@@ -106,8 +106,8 @@ pub fn percentile(
     Some(lower + (upper - lower) * f64::from(fraction_scaled) / f64::from(MAX_PERCENT))
 }
 
-pub fn ns_to_f64(ns: u64) -> f64 {
-    let [b0, b1, b2, b3, b4, b5, b6, b7] = ns.to_le_bytes();
+pub fn u64_to_f64(value: u64) -> f64 {
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = value.to_le_bytes();
     let low = u32::from_le_bytes([b0, b1, b2, b3]);
     let high = u32::from_le_bytes([b4, b5, b6, b7]);
     f64::from(high) * U32_SPAN + f64::from(low)
@@ -119,8 +119,8 @@ mod tests {
     use crate::bench::stats::{
         Summary,
         median,
-        ns_to_f64,
         percentile,
+        u64_to_f64,
     };
 
     #[test]
@@ -183,9 +183,9 @@ mod tests {
     }
 
     #[test]
-    fn ns_to_f64_is_exact_across_the_u32_boundary() {
+    fn u64_to_f64_is_exact_across_the_u32_boundary() {
         assert_eq!(
-            [0, 1_000, 4_294_967_296, 4_294_967_297].map(ns_to_f64),
+            [0, 1_000, 4_294_967_296, 4_294_967_297].map(u64_to_f64),
             [0.0, 1_000.0, 4_294_967_296.0, 4_294_967_297.0],
             "integers below 2^53 convert exactly"
         );

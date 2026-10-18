@@ -7,8 +7,8 @@ use crate::bench::error::BenchError;
 use crate::bench::stats::{
     mean,
     median,
-    ns_to_f64,
     percentile,
+    u64_to_f64,
 };
 
 const NS_PER_S: f64 = 1e9;
@@ -142,7 +142,7 @@ fn llama_cpp(
     let samples_ns_f64 = samples_ns
         .iter()
         .copied()
-        .map(ns_to_f64)
+        .map(u64_to_f64)
         .collect::<Vec<f64>>();
     Ok(LlamaCpp {
         n_prompt: counts.prompt_count,
@@ -162,7 +162,7 @@ pub fn run_ts(
     counts: TokenCounts,
 ) -> f64 {
     let token_count = f64::from(counts.prompt_count) + f64::from(counts.gen_count);
-    NS_PER_S * f64::from(counts.batch_size) * token_count / ns_to_f64(run.total_ns())
+    NS_PER_S * f64::from(counts.batch_size) * token_count / u64_to_f64(run.total_ns())
 }
 
 fn stdev_llama_cpp(samples: &[f64]) -> f64 {
@@ -291,9 +291,9 @@ pub fn sum_ns(samples_ns: &[u64]) -> u64 {
         .fold(0, |total_ns, &sample_ns| total_ns.saturating_add(sample_ns))
 }
 
-fn seconds(ns: u64) -> f64 { ns_to_f64(ns) / NS_PER_S }
+fn seconds(ns: u64) -> f64 { u64_to_f64(ns) / NS_PER_S }
 
-fn gigabytes(bytes: u64) -> f64 { ns_to_f64(bytes) / BYTES_PER_GB }
+fn gigabytes(bytes: u64) -> f64 { u64_to_f64(bytes) / BYTES_PER_GB }
 
 #[cfg(test)]
 mod tests {

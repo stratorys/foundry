@@ -44,7 +44,7 @@ use self::rng::SplitMix64;
 pub use self::stats::Summary;
 use self::stats::{
     mean,
-    ns_to_f64,
+    u64_to_f64,
 };
 use crate::generate::Decoder;
 use crate::models::CausalLm;
@@ -376,7 +376,7 @@ fn step<D: Device, M: CausalLm<D>>(
     })
 }
 
-fn ns_to_ms(ns: u64) -> f64 { ns_to_f64(ns) / NS_PER_MS }
+fn ns_to_ms(ns: u64) -> f64 { u64_to_f64(ns) / NS_PER_MS }
 
 fn advance(
     past_seen_tokens: usize,
@@ -394,16 +394,16 @@ fn advance(
 fn stats(runs: &[RunSamples]) -> Result<Stats, BenchError> {
     let prefill_ns = runs
         .iter()
-        .map(|run| run.prefill_ns.map(ns_to_f64))
+        .map(|run| run.prefill_ns.map(u64_to_f64))
         .collect::<Option<Vec<f64>>>()
         .filter(|samples| !samples.is_empty());
     let decode_step_ns = runs
         .iter()
-        .flat_map(|run| run.decode_ns.iter().copied().map(ns_to_f64))
+        .flat_map(|run| run.decode_ns.iter().copied().map(u64_to_f64))
         .collect::<Vec<f64>>();
     let run_ns = runs
         .iter()
-        .map(|run| ns_to_f64(run.total_ns()))
+        .map(|run| u64_to_f64(run.total_ns()))
         .collect::<Vec<f64>>();
     Ok(Stats {
         prefill_ns: prefill_ns.as_deref().map(Summary::try_from).transpose()?,
