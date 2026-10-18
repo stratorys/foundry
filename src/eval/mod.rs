@@ -495,7 +495,7 @@ mod tests {
         let view = WeightView {
             name: "model.norm.input",
             dtype: DType::F32,
-            shape: Shape::try_from([1].as_slice()).expect("the shape is valid"),
+            shape: Shape::try_from([1]).expect("the shape is valid"),
             bytes: &[0; 4],
         };
         let activation = |name| Activation {
