@@ -15,13 +15,16 @@ use std::time::{
     UNIX_EPOCH,
 };
 
+use chrono::{
+    DateTime,
+    SecondsFormat,
+};
 use foundry::bench::{
     BenchConfig,
     Metadata,
     Report,
     bench,
     git_commit,
-    rfc3339_utc,
 };
 use foundry::eval::{
     BaselineReport,
@@ -403,13 +406,17 @@ fn test_time() -> Result<String, CliError> {
             error!(message = "System clock is before the Unix epoch.", %error);
             CliError::Timestamp
         })?;
-    rfc3339_utc(since_epoch.as_secs()).ok_or_else(|| {
-        error!(
-            message = "System clock cannot be formatted as an RFC 3339 time.",
-            unix_s = since_epoch.as_secs()
-        );
-        CliError::Timestamp
-    })
+    i64::try_from(since_epoch.as_secs())
+        .ok()
+        .and_then(|unix_s| DateTime::from_timestamp(unix_s, 0))
+        .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .ok_or_else(|| {
+            error!(
+                message = "System clock cannot be formatted as an RFC 3339 time.",
+                unix_s = since_epoch.as_secs()
+            );
+            CliError::Timestamp
+        })
 }
 
 fn read_git_commit() -> Option<String> {

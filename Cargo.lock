@@ -603,6 +603,7 @@ dependencies = [
 name = "foundry"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "half",
  "hf-hub",
