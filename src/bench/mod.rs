@@ -24,22 +24,8 @@ pub use self::metadata::{
     Metadata,
     git_commit,
 };
-pub use self::metrics::{
-    Candle,
-    LlamaCpp,
-    Metrics,
-    Mlx,
-    MlxTrial,
-    Sglang,
-    SglangRun,
-    TokenCounts,
-    Vllm,
-};
-use self::metrics::{
-    metrics,
-    run_ts,
-    sum_ns,
-};
+pub use self::metrics::Metrics;
+use self::metrics::sum_ns;
 use self::rng::SplitMix64;
 pub use self::stats::Summary;
 use self::stats::{
@@ -91,21 +77,11 @@ pub struct Report {
     pub start_ids: Option<Vec<u32>>,
     pub warmup_run_count: u32,
     pub runs: Vec<RunSamples>,
-    pub stats: Stats,
     pub metrics: Metrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_source: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Stats {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_ns: Option<Summary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decode_step_ns: Option<Summary>,
-    pub run_ns: Summary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,12 +125,6 @@ pub fn bench<D: Device, M: CausalLm<D>>(
 ) -> Result<Report, BenchError> {
     let mode = Mode::try_from(config)?;
     let inputs = draw_inputs(config, mode, vocab_size)?;
-    let counts = TokenCounts {
-        batch_size: config.batch_size.get(),
-        prompt_count: config.prompt_token_count,
-        gen_count: config.gen_token_count,
-        depth_count: config.depth_token_count,
-    };
     info!(
         message = "Starting the benchmark.",
         ?mode,
@@ -197,13 +167,11 @@ pub fn bench<D: Device, M: CausalLm<D>>(
                 runs = config.run_count.get(),
                 prefill_ms = ?measured_run.prefill_ns.map(ns_to_ms),
                 decode_ms_mean = ?mean(&decode_ms),
-                ts = run_ts(&measured_run, counts),
             );
             Ok(measured_run)
         })
         .collect::<Result<Vec<RunSamples>, BenchError>>()?;
-    let stats = stats(&runs)?;
-    let metrics = metrics(&runs, counts)?;
+    let metrics = Metrics::from_runs(&runs, config)?;
     let peak_memory = device.max_memory_allocated();
     Ok(Report {
         config: *config,
@@ -213,7 +181,6 @@ pub fn bench<D: Device, M: CausalLm<D>>(
         start_ids: inputs.start_ids,
         warmup_run_count,
         runs,
-        stats,
         metrics,
         peak_memory_bytes: peak_memory.map(|peak_memory| peak_memory.bytes),
         peak_memory_source: peak_memory.map(|peak_memory| peak_memory.source),
@@ -388,29 +355,6 @@ fn advance(
             past_seen_tokens, seq_len
         );
         BenchError::PositionOverflow
-    })
-}
-
-fn stats(runs: &[RunSamples]) -> Result<Stats, BenchError> {
-    let prefill_ns = runs
-        .iter()
-        .map(|run| run.prefill_ns.map(u64_to_f64))
-        .collect::<Option<Vec<f64>>>()
-        .filter(|samples| !samples.is_empty());
-    let decode_step_ns = runs
-        .iter()
-        .flat_map(|run| run.decode_ns.iter().copied().map(u64_to_f64))
-        .collect::<Vec<f64>>();
-    let run_ns = runs
-        .iter()
-        .map(|run| u64_to_f64(run.total_ns()))
-        .collect::<Vec<f64>>();
-    Ok(Stats {
-        prefill_ns: prefill_ns.as_deref().map(Summary::try_from).transpose()?,
-        decode_step_ns: (!decode_step_ns.is_empty())
-            .then(|| Summary::try_from(decode_step_ns.as_slice()))
-            .transpose()?,
-        run_ns: Summary::try_from(run_ns.as_slice())?,
     })
 }
 

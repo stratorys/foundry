@@ -84,12 +84,6 @@ pub fn variance_sample(
         / f64::from(degrees)
 }
 
-pub fn median(samples: &[f64]) -> Option<f64> {
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable_by(f64::total_cmp);
-    percentile(&sorted, 50)
-}
-
 pub fn percentile(
     sorted: &[f64],
     percent: u32,
@@ -118,7 +112,6 @@ mod tests {
     use crate::bench::error::BenchError;
     use crate::bench::stats::{
         Summary,
-        median,
         percentile,
         u64_to_f64,
     };
@@ -178,7 +171,11 @@ mod tests {
 
     #[test]
     fn median_of_an_even_count_averages_the_middle_pair() {
-        assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), Some(2.5), "between 2 and 3");
+        assert_eq!(
+            Summary::try_from([4.0, 1.0, 3.0, 2.0].as_slice()).map(|s| s.p50),
+            Ok(2.5),
+            "between 2 and 3"
+        );
         assert_eq!(percentile(&[], 50), None, "no sample");
     }
 

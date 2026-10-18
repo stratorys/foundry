@@ -66,10 +66,69 @@ Results are written to `$OUT`:
 | File | Contents |
 |---|---|
 | `eval.json` | Module and generation comparisons against transformers and MLX. |
-| `report.json` | Configuration, token IDs, raw timings, statistics, peak Metal memory and source commit. |
+| `report.json` | Configuration, token IDs, raw timings, common metrics, peak Metal memory and source commit. |
 
-All speed measurements are from Foundry. Groups named `mlx`, `llama_cpp`, or other engines
-present those measurements using each engine's metric conventions.
+## Common metrics
+
+All measurements in `report.json` come from Foundry. One `metrics` object contains the
+statistics and throughputs, alongside configuration, input IDs, generated IDs and ordered raw
+timings. There are no per-engine groups or compatibility formats.
+
+Each metric contains `count`, `mean`, sample `stdev` and `variance`, `min`, `max` and interpolated
+`p10`, `p25`, `p50`, `p75`, `p90`, `p99`. Throughputs are summarized across per-run rates, rather
+than computed as the inverse of the mean latency. A metric without applicable samples is
+`null`; a zero duration never produces an infinite rate. Ten runs give an initial dispersion,
+not a reliable tail-latency estimate.
+
+For each run let **P** be prompt tokens across the batch, **D** be the number of decode steps
+times batch size, **O** be the actual number of output IDs across the batch, **Tp** be the prompt
+step duration, **Td** be the sum of all decode step durations, and **T = Tp + Td**. Rates below
+use seconds; stored latency values use nanoseconds.
+
+| Field under `metrics` | Definition |
+|---|---|
+| `prompt_step_ns` | Prompt step through greedy selection and token availability on the host. |
+| `decode_step_ns` | Distribution of all raw decode steps, across runs and positions. |
+| `step_sum_ns` | Per-run sum of the prompt and every decode step. |
+| `prompt_tokens_per_s` | P / Tp; unavailable without a prompt. |
+| `decode_tokens_per_s` | D / Td; unavailable without decode steps. |
+| `output_tokens_per_s` | O / T, including the first output produced by a prompt step. |
+| `total_tokens_per_s` | (P + O) / T, counting input and output tokens. |
+| `processed_tokens_per_s` | (P + D) / T, counting input tokens passed through timed forwards. |
+
+The timing boundary is the current **host step**: CPU preparation, allocations, command
+encoding, GPU execution, greedy selection and token readback. It is neither GPU-only time nor
+full request latency. Decoder/cache creation and initial `--depth` processing are outside the
+step timers; queued GPU cache initialization can still be waited on by the first timed step.
+Nanoseconds specify storage units, not measurement accuracy. Step sums exclude orchestration
+between steps. Prefill-to-logits, first-token latency, full generation latency, inter-token
+intervals and context-specific statistics require the subsequent instrumentation steps.
+
+`--gen-tokens` still means decode steps after the prompt: prompt 512 plus decode 128 produces
+129 output IDs per sequence. No final decode step is silently discarded. Initial cache depth
+is excluded from both rate numerators and timed step sums. Batch size multiplies token counts,
+not elapsed durations. Memory fields retain their current cumulative Metal high-water scope,
+including warmup; they are not independent run peaks or process resident memory.
+
+### Comparing engines
+
+Use the same model snapshot (including any conversion), token IDs, batch, cache depth/capacity,
+weight/KV types, generation count, EOS policy and warmup. Record engine versions and full
+commands. Matching metric names alone do not establish equal measurement boundaries.
+
+| Engine / reference | Common quantities to compare | Boundary to check |
+|---|---|---|
+| [ZML](https://github.com/zml/zml/tree/master/examples) | Loading/execution latency and generation throughput from the chosen example. | Compilation, weight loading and execution are separate phases; identify what the selected example times. |
+| [llama.cpp `llama-bench`](https://github.com/ggml-org/llama.cpp/blob/master/tools/llama-bench/README.md) | Prompt/decode or combined processed-token throughput, run latencies, dispersion. | `llama-bench` excludes sampling; Foundry host steps include it. Forward-only timing is needed for an aligned comparison. |
+| [MLX-LM benchmark](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/benchmark.py) | Prompt throughput, generation throughput, peak memory. | Check the first-token numerator, final forward, synchronization and memory allocator scope in the pinned version. |
+| [Candle Llama example](https://github.com/huggingface/candle/blob/main/candle-examples/examples/llama/main.rs) | Generation throughput and output counts. | Check whether prefill/first output and decoding or printing are included. |
+| [vLLM benchmarks](https://github.com/vllm-project/vllm/tree/main/vllm/benchmarks) | Local latency and input/output throughput; TTFT, TPOT and ITL once instrumented. | Use a local benchmark for local inference comparisons. Client/server measurements include additional work. |
+| [SGLang benchmarks](https://docs.sglang.ai/developer_guide/bench_serving) | Latency and input/output throughput; TTFT, TPOT and ITL once instrumented. | Separate engine execution from streaming-client latency and concurrent serving throughput. |
+
+Loading/compilation time, GPU-only time, process RSS and serving metrics are not currently
+instrumented in this report. No value is inferred for an unmeasured quantity. For external
+metrics with a different numerator or interval, use the retained raw samples and explicit
+formula; do not label a Foundry calculation as an actual run of that engine.
 
 ## Record the environment
 
