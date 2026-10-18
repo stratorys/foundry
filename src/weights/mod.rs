@@ -388,6 +388,11 @@ fn check_index<S>(
 
 #[cfg(test)]
 mod tests {
+    use safetensors::tensor::TensorView;
+    use safetensors::{
+        Dtype,
+        serialize,
+    };
     use serde_json::json;
 
     use crate::nn::{
@@ -454,18 +459,20 @@ mod tests {
 
     #[test]
     fn nbytes_sums_tensor_bytes() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] },
-            "b": { "dtype": "F32", "shape": [1], "data_offsets": [4, 8] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..8)
-            .collect();
+        let file = serialize(
+            [
+                (
+                    "a",
+                    TensorView::new(Dtype::BF16, vec![2], &[0; 4]).expect("the view is valid"),
+                ),
+                (
+                    "b",
+                    TensorView::new(Dtype::F32, vec![1], &[0; 4]).expect("the view is valid"),
+                ),
+            ],
+            None,
+        )
+        .expect("the file serializes");
         let index = serde_json::to_vec(&json!({
             "metadata": { "total_size": 8 },
             "weight_map": { "a": "s1.safetensors", "b": "s1.safetensors" },
@@ -488,17 +495,14 @@ mod tests {
 
     #[test]
     fn nbytes_rejects_a_declared_size_mismatch() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+        let file = serialize(
+            [(
+                "a",
+                TensorView::new(Dtype::F32, vec![1], &[0; 4]).expect("the view is valid"),
+            )],
+            None,
         )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        .expect("the file serializes");
         let index = serde_json::to_vec(&json!({
             "metadata": { "total_size": 5 },
             "weight_map": { "a": "s1.safetensors" },
@@ -521,18 +525,20 @@ mod tests {
 
     #[test]
     fn numel_sums_the_elements_of_every_tensor() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 12] },
-            "b": { "dtype": "F32", "shape": [2], "data_offsets": [12, 20] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..20)
-            .collect();
+        let file = serialize(
+            [
+                (
+                    "a",
+                    TensorView::new(Dtype::BF16, vec![2, 3], &[0; 12]).expect("the view is valid"),
+                ),
+                (
+                    "b",
+                    TensorView::new(Dtype::F32, vec![2], &[0; 8]).expect("the view is valid"),
+                ),
+            ],
+            None,
+        )
+        .expect("the file serializes");
         let weights = Weights::from_shards(
             None,
             vec![Shard {
@@ -546,35 +552,22 @@ mod tests {
 
     #[test]
     fn index_with_two_shards_loads_both() {
-        struct HeaderDataCase {
-            header: serde_json::Value,
-            data: Vec<u8>,
-        }
-        let [first, second] = [
-            HeaderDataCase {
-                header: json!({ "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] } }),
-                data: vec![0, 1, 2, 3],
-            },
-            HeaderDataCase {
-                header: json!({ "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
-                data: vec![9, 8, 7, 6],
-            },
-        ]
-        .map(
-            |HeaderDataCase {
-                 header,
-                 data,
-             }| {
-                let header = serde_json::to_vec(&header).expect("the header serializes");
-                u64::try_from(header.len())
-                    .expect("the header length fits in u64")
-                    .to_le_bytes()
-                    .into_iter()
-                    .chain(header)
-                    .chain(data)
-                    .collect::<Vec<u8>>()
-            },
-        );
+        let first = serialize(
+            [(
+                "a",
+                TensorView::new(Dtype::BF16, vec![2], &[0, 1, 2, 3]).expect("the view is valid"),
+            )],
+            None,
+        )
+        .expect("the file serializes");
+        let second = serialize(
+            [(
+                "b",
+                TensorView::new(Dtype::F32, vec![1], &[9, 8, 7, 6]).expect("the view is valid"),
+            )],
+            None,
+        )
+        .expect("the file serializes");
         let index = serde_json::to_vec(&json!({
             "metadata": { "total_size": 8 },
             "weight_map": { "a": "s1.safetensors", "b": "s2.safetensors" },
@@ -610,17 +603,14 @@ mod tests {
 
     #[test]
     fn index_naming_the_wrong_shard_is_rejected() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] } }),
+        let file = serialize(
+            [(
+                "a",
+                TensorView::new(Dtype::BF16, vec![2], &[0; 4]).expect("the view is valid"),
+            )],
+            None,
         )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        .expect("the file serializes");
         let index = serde_json::to_vec(
             &json!({ "weight_map": { "a": "s1.safetensors", "c": "s1.safetensors" } }),
         )
@@ -642,17 +632,14 @@ mod tests {
     #[test]
     fn index_naming_another_existing_shard_is_rejected() {
         let [first, second] = ["a", "b"].map(|name| {
-            let header = serde_json::to_vec(
-                &json!({ name: { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+            serialize(
+                [(
+                    name,
+                    TensorView::new(Dtype::F32, vec![1], &[0; 4]).expect("the view is valid"),
+                )],
+                None,
             )
-            .expect("the header serializes");
-            u64::try_from(header.len())
-                .expect("the header length fits in u64")
-                .to_le_bytes()
-                .into_iter()
-                .chain(header)
-                .chain(0..4)
-                .collect::<Vec<u8>>()
+            .expect("the file serializes")
         });
         let index = serde_json::to_vec(
             &json!({ "weight_map": { "a": "s2.safetensors", "b": "s2.safetensors" } }),
@@ -680,17 +667,14 @@ mod tests {
 
     #[test]
     fn index_without_metadata_declares_no_size() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+        let file = serialize(
+            [(
+                "a",
+                TensorView::new(Dtype::F32, vec![1], &[0; 4]).expect("the view is valid"),
+            )],
+            None,
         )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        .expect("the file serializes");
         let index = serde_json::to_vec(&json!({ "weight_map": { "a": "s1.safetensors" } }))
             .expect("the index serializes");
         let weights = Weights::from_shards(
@@ -726,17 +710,14 @@ mod tests {
     #[test]
     fn duplicate_tensor_across_shards_is_rejected() {
         let [first, second] = [0_u8; 2].map(|_| {
-            let header = serde_json::to_vec(
-                &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+            serialize(
+                [(
+                    "a",
+                    TensorView::new(Dtype::F32, vec![1], &[0; 4]).expect("the view is valid"),
+                )],
+                None,
             )
-            .expect("the header serializes");
-            u64::try_from(header.len())
-                .expect("the header length fits in u64")
-                .to_le_bytes()
-                .into_iter()
-                .chain(header)
-                .chain(0..4)
-                .collect::<Vec<u8>>()
+            .expect("the file serializes")
         });
         assert_eq!(
             Weights::from_shards(
@@ -835,17 +816,14 @@ mod tests {
 
     #[test]
     fn u32_dtype_is_accepted() {
-        let header = serde_json::to_vec(&json!({
-            "b": { "dtype": "U32", "shape": [1], "data_offsets": [0, 4] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        let file = serialize(
+            [(
+                "b",
+                TensorView::new(Dtype::U32, vec![1], &[0; 4]).expect("the view is valid"),
+            )],
+            None,
+        )
+        .expect("the file serializes");
         let weights = Weights::from_shards(
             None,
             vec![Shard {
@@ -904,18 +882,20 @@ mod tests {
 
     #[test]
     fn scalar_and_zero_dim_tensors_are_accepted() {
-        let header = serde_json::to_vec(&json!({
-            "s": { "dtype": "F32", "shape": [], "data_offsets": [0, 4] },
-            "z": { "dtype": "F32", "shape": [0, 3], "data_offsets": [4, 4] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        let file = serialize(
+            [
+                (
+                    "s",
+                    TensorView::new(Dtype::F32, vec![], &[0, 1, 2, 3]).expect("the view is valid"),
+                ),
+                (
+                    "z",
+                    TensorView::new(Dtype::F32, vec![0, 3], &[]).expect("the view is valid"),
+                ),
+            ],
+            None,
+        )
+        .expect("the file serializes");
         let weights = Weights::from_shards(
             None,
             vec![Shard {
@@ -948,19 +928,24 @@ mod tests {
 
     #[test]
     fn empty_ranges_at_the_same_offset_are_accepted() {
-        let header = serde_json::to_vec(&json!({
-            "a": { "dtype": "F32", "shape": [0], "data_offsets": [4, 4] },
-            "b": { "dtype": "F32", "shape": [0], "data_offsets": [4, 4] },
-            "c": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
-        }))
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        let file = serialize(
+            [
+                (
+                    "a",
+                    TensorView::new(Dtype::F32, vec![0], &[]).expect("the view is valid"),
+                ),
+                (
+                    "b",
+                    TensorView::new(Dtype::F32, vec![0], &[]).expect("the view is valid"),
+                ),
+                (
+                    "c",
+                    TensorView::new(Dtype::F32, vec![1], &[0; 4]).expect("the view is valid"),
+                ),
+            ],
+            None,
+        )
+        .expect("the file serializes");
         let weights = Weights::from_shards(
             None,
             vec![Shard {
@@ -974,17 +959,14 @@ mod tests {
 
     #[test]
     fn missing_tensor_is_not_found() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] } }),
+        let file = serialize(
+            [(
+                "a",
+                TensorView::new(Dtype::F32, vec![1], &[0; 4]).expect("the view is valid"),
+            )],
+            None,
         )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        .expect("the file serializes");
         let weights = Weights::from_shards(
             None,
             vec![Shard {
