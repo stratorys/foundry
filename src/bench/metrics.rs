@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::bench::stats::u64_to_f64;
 use crate::bench::{
     BenchConfig,
     BenchError,
+    DecodeSample,
     RunSamples,
     Summary,
 };
@@ -16,6 +19,9 @@ const NS_PER_S: f64 = 1e9;
 pub struct Metrics {
     pub prompt_step_ns: Option<Summary>,
     pub decode_step_ns: Option<Summary>,
+    pub decode_by_position: Vec<DecodePositionMetrics>,
+    pub inter_token_ns: Option<Summary>,
+    pub tpot_ns: Option<Summary>,
     pub step_sum_ns: Summary,
     pub first_token_ns: Option<Summary>,
     pub generation_ns: Option<Summary>,
@@ -26,12 +32,21 @@ pub struct Metrics {
     pub processed_tokens_per_s: Option<Summary>,
 }
 
-struct Throughputs {
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DecodePositionMetrics {
+    pub position: usize,
+    pub context_tokens: usize,
+    pub step_ns: Summary,
+    pub inter_token_ns: Option<Summary>,
+}
+
+struct DerivedMetrics {
     prompt: Option<f64>,
     decode: Option<f64>,
     output: Option<f64>,
     total: Option<f64>,
     processed: Option<f64>,
+    tpot: Option<f64>,
 }
 
 impl Metrics {
@@ -41,22 +56,21 @@ impl Metrics {
     ) -> Result<Self, BenchError> {
         let prompt_tokens =
             f64::from(config.batch_size.get()) * f64::from(config.prompt_token_count);
-        let rates = runs
+        let derived = runs
             .iter()
             .map(|run| {
-                let decode_tokens =
-                    f64::from(config.batch_size.get()) * count(run.decode_ns.len())?;
+                let decode_tokens = f64::from(config.batch_size.get()) * count(run.decode.len())?;
                 let output_tokens = run
                     .token_ids
                     .iter()
                     .map(|row| count(row.len()))
                     .sum::<Result<f64, _>>()?;
                 let total_ns = run.step_sum_ns();
-                Ok(Throughputs {
+                Ok(DerivedMetrics {
                     prompt: run
                         .prompt_step_ns
                         .and_then(|ns| throughput(prompt_tokens, ns)),
-                    decode: throughput(decode_tokens, sum_ns(&run.decode_ns)),
+                    decode: throughput(decode_tokens, sum_ns(run.decode_ns())),
                     output: run
                         .generation_ns
                         .and_then(|ns| throughput(output_tokens, ns)),
@@ -64,11 +78,12 @@ impl Metrics {
                         .generation_ns
                         .and_then(|ns| throughput(prompt_tokens + output_tokens, ns)),
                     processed: throughput(prompt_tokens + decode_tokens, total_ns),
+                    tpot: tpot_ns(run)?,
                 })
             })
             .collect::<Result<Vec<_>, BenchError>>()?;
-        let rate_summary =
-            |select: fn(&Throughputs) -> Option<f64>| summary(rates.iter().filter_map(select));
+        let derived_summary =
+            |select: fn(&DerivedMetrics) -> Option<f64>| summary(derived.iter().filter_map(select));
         let step_sums = runs
             .iter()
             .map(|run| u64_to_f64(run.step_sum_ns()))
@@ -78,10 +93,14 @@ impl Metrics {
                 runs.iter()
                     .filter_map(|run| run.prompt_step_ns.map(u64_to_f64)),
             )?,
-            decode_step_ns: summary(
+            decode_step_ns: summary(runs.iter().flat_map(RunSamples::decode_ns).map(u64_to_f64))?,
+            decode_by_position: decode_by_position(runs)?,
+            inter_token_ns: summary(
                 runs.iter()
-                    .flat_map(|run| run.decode_ns.iter().copied().map(u64_to_f64)),
+                    .flat_map(|run| &run.decode)
+                    .filter_map(|sample| sample.inter_token_ns.map(u64_to_f64)),
             )?,
+            tpot_ns: derived_summary(|run| run.tpot)?,
             step_sum_ns: Summary::try_from(step_sums.as_slice())?,
             first_token_ns: summary(
                 runs.iter()
@@ -91,13 +110,52 @@ impl Metrics {
                 runs.iter()
                     .filter_map(|run| run.generation_ns.map(u64_to_f64)),
             )?,
-            prompt_tokens_per_s: rate_summary(|rates| rates.prompt)?,
-            decode_tokens_per_s: rate_summary(|rates| rates.decode)?,
-            output_tokens_per_s: rate_summary(|rates| rates.output)?,
-            total_tokens_per_s: rate_summary(|rates| rates.total)?,
-            processed_tokens_per_s: rate_summary(|rates| rates.processed)?,
+            prompt_tokens_per_s: derived_summary(|run| run.prompt)?,
+            decode_tokens_per_s: derived_summary(|run| run.decode)?,
+            output_tokens_per_s: derived_summary(|run| run.output)?,
+            total_tokens_per_s: derived_summary(|run| run.total)?,
+            processed_tokens_per_s: derived_summary(|run| run.processed)?,
         })
     }
+}
+
+fn tpot_ns(run: &RunSamples) -> Result<Option<f64>, BenchError> {
+    let intervals = run.token_ids.first().map_or(0, Vec::len).saturating_sub(1);
+    match (run.first_token_ns, run.generation_ns) {
+        (Some(first), Some(last)) if intervals > 0 => Ok(Some(
+            u64_to_f64(last.saturating_sub(first)) / count(intervals)?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn decode_by_position(runs: &[RunSamples]) -> Result<Vec<DecodePositionMetrics>, BenchError> {
+    let mut groups: BTreeMap<(usize, usize), Vec<&DecodeSample>> = BTreeMap::new();
+    for sample in runs.iter().flat_map(|run| &run.decode) {
+        groups
+            .entry((sample.position, sample.context_tokens))
+            .or_default()
+            .push(sample);
+    }
+    groups
+        .into_iter()
+        .map(|((position, context_tokens), samples)| {
+            let steps = samples
+                .iter()
+                .map(|sample| u64_to_f64(sample.step_ns))
+                .collect::<Vec<_>>();
+            Ok(DecodePositionMetrics {
+                position,
+                context_tokens,
+                step_ns: Summary::try_from(steps.as_slice())?,
+                inter_token_ns: summary(
+                    samples
+                        .iter()
+                        .filter_map(|sample| sample.inter_token_ns.map(u64_to_f64)),
+                )?,
+            })
+        })
+        .collect()
 }
 
 fn count(value: usize) -> Result<f64, BenchError> {
@@ -120,10 +178,8 @@ fn summary(samples: impl Iterator<Item = f64>) -> Result<Option<Summary>, BenchE
         .transpose()
 }
 
-pub(crate) fn sum_ns(samples: &[u64]) -> u64 {
-    samples
-        .iter()
-        .fold(0, |total, &sample| total.saturating_add(sample))
+pub(crate) fn sum_ns(samples: impl Iterator<Item = u64>) -> u64 {
+    samples.fold(0, |total, sample| total.saturating_add(sample))
 }
 
 #[cfg(test)]
@@ -133,6 +189,7 @@ mod tests {
     use crate::bench::{
         BenchConfig,
         BenchError,
+        DecodeSample,
         Metrics,
         RunSamples,
         TimingScope,
@@ -167,9 +224,18 @@ mod tests {
             generation_ns: Some(
                 prompt_step_ns
                     .unwrap_or(0)
-                    .saturating_add(super::sum_ns(&decode_ns)),
+                    .saturating_add(super::sum_ns(decode_ns.iter().copied())),
             ),
-            decode_ns,
+            decode: decode_ns
+                .into_iter()
+                .enumerate()
+                .map(|(position, step_ns)| DecodeSample {
+                    position,
+                    context_tokens: position.saturating_add(11),
+                    step_ns,
+                    inter_token_ns: (prompt_step_ns.is_some() || position > 0).then_some(step_ns),
+                })
+                .collect(),
             token_ids: vec![vec![1; tokens]; batch],
             peak_memory_bytes: Some(2_000_000_000),
         }
@@ -326,6 +392,9 @@ mod tests {
         );
         run.first_token_ns = None;
         run.generation_ns = None;
+        run.decode
+            .iter_mut()
+            .for_each(|sample| sample.inter_token_ns = None);
         let metrics = Metrics::from_runs(
             &[run],
             &BenchConfig {
@@ -338,11 +407,87 @@ mod tests {
             (
                 metrics.first_token_ns,
                 metrics.generation_ns,
+                metrics.inter_token_ns,
+                metrics.tpot_ns,
                 metrics.output_tokens_per_s,
                 metrics.total_tokens_per_s
             ),
-            (None, None, None, None),
+            (None, None, None, None, None, None),
             "forward timing does not invent host latencies or full generation rates"
+        );
+    }
+
+    #[test]
+    fn inter_token_latency_and_tpot_use_host_availability_not_step_time() {
+        let mut sample = run(Some(100_000_000), vec![90_000_000, 110_000_000], 3, 2);
+        sample.generation_ns = Some(500_000_000);
+        for (step, interval) in sample.decode.iter_mut().zip([150_000_000, 250_000_000]) {
+            step.inter_token_ns = Some(interval);
+        }
+        let metrics = Metrics::from_runs(&[sample], &config(4, 2)).expect("metrics");
+        let itl = metrics.inter_token_ns.expect("two host intervals");
+        let tpot = metrics.tpot_ns.expect("one request mean");
+        assert_eq!(
+            (itl.count, itl.min, itl.max, itl.mean),
+            (2, 150_000_000.0, 250_000_000.0, 200_000_000.0),
+            "tokens available at 100, 250, 500 ms"
+        );
+        assert_eq!(
+            (tpot.count, tpot.mean),
+            (1, 200_000_000.0),
+            "TPOT is per sequence, not divided by batch size"
+        );
+        assert_eq!(
+            metrics.decode_step_ns.map(|s| s.mean),
+            Some(100_000_000.0),
+            "ITL also includes orchestration outside the step timer"
+        );
+    }
+
+    #[test]
+    fn position_statistics_keep_repetitions_and_contexts_separate() {
+        let mut samples = [
+            run(Some(100), vec![10, 900], 3, 1),
+            run(Some(100), vec![30, 1100], 3, 1),
+        ];
+        let metrics = Metrics::from_runs(&samples, &config(4, 1)).expect("metrics");
+        let positions = metrics
+            .decode_by_position
+            .iter()
+            .map(|p| (p.position, p.context_tokens, p.step_ns.count, p.step_ns.p50))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            vec![(0, 11, 2, 20.0), (1, 12, 2, 1000.0)],
+            "compare repetitions at the same position and context"
+        );
+        assert_eq!(
+            metrics.inter_token_ns.map(|s| s.count),
+            Some(4),
+            "four raw intervals"
+        );
+        assert_eq!(
+            metrics.tpot_ns.map(|s| s.count),
+            Some(2),
+            "two request means, not four independent requests"
+        );
+        samples
+            .last_mut()
+            .expect("second run")
+            .decode
+            .first_mut()
+            .expect("first step")
+            .context_tokens = 111;
+        let metrics = Metrics::from_runs(&samples, &config(4, 1)).expect("metrics");
+        let groups = metrics
+            .decode_by_position
+            .iter()
+            .map(|p| (p.position, p.context_tokens, p.step_ns.count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            vec![(0, 11, 1), (0, 111, 1), (1, 12, 2)],
+            "different contexts never merged even at the same position"
         );
     }
 
@@ -378,7 +523,7 @@ mod tests {
             .get("metrics")
             .and_then(serde_json::Value::as_object)
             .expect("metrics object");
-        assert_eq!(object.len(), 10, "one field per canonical metric");
+        assert_eq!(object.len(), 13, "one field per canonical metric");
         for name in ["mlx", "vllm", "llama_cpp", "sglang", "candle", "zml"] {
             assert!(!object.contains_key(name), "no engine projection {name}");
         }

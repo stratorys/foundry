@@ -74,7 +74,7 @@ All measurements in `report.json` come from Foundry. One `metrics` object contai
 statistics and throughputs, alongside configuration, input IDs, generated IDs and ordered raw
 timings. There are no per-engine groups or compatibility formats.
 
-Each metric contains `count`, `mean`, sample `stdev` and `variance`, `min`, `max` and interpolated
+Each latency/throughput summary contains `count`, `mean`, sample `stdev` and `variance`, `min`, `max` and interpolated
 `p10`, `p25`, `p50`, `p75`, `p90`, `p99`. Throughputs are summarized across per-run rates, rather
 than computed as the inverse of the mean latency. A metric without applicable samples is
 `null`; a zero duration never produces an infinite rate. Ten runs give an initial dispersion,
@@ -88,7 +88,10 @@ full generation wall time. Rates below use seconds; stored latency values use na
 | Field under `metrics` | Definition |
 |---|---|
 | `prompt_step_ns` | Prompt forward or host step, according to `config.timing_scope`. |
-| `decode_step_ns` | Distribution of all raw decode steps, across runs and positions. |
+| `decode_step_ns` | Secondary distribution of all decode step durations, mixing contexts. |
+| `decode_by_position` | Step and ITL summaries across repetitions at each identical position and context. |
+| `inter_token_ns` | Distribution of host availability intervals after the first token; generation scope only. |
+| `tpot_ns` | Distribution of per-run `(generation_ns - first_token_ns) / (N - 1)`; generation scope and N > 1 only. |
 | `step_sum_ns` | Per-run sum of the prompt and every decode step. |
 | `prompt_tokens_per_s` | P / Tp; unavailable without a prompt. |
 | `decode_tokens_per_s` | D / Td; unavailable without decode steps. |
@@ -121,10 +124,36 @@ The KV capacity is depth + prompt + actual decode steps.
 
 All decode steps are retained. Depth is excluded from step-throughput numerators and step
 sums, but included in full-generation latencies. Batch size multiplies token counts, not
-elapsed durations. Nanoseconds are storage units, not accuracy guarantees. Inter-token
-intervals and context-specific statistics are added in the next step. Memory fields still
+elapsed durations. Nanoseconds are storage units, not accuracy guarantees. Memory fields still
 report a cumulative Metal high-water mark including warmup, not independent run peaks or
 process resident memory.
+
+### Decode samples and context
+
+Each run records a `decode` array. Every sample contains `position` (zero-based decode index),
+`context_tokens` (cached tokens per sequence **before** the one-token input), `step_ns` and
+`inter_token_ns` (ITL). With depth C and prompt length P, the first decode has context C + P;
+without a prompt it has context C. Following contexts increment by one. Each step attends over
+its cached context plus its new input token. Prompt processing is recorded separately in
+`prompt_step_ns`.
+
+ITL is the difference between consecutive **host token completion events**, reusing the
+existing clock readings. It includes orchestration between steps, unlike `step_ns`. Without a
+prompt, the first decode produces the first output and has no predecessor: its ITL is `null`.
+With a prompt, the first decode ITL starts at the prompt output's completion. In forward scope
+all ITLs and TPOT are `null`, because host generation is outside that measurement boundary.
+With one output token, there are no intervals and TPOT is `null`.
+
+For example, outputs available at 100, 250 and 500 ms have ITLs of 150 and 250 ms and TPOT of
+200 ms. TPOT is per sequence and is not divided by batch size. A synchronous batch has one
+completion event per step; latency sample counts are not multiplied by its number of sequences.
+
+`metrics.decode_by_position` groups samples by **both** position and context. Each entry has
+`position`, `context_tokens`, a `step_ns` summary and an optional `inter_token_ns` summary. For
+ten repetitions, each position normally has ten samples, not ten times the decode length.
+Prefer these summaries for context-dependent comparisons. Global decode/ITL percentiles mix
+contexts and do not make successive steps statistically independent. `metrics.tpot_ns` has
+one sample per measured run with at least two outputs, rather than one sample per interval.
 
 ### Comparing engines
 
@@ -138,8 +167,8 @@ commands. Matching metric names alone do not establish equal measurement boundar
 | [llama.cpp `llama-bench`](https://github.com/ggml-org/llama.cpp/blob/master/tools/llama-bench/README.md) | Prompt/decode or combined processed-token throughput, run latencies, dispersion. | `llama-bench` excludes sampling; Foundry host steps include it. Use forward scope for comparison; verify the remaining input-preparation and synchronization boundaries. |
 | [MLX-LM benchmark](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/benchmark.py) | Prompt throughput, generation throughput, peak memory. | Check the first-token numerator, final forward, synchronization and memory allocator scope in the pinned version. |
 | [Candle Llama example](https://github.com/huggingface/candle/blob/main/candle-examples/examples/llama/main.rs) | Generation throughput and output counts. | Check whether prefill/first output and decoding or printing are included. |
-| [vLLM benchmarks](https://github.com/vllm-project/vllm/tree/main/vllm/benchmarks) | Local latency and input/output throughput; first-token latency, with TPOT and ITL in the next step. | Use a local benchmark for local inference comparisons. Client/server measurements include additional work. |
-| [SGLang benchmarks](https://docs.sglang.ai/developer_guide/bench_serving) | Latency and input/output throughput; first-token latency, with TPOT and ITL in the next step. | Separate engine execution from streaming-client latency and concurrent serving throughput. |
+| [vLLM benchmarks](https://github.com/vllm-project/vllm/tree/main/vllm/benchmarks) | Local latency and input/output throughput; first-token latency, TPOT and ITL. | Use a local benchmark for local inference comparisons. Client/server measurements include additional work. |
+| [SGLang benchmarks](https://docs.sglang.ai/developer_guide/bench_serving) | Latency and input/output throughput; first-token latency, TPOT and ITL. | Separate engine execution from streaming-client latency and concurrent serving throughput. |
 
 Loading/compilation time, GPU-only time, process RSS and serving metrics are not currently
 instrumented in this report. No value is inferred for an unmeasured quantity. For external

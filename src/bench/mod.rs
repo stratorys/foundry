@@ -24,8 +24,11 @@ pub use self::metadata::{
     Metadata,
     git_commit,
 };
-pub use self::metrics::Metrics;
 use self::metrics::sum_ns;
+pub use self::metrics::{
+    DecodePositionMetrics,
+    Metrics,
+};
 use self::rng::SplitMix64;
 pub use self::stats::Summary;
 use self::stats::u64_to_f64;
@@ -71,12 +74,22 @@ impl BenchConfig {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct RunSamples {
     pub prompt_step_ns: Option<u64>,
-    pub decode_ns: Vec<u64>,
+    pub decode: Vec<DecodeSample>,
     pub first_token_ns: Option<u64>,
     pub generation_ns: Option<u64>,
     pub token_ids: Vec<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
+}
+
+/// One single-token forward; context is the cache length before processing its
+/// input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DecodeSample {
+    pub position: usize,
+    pub context_tokens: usize,
+    pub step_ns: u64,
+    pub inter_token_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -106,10 +119,14 @@ struct Inputs {
 }
 
 impl RunSamples {
+    pub fn decode_ns(&self) -> impl Iterator<Item = u64> + '_ {
+        self.decode.iter().map(|sample| sample.step_ns)
+    }
+
     pub fn step_sum_ns(&self) -> u64 {
         self.prompt_step_ns
             .unwrap_or(0)
-            .saturating_add(sum_ns(&self.decode_ns))
+            .saturating_add(sum_ns(self.decode_ns()))
     }
 }
 
@@ -147,8 +164,8 @@ pub fn bench<D: Device, M: CausalLm<D>>(
                 run = run_number,
                 runs = config.run_count.get(),
                 prefill_ms = ?measured_run.prompt_step_ns.map(ns_to_ms),
-                decode_steps = measured_run.decode_ns.len(),
-                decode_ms_total = ns_to_ms(sum_ns(&measured_run.decode_ns)),
+                decode_steps = measured_run.decode.len(),
+                decode_ms_total = ns_to_ms(sum_ns(measured_run.decode_ns())),
             );
             Ok(measured_run)
         })
@@ -226,7 +243,7 @@ fn run<D: Device, M: CausalLm<D>>(
     let mut past_seen_tokens = inputs.depth_ids.first().map_or(0, Vec::len);
     let mut samples = RunSamples {
         token_ids: vec![Vec::with_capacity(inputs.new_token_count); inputs.batch_size.get()],
-        decode_ns: Vec::with_capacity(inputs.new_token_count),
+        decode: Vec::with_capacity(inputs.new_token_count),
         ..RunSamples::default()
     };
     device.synchronize().map_err(|error| {
@@ -253,15 +270,27 @@ fn run<D: Device, M: CausalLm<D>>(
             inputs.timing_scope,
             inputs.new_token_count > 0,
         )?;
-        if inputs.new_token_count > 0 && inputs.timing_scope == TimingScope::Generation {
-            let elapsed = duration_ns(step.completed_at.duration_since(start))?;
-            samples.first_token_ns.get_or_insert(elapsed);
-            samples.generation_ns = Some(elapsed);
-        }
+        let inter_token_ns =
+            if inputs.new_token_count > 0 && inputs.timing_scope == TimingScope::Generation {
+                let elapsed = duration_ns(step.completed_at.duration_since(start))?;
+                let interval = samples
+                    .generation_ns
+                    .map(|previous| elapsed.saturating_sub(previous));
+                samples.first_token_ns.get_or_insert(elapsed);
+                samples.generation_ns = Some(elapsed);
+                interval
+            } else {
+                None
+            };
         if is_prompt {
             samples.prompt_step_ns = Some(step.ns);
         } else {
-            samples.decode_ns.push(step.ns);
+            samples.decode.push(DecodeSample {
+                position: samples.decode.len(),
+                context_tokens: past_seen_tokens,
+                step_ns: step.ns,
+                inter_token_ns,
+            });
         }
         samples
             .token_ids
@@ -606,9 +635,17 @@ mod tests {
                         "exact greedy output per sequence"
                     );
                     assert_eq!(
-                        run.decode_ns.len(),
+                        run.decode.len(),
                         output.saturating_sub(1),
                         "prefill produces the first token"
+                    );
+                    assert!(
+                        run.decode
+                            .iter()
+                            .enumerate()
+                            .all(|(i, s)| s.position == i
+                                && s.context_tokens == i.saturating_add(11)),
+                        "context before each one-token input"
                     );
                     assert_eq!(
                         device.forwards.get(..2),
@@ -630,6 +667,28 @@ mod tests {
                             run.first_token_ns, run.generation_ns,
                             "same completion event"
                         );
+                        assert_eq!(
+                            (report.metrics.inter_token_ns, report.metrics.tpot_ns),
+                            (None, None),
+                            "one output has no interval"
+                        );
+                    }
+                    let intervals = run
+                        .decode
+                        .iter()
+                        .filter_map(|s| s.inter_token_ns)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        intervals.len(),
+                        if host { output.saturating_sub(1) } else { 0 },
+                        "forward pass does not invent host intervals"
+                    );
+                    if let (Some(first), Some(last)) = (run.first_token_ns, run.generation_ns) {
+                        assert_eq!(
+                            intervals.iter().sum::<u64>(),
+                            last.saturating_sub(first),
+                            "intervals reconstruct the host timeline"
+                        );
                     }
                     if let Some(ns) = run.generation_ns {
                         assert!(ns >= run.step_sum_ns(), "wall time includes setup");
@@ -642,9 +701,12 @@ mod tests {
     #[test]
     fn prefill_only_produces_no_tokens_and_decode_only_counts_every_step() {
         for scope in [TimingScope::Generation, TimingScope::Forward] {
-            for (prompt, output) in [(4, 0), (0, 128)] {
+            for (prompt, output) in [(4, 0), (0, 1), (0, 128)] {
                 let mut device = RecordingDevice::default();
-                let config = measured_config(prompt, output, scope);
+                let config = BenchConfig {
+                    depth_token_count: if prompt == 0 { 7 } else { 0 },
+                    ..measured_config(prompt, output, scope)
+                };
                 let report =
                     bench(&mut device, &TestModel, NonZeroU32::MIN, &config).expect("benchmark");
                 let run = report.runs.first().expect("one run");
@@ -655,7 +717,19 @@ mod tests {
                     prompt > 0,
                     "prompt measurement only with prompt"
                 );
-                assert_eq!(run.decode_ns.len(), output, "all decode-only steps counted");
+                assert_eq!(run.decode.len(), output, "all decode-only steps counted");
+                assert!(
+                    run.decode
+                        .iter()
+                        .enumerate()
+                        .all(|(i, s)| s.position == i && s.context_tokens == i.saturating_add(7)),
+                    "decode-only starts at the initial cache depth"
+                );
+                assert_eq!(
+                    run.decode.first().and_then(|s| s.inter_token_ns),
+                    None,
+                    "first decode-only token has no predecessor"
+                );
                 if output == 0 {
                     assert_eq!(
                         (run.first_token_ns, run.generation_ns),
