@@ -109,8 +109,9 @@ Custom prompts replace the default prompts. For a smaller model, use
 | `last_logits.safetensors` | Last prompt token's logits, used for first-step metrics. |
 | `activations.safetensors` | Embedding and layer-0 module inputs and outputs; transformers only. |
 
-Evaluation requires activations from at least one reference. A checked module passes when at
-least 99.9% of its elements are within tolerance, with no NaN or Inf. Generation passes when
+Evaluation requires activations from at least one reference. An activations file must hold at
+least one module, and each module must match a Foundry submodule. A checked module passes when
+at least 99.9% of its elements are within tolerance, with no NaN or Inf. Generation passes when
 token IDs match or, at the first difference, each token is in the other engine's top-k.
 First-step metrics and the transformers/MLX comparison are informational. Any module or
 generation failure makes `foundry eval` exit with an error.

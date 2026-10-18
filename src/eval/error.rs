@@ -33,6 +33,12 @@ pub enum EvalError {
     #[error("Activation has no matching input or output.")]
     UnpairedActivation,
 
+    #[error("Reference activations hold no tensor.")]
+    ActivationsEmpty,
+
+    #[error("Activation has no matching submodule.")]
+    ModuleMissing,
+
     #[error("Creating a submodule input tensor failed.")]
     Input,
 

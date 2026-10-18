@@ -108,7 +108,6 @@ pub enum LayerOutcome {
         expected_dims: Vec<usize>,
         actual_dims: Vec<usize>,
     },
-    Skipped,
 }
 
 impl LayerOutcome {
@@ -216,23 +215,45 @@ pub fn eval_layers<D: Device, S: AsRef<[u8]>>(
     module_atol: fn(&str) -> f32,
     weights: &Weights<S>,
 ) -> Result<Vec<LayerReport>, EvalError> {
-    activations(weights)?
-        .iter()
-        .map(|activation| eval_layer(device, modules, module_atol, activation))
+    match_modules(activations(weights)?, modules)?
+        .into_iter()
+        .map(|(activation, module)| eval_layer(device, *module, module_atol, activation))
+        .collect()
+}
+
+fn match_modules<'weights, 'modules, M>(
+    activations: Vec<Activation<'weights>>,
+    modules: &'modules [(String, M)],
+) -> Result<Vec<(Activation<'weights>, &'modules M)>, EvalError> {
+    if activations.is_empty() {
+        error!(message = "Reference activations hold no tensor.");
+        return Err(EvalError::ActivationsEmpty);
+    }
+    activations
+        .into_iter()
+        .map(|activation| {
+            let name = activation.name;
+            let Some((_, module)) = modules.iter().find(|(module_name, _)| module_name == name)
+            else {
+                error!(message = "Activation has no matching submodule.", name);
+                return Err(EvalError::ModuleMissing);
+            };
+            Ok((activation, module))
+        })
         .collect()
 }
 
 fn eval_layer<D: Device>(
     device: &mut D,
-    modules: &[(String, &dyn Module<D>)],
+    module: &dyn Module<D>,
     module_atol: fn(&str) -> f32,
-    activation: &Activation<'_>,
+    activation: Activation<'_>,
 ) -> Result<LayerReport, EvalError> {
     let Activation {
         name,
         input,
         output: expected,
-    } = *activation;
+    } = activation;
     let tolerance = Tolerance {
         atol: module_atol(name),
         rtol: RTOL,
@@ -241,9 +262,6 @@ fn eval_layer<D: Device>(
         name: name.to_owned(),
         tolerance,
         outcome,
-    };
-    let Some((_, module)) = modules.iter().find(|(module_name, _)| module_name == name) else {
-        return Ok(report(LayerOutcome::Skipped));
     };
     let input =
         Tensor::from_bytes(device, input.bytes, input.dtype, input.shape).map_err(|error| {
@@ -398,7 +416,9 @@ mod tests {
     use serde_json::json;
 
     use crate::eval::{
+        Activation,
         CloseReport,
+        EvalError,
         FirstStepReport,
         GenerationReport,
         LayerOutcome,
@@ -406,7 +426,13 @@ mod tests {
         PromptReport,
         ReferenceReport,
         Tolerance,
+        match_modules,
     };
+    use crate::nn::{
+        DType,
+        Shape,
+    };
+    use crate::weights::WeightView;
 
     #[test]
     fn is_failure_holds_for_a_close_prompt_with_non_finite_logits() {
@@ -457,11 +483,48 @@ mod tests {
                     expected_dims: vec![1],
                     actual_dims: vec![1],
                 },
-                LayerOutcome::Skipped,
             ]
             .map(|outcome| outcome.is_failure()),
-            [false, true, true, false],
-            "passed, failed, mismatched, skipped"
+            [false, true, true],
+            "passed, failed, mismatched"
+        );
+    }
+
+    #[test]
+    fn match_modules_rejects_empty_activations_and_unknown_names() {
+        let view = WeightView {
+            name: "model.norm.input",
+            dtype: DType::F32,
+            shape: Shape::try_from([1].as_slice()).expect("the shape is valid"),
+            bytes: &[0; 4],
+        };
+        let activation = |name| Activation {
+            name,
+            input: view,
+            output: view,
+        };
+        let modules = [
+            ("model.norm".to_owned(), 1_u8),
+            ("model.mlp".to_owned(), 2_u8),
+        ];
+        assert_eq!(
+            [
+                match_modules(Vec::new(), &modules),
+                match_modules(vec![activation("model.embed_tokens")], &modules),
+                match_modules(
+                    vec![activation("model.mlp"), activation("model.norm")],
+                    &modules
+                ),
+            ],
+            [
+                Err(EvalError::ActivationsEmpty),
+                Err(EvalError::ModuleMissing),
+                Ok(vec![
+                    (activation("model.mlp"), &2),
+                    (activation("model.norm"), &1),
+                ]),
+            ],
+            "no activation, an unknown name, then two known names in activation order"
         );
     }
 
@@ -485,7 +548,13 @@ mod tests {
                     max_abs_error: 0.5,
                 })))
                 .ok(),
-                serde_json::to_value(report(LayerOutcome::Skipped)).ok(),
+                serde_json::to_value(report(LayerOutcome::Mismatch {
+                    expected_dtype: "BF16".to_owned(),
+                    actual_dtype: "F32".to_owned(),
+                    expected_dims: vec![2],
+                    actual_dims: vec![1, 2],
+                }))
+                .ok(),
             ],
             [
                 Some(json!({
@@ -503,10 +572,14 @@ mod tests {
                     "name": "model.norm",
                     "atol": 0.5,
                     "rtol": 0.25,
-                    "status": "skipped",
+                    "status": "mismatch",
+                    "expected_dtype": "BF16",
+                    "actual_dtype": "F32",
+                    "expected_dims": [2],
+                    "actual_dims": [1, 2],
                 })),
             ],
-            "a compared layer and a skipped layer"
+            "a compared layer and a mismatched layer"
         );
     }
 }
