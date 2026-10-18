@@ -80,6 +80,7 @@ pub fn run<D: Device>(
     max_new_tokens: usize,
 ) -> Result<(), CliError> {
     let (config, weights) = open_snapshot(model)?;
+    check_token_ids(prompt_ids, vocab_size(&config)?)?;
     let mut device = open_device()?;
     let max_cache_len = prompt_ids
         .len()
@@ -128,16 +129,7 @@ pub fn bench_command<D: Device>(
     let git_commit = read_git_commit();
     let (config, weights) = open_snapshot(&args.model)?;
     let metadata = metadata(&args.model, &weights, test_time, git_commit)?;
-    let vocab_size = u32::try_from(config.vocab_size())
-        .ok()
-        .and_then(NonZeroU32::new)
-        .ok_or_else(|| {
-            error!(
-                message = "Vocabulary size is zero or does not fit in u32.",
-                vocab_size = config.vocab_size()
-            );
-            CliError::VocabSize
-        })?;
+    let vocab_size = vocab_size(&config)?;
     let bench_config = BenchConfig {
         prompt_token_count: args.prompt_tokens,
         gen_token_count: args.gen_tokens,
@@ -232,6 +224,11 @@ pub fn eval_command<D: Device>(
         CliError::Eval
     })?;
     let (config, weights) = open_snapshot(&args.model)?;
+    let vocab_size = vocab_size(&config)?;
+    references
+        .iter()
+        .flat_map(|reference| &reference.generation.prompts)
+        .try_for_each(|prompt| check_token_ids(&prompt.prompt_ids, vocab_size))?;
     let metadata = metadata(&args.model, &weights, test_time, git_commit)?;
     let mut device = open_device()?;
     let device_name = device.device_name();
@@ -322,6 +319,37 @@ fn open_snapshot(model: &ModelId) -> Result<(LlamaConfig, Weights), CliError> {
         CliError::Weights
     })?;
     Ok((config, weights))
+}
+
+fn vocab_size(config: &LlamaConfig) -> Result<NonZeroU32, CliError> {
+    u32::try_from(config.vocab_size())
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            error!(
+                message = "Vocabulary size is zero or does not fit in u32.",
+                vocab_size = config.vocab_size()
+            );
+            CliError::VocabSize
+        })
+}
+
+fn check_token_ids(
+    token_ids: &[u32],
+    vocab_size: NonZeroU32,
+) -> Result<(), CliError> {
+    let Some(&token_id) = token_ids
+        .iter()
+        .find(|&&token_id| token_id >= vocab_size.get())
+    else {
+        return Ok(());
+    };
+    error!(
+        message = "Token id is outside the vocabulary.",
+        token_id,
+        vocab_size = vocab_size.get()
+    );
+    Err(CliError::TokenIdOutOfVocab)
 }
 
 fn load_llama<D: Device>(
@@ -447,7 +475,31 @@ fn write_token_ids(
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::command::write_token_ids;
+    use std::num::NonZeroU32;
+
+    use crate::cli::command::{
+        check_token_ids,
+        write_token_ids,
+    };
+    use crate::cli::error::CliError;
+
+    #[test]
+    fn check_token_ids_rejects_ids_outside_the_vocabulary() {
+        let vocab_size = NonZeroU32::new(8).expect("8 is not zero");
+        assert_eq!(
+            [
+                check_token_ids(&[0, 7], vocab_size),
+                check_token_ids(&[0, 8], vocab_size),
+                check_token_ids(&[u32::MAX], vocab_size),
+            ],
+            [
+                Ok(()),
+                Err(CliError::TokenIdOutOfVocab),
+                Err(CliError::TokenIdOutOfVocab),
+            ],
+            "the first and last ids, the vocabulary size, then u32::MAX"
+        );
+    }
 
     #[test]
     fn write_token_ids_prints_a_json_array() {

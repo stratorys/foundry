@@ -39,6 +39,9 @@ pub enum CliError {
     #[error("Vocabulary size is zero or does not fit in u32.")]
     VocabSize,
 
+    #[error("Token id is outside the vocabulary.")]
+    TokenIdOutOfVocab,
+
     #[error("Benchmark failed.")]
     Bench,
 
