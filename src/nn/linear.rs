@@ -25,19 +25,13 @@ impl<D: Device> Module<D> for Linear<D> {
         x: &Tensor<D>,
     ) -> Result<Tensor<D>, TensorError> {
         let weight_t = self.weight.permute(&[1, 0])?;
-        let dims = x.shape().dims();
-        let in_features = x.shape().size(x.shape().last_dim()?)?;
-        let rows = x.shape().numel().checked_div(in_features).unwrap_or(0);
-        let out_features = weight_t.shape().size(1)?;
-        let output_dims = dims
-            .iter()
-            .take(dims.len().saturating_sub(1))
-            .copied()
-            .chain([out_features])
-            .collect::<Vec<usize>>();
+        let last_dim = x.shape().last_dim()?;
+        let in_features = x.shape().size(last_dim)?;
+        let rows = x.shape().dims().iter().take(last_dim).product();
+        let output_shape = x.shape().with_dim(last_dim, weight_t.shape().size(1)?)?;
         x.reshape(Shape::try_from([rows, in_features])?)?
             .matmul(device, &weight_t)?
-            .reshape(Shape::try_from(output_dims.as_slice())?)
+            .reshape(output_shape)
     }
 }
 
