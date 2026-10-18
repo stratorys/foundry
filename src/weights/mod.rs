@@ -785,20 +785,17 @@ mod tests {
 
     #[test]
     fn unknown_dtype_is_rejected() {
-        [("I64", 1), ("F16", 4)]
+        [(Dtype::I64, 1), (Dtype::F16, 4)]
             .into_iter()
             .for_each(|(dtype, size)| {
-                let header = serde_json::to_vec(
-                    &json!({ "a": { "dtype": dtype, "shape": [size], "data_offsets": [0, 8] } }),
+                let file = serialize(
+                    [(
+                        "a",
+                        TensorView::new(dtype, vec![size], &[0; 8]).expect("the view is valid"),
+                    )],
+                    None,
                 )
-                .expect("the header serializes");
-                let file: Vec<u8> = u64::try_from(header.len())
-                    .expect("the header length fits in u64")
-                    .to_le_bytes()
-                    .into_iter()
-                    .chain(header)
-                    .chain(0..8)
-                    .collect();
+                .expect("the file serializes");
                 assert_eq!(
                     Weights::from_shards(
                         None,
@@ -841,17 +838,15 @@ mod tests {
 
     #[test]
     fn invalid_tensor_shape_is_rejected() {
-        let header = serde_json::to_vec(
-            &json!({ "a": { "dtype": "F32", "shape": [1, 1, 1, 1, 1], "data_offsets": [0, 4] } }),
+        let file = serialize(
+            [(
+                "a",
+                TensorView::new(Dtype::F32, vec![1, 1, 1, 1, 1], &[0; 4])
+                    .expect("the view is valid"),
+            )],
+            None,
         )
-        .expect("the header serializes");
-        let file: Vec<u8> = u64::try_from(header.len())
-            .expect("the header length fits in u64")
-            .to_le_bytes()
-            .into_iter()
-            .chain(header)
-            .chain(0..4)
-            .collect();
+        .expect("the file serializes");
         assert_eq!(
             Weights::from_shards(
                 None,
