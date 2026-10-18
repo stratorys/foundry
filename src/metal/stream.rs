@@ -1,10 +1,7 @@
 use std::collections::VecDeque;
 
 use objc2::rc::Retained;
-use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLBlitCommandEncoder,
-    MTLBuffer,
     MTLCommandBuffer,
     MTLCommandBufferStatus,
     MTLCommandEncoder,
@@ -14,7 +11,6 @@ use objc2_metal::{
 use tracing::error;
 
 use crate::metal::{
-    Buffer,
     CommandBuffer,
     ComputeEncoder,
     MetalError,
@@ -60,22 +56,6 @@ impl CommandStream {
         let encoder = self.open_buffer()?.compute_encoder()?;
         encoder.setComputePipelineState(pipeline);
         bind(encoder);
-        self.count_dispatch()
-    }
-
-    pub fn fill_zero(
-        &mut self,
-        buffer: &Buffer,
-    ) -> Result<(), MetalError> {
-        self.check_failure()?;
-        let open = self.open_buffer()?;
-        open.end_compute();
-        let encoder = open
-            .command_buffer
-            .blitCommandEncoder()
-            .ok_or(MetalError::BlitEncoderCreation)?;
-        encoder.fillBuffer_range_value(buffer, NSRange::new(0, buffer.length()), 0);
-        encoder.endEncoding();
         self.count_dispatch()
     }
 
@@ -130,11 +110,12 @@ impl CommandStream {
         if let Some(mut open) = self.open.take() {
             self.in_flight.push_back(open.commit());
         }
-        while self
-            .in_flight
-            .front()
-            .is_some_and(|command_buffer| is_finished(command_buffer.status()))
-            || self.in_flight.len() > MAX_IN_FLIGHT
+        while self.in_flight.front().is_some_and(|command_buffer| {
+            matches!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            )
+        }) || self.in_flight.len() > MAX_IN_FLIGHT
         {
             if let Some(command_buffer) = self.in_flight.pop_front() {
                 self.retire(&command_buffer)?;
@@ -195,11 +176,4 @@ impl OpenBuffer {
 
 impl Drop for OpenBuffer {
     fn drop(&mut self) { self.end_compute(); }
-}
-
-fn is_finished(status: MTLCommandBufferStatus) -> bool {
-    matches!(
-        status,
-        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
-    )
 }

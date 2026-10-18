@@ -26,9 +26,6 @@ pub enum MetalError {
     #[error("Metal command buffer creation failed.")]
     CommandBufferCreation,
 
-    #[error("Metal blit command encoder creation failed.")]
-    BlitEncoderCreation,
-
     #[error("Metal compute command encoder creation failed.")]
     ComputeEncoderCreation,
 

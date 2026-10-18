@@ -239,7 +239,13 @@ impl MetalDevice {
         let threads_max = pipeline.maxTotalThreadsPerThreadgroup();
         let threads_required = grid.threads_required();
         if threads_max < threads_required {
-            return Err(threadgroup_too_small(kernel, threads_max, threads_required));
+            error!(
+                message = "Kernel allows too few threads per threadgroup.",
+                name = %kernel.name(),
+                threads = threads_max,
+                threads_required,
+            );
+            return Err(MetalError::ThreadgroupTooSmall);
         }
         let group = grid.group(threads_max);
         self.stream.compute(&pipeline, |encoder| {
@@ -538,9 +544,9 @@ impl Device for MetalDevice {
         &mut self,
         nbytes: usize,
     ) -> Result<MetalStorage, MetalError> {
-        let storage = self.allocate(nbytes)?;
-        self.stream.fill_zero(&storage.buffer)?;
-        Ok(storage)
+        // Metal clears every new buffer to zero, and `allocate` never reuses
+        // one.
+        self.allocate(nbytes)
     }
 
     fn storage_to_bytes(
@@ -676,20 +682,6 @@ impl Device for MetalDevice {
             target.storage_mut(),
         )
     }
-}
-
-fn threadgroup_too_small(
-    kernel: Kernel,
-    threads: usize,
-    threads_required: usize,
-) -> MetalError {
-    error!(
-        message = "Kernel allows too few threads per threadgroup.",
-        name = %kernel.name(),
-        threads,
-        threads_required,
-    );
-    MetalError::ThreadgroupTooSmall
 }
 
 fn allocated_bytes(device: &MtlDevice) -> Result<u64, MetalError> {
