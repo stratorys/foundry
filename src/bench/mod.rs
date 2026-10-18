@@ -102,8 +102,12 @@ pub struct Report {
     pub warmup_run_count: u32,
     pub runs: Vec<RunSamples>,
     pub metrics: Metrics,
+    // Maximum of measured run peaks, excluding loading and warmup peaks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
+    // Peak since device creation, including loading and warmup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_peak_memory_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_source: Option<&'static str>,
 }
@@ -171,7 +175,8 @@ pub fn bench<D: Device, M: CausalLm<D>>(
         })
         .collect::<Result<Vec<RunSamples>, BenchError>>()?;
     let metrics = Metrics::from_runs(&runs, config)?;
-    let peak_memory = device.max_memory_allocated();
+    let peak_memory_bytes = runs.iter().filter_map(|run| run.peak_memory_bytes).max();
+    let session_peak_memory = device.max_memory_allocated();
     Ok(Report {
         config: *config,
         depth_ids: inputs.depth_ids,
@@ -180,8 +185,9 @@ pub fn bench<D: Device, M: CausalLm<D>>(
         warmup_run_count,
         runs,
         metrics,
-        peak_memory_bytes: peak_memory.map(|peak_memory| peak_memory.bytes),
-        peak_memory_source: peak_memory.map(|peak_memory| peak_memory.source),
+        peak_memory_bytes,
+        session_peak_memory_bytes: session_peak_memory.map(|peak| peak.bytes),
+        peak_memory_source: session_peak_memory.map(|peak| peak.source),
     })
 }
 
@@ -250,6 +256,10 @@ fn run<D: Device, M: CausalLm<D>>(
         error!(message = "Synchronizing before the benchmark failed.", %error);
         BenchError::Step
     })?;
+    device.reset_run_memory_peak().map_err(|error| {
+        error!(message = "Resetting the run memory peak failed.", %error);
+        BenchError::MemoryPeakReset
+    })?;
     let start = Instant::now();
     let mut decoder = Decoder::new(device, model, inputs.batch_size).map_err(|error| {
         error!(message = "Creating the decoder failed.", %error);
@@ -300,7 +310,8 @@ fn run<D: Device, M: CausalLm<D>>(
         tokens = step.tokens;
         past_seen_tokens = advance(past_seen_tokens, if is_prompt { prompt_len } else { 1 })?;
     }
-    samples.peak_memory_bytes = device.max_memory_allocated().map(|peak| peak.bytes);
+    drop(decoder);
+    samples.peak_memory_bytes = device.run_memory_peak().map(|peak| peak.bytes);
     Ok(samples)
 }
 
@@ -362,6 +373,7 @@ fn advance(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::num::{
         NonZeroU32,
         NonZeroUsize,
@@ -502,13 +514,36 @@ mod tests {
         selected_at: Option<std::time::Instant>,
         read_at: Option<std::time::Instant>,
         fail_on_sync: Option<usize>,
+        fail_on_memory_reset: bool,
+        memory_peaks: VecDeque<u64>,
+        run_memory_peak: Option<u64>,
+        session_memory_peak: Option<u64>,
     }
 
     impl Device for RecordingDevice {
         type Storage = Vec<u8>;
         type Error = std::io::Error;
         fn device_name(&self) -> String { "recording".to_owned() }
-        fn max_memory_allocated(&self) -> Option<AllocatedMemory> { None }
+        fn max_memory_allocated(&self) -> Option<AllocatedMemory> {
+            self.session_memory_peak.map(|bytes| AllocatedMemory {
+                bytes,
+                source: "test",
+            })
+        }
+        fn reset_run_memory_peak(&mut self) -> Result<(), Self::Error> {
+            self.events.push("memory_reset");
+            if self.fail_on_memory_reset {
+                return Err(std::io::Error::other("memory reset failed"));
+            }
+            self.run_memory_peak = None;
+            Ok(())
+        }
+        fn run_memory_peak(&self) -> Option<AllocatedMemory> {
+            self.run_memory_peak.map(|bytes| AllocatedMemory {
+                bytes,
+                source: "test",
+            })
+        }
         fn synchronize(&mut self) -> Result<(), Self::Error> {
             self.events.push("ready");
             self.sync_count = self.sync_count.saturating_add(1);
@@ -528,6 +563,8 @@ mod tests {
             nbytes: usize,
         ) -> Result<Vec<u8>, Self::Error> {
             self.events.push("cache");
+            self.run_memory_peak = self.memory_peaks.pop_front();
+            self.session_memory_peak = self.session_memory_peak.max(self.run_memory_peak);
             Ok(vec![0; nbytes])
         }
         fn storage_to_bytes(
@@ -633,6 +670,16 @@ mod tests {
                         run.token_ids,
                         vec![vec![1; output]; batch],
                         "exact greedy output per sequence"
+                    );
+                    assert_eq!(
+                        (
+                            run.peak_memory_bytes,
+                            report.peak_memory_bytes,
+                            report.session_peak_memory_bytes,
+                            report.peak_memory_source,
+                        ),
+                        (None, None, None, None),
+                        "unavailable memory tracking stays absent"
                     );
                     assert_eq!(
                         run.decode.len(),
@@ -750,12 +797,28 @@ mod tests {
         for (scope, expected) in [
             (
                 TimingScope::Generation,
-                vec!["ready", "cache", "forward", "select", "ready", "read"],
+                vec![
+                    "ready",
+                    "memory_reset",
+                    "cache",
+                    "forward",
+                    "select",
+                    "ready",
+                    "read",
+                ],
             ),
             (
                 TimingScope::Forward,
                 vec![
-                    "ready", "cache", "ready", "forward", "ready", "select", "ready", "read",
+                    "ready",
+                    "memory_reset",
+                    "cache",
+                    "ready",
+                    "forward",
+                    "ready",
+                    "select",
+                    "ready",
+                    "read",
                 ],
             ),
         ] {
@@ -810,5 +873,81 @@ mod tests {
                 "sync failure {failure} propagates"
             );
         }
+    }
+
+    #[test]
+    fn measured_memory_peaks_exclude_loading_warmup_and_previous_runs() {
+        for scope in [TimingScope::Generation, TimingScope::Forward] {
+            for loading_peak in [0, 10_000] {
+                let mut device = RecordingDevice {
+                    memory_peaks: [8_000, 6_000, 3_000, 2_000, 2_500].into(),
+                    session_memory_peak: Some(loading_peak),
+                    ..RecordingDevice::default()
+                };
+                let config = BenchConfig {
+                    warmup_run_count: 2,
+                    run_count: NonZeroU32::MIN.saturating_add(2),
+                    ..measured_config(4, 3, scope)
+                };
+                let report = bench(&mut device, &TestModel, NonZeroU32::MIN, &config)
+                    .expect("benchmark with scripted memory");
+                assert_eq!(
+                    report
+                        .runs
+                        .iter()
+                        .map(|run| run.peak_memory_bytes)
+                        .collect::<Vec<_>>(),
+                    [Some(3_000), Some(2_000), Some(2_500)],
+                    "each measured peak excludes prior runs and warmup"
+                );
+                assert_eq!(report.peak_memory_bytes, Some(3_000), "max measured peak");
+                assert_eq!(
+                    report.session_peak_memory_bytes,
+                    Some(loading_peak.max(8_000)),
+                    "session retains both loading and warmup peaks"
+                );
+                assert_eq!(report.peak_memory_source, Some("test"), "source retained");
+                assert_eq!(report.warmup_run_count, 2, "both warmups executed");
+                assert!(device.memory_peaks.is_empty(), "all five peaks consumed");
+                assert_eq!(
+                    device
+                        .events
+                        .windows(3)
+                        .filter(|events| *events == ["ready", "memory_reset", "cache"])
+                        .count(),
+                    5,
+                    "every run resets after synchronization and before cache creation"
+                );
+                assert!(
+                    report.runs.iter().all(|run| run.token_ids == [vec![1; 3]]),
+                    "memory tracking preserves generated tokens in both scopes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memory_reset_failure_does_not_produce_a_report() {
+        let mut device = RecordingDevice {
+            fail_on_memory_reset: true,
+            ..RecordingDevice::default()
+        };
+        assert!(
+            matches!(
+                bench(
+                    &mut device,
+                    &TestModel,
+                    NonZeroU32::MIN,
+                    &measured_config(4, 1, TimingScope::Generation)
+                ),
+                Err(BenchError::MemoryPeakReset)
+            ),
+            "memory reset failure propagates"
+        );
+        assert_eq!(
+            device.events,
+            ["ready", "memory_reset"],
+            "no decoder or token after failure"
+        );
     }
 }

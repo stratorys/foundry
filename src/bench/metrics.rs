@@ -506,6 +506,7 @@ mod tests {
             metrics,
             peak_memory_bytes: Some(2_000_000_000),
             peak_memory_source: Some("test"),
+            session_peak_memory_bytes: Some(3_000_000_000),
         };
         let json = serde_json::to_value(report).expect("serializable report");
         assert!(json.get("stats").is_none(), "statistics live in metrics");

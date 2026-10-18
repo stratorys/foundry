@@ -12,6 +12,9 @@ pub enum BenchError {
     #[error("Benchmark step failed.")]
     Step,
 
+    #[error("Resetting the run memory peak failed.")]
+    MemoryPeakReset,
+
     #[error("Batch size does not fit in usize.")]
     BatchSizeOverflow,
 

@@ -124,9 +124,25 @@ The KV capacity is depth + prompt + actual decode steps.
 
 All decode steps are retained. Depth is excluded from step-throughput numerators and step
 sums, but included in full-generation latencies. Batch size multiplies token counts, not
-elapsed durations. Nanoseconds are storage units, not accuracy guarantees. Memory fields still
-report a cumulative Metal high-water mark including warmup, not independent run peaks or
-process resident memory.
+elapsed durations. Nanoseconds are storage units, not accuracy guarantees.
+
+### Memory scope
+
+- `runs[].peak_memory_bytes`: peak observed for that run, reset after pending device work is
+  synchronized and before decoder/KV creation. Includes resident weights, KV cache and
+  temporaries, regardless of timing scope. Loading and previous warmup/run peaks are excluded;
+  allocations still resident at the start remain included.
+- `peak_memory_bytes`: maximum of the measured run peaks, excluding warmup runs.
+- `session_peak_memory_bytes`: cumulative peak since device creation, including model loading,
+  warmup and every measured run.
+- `peak_memory_source`: `metal_current_allocated_size` for both peak scopes. Memory fields are
+  omitted when tracking is unavailable.
+
+Metal samples `currentAllocatedSize` after buffer allocations and at run reset. Both counters
+subtract the same baseline taken at device creation; reset does not subtract resident weights.
+These are observed Metal allocation peaks, not process resident memory, separate measurements
+of weights/KV/temporaries, or an exact continuous hardware peak. No extra synchronization is
+inserted inside timed steps to measure memory.
 
 ### Decode samples and context
 

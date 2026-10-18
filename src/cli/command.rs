@@ -189,6 +189,7 @@ pub fn bench_command<D: Device>(
         decode_tokens_per_s = ?record.report.metrics.decode_tokens_per_s.map(|s| s.mean),
         output_tokens_per_s = ?record.report.metrics.output_tokens_per_s.map(|s| s.mean),
         peak_memory_bytes = ?record.report.peak_memory_bytes,
+        session_peak_memory_bytes = ?record.report.session_peak_memory_bytes,
         peak_memory_source = ?record.report.peak_memory_source,
         report = %report_path.display(),
     );

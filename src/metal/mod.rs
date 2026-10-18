@@ -94,6 +94,7 @@ pub struct MetalDevice {
     stream: CommandStream,
     allocated_bytes_baseline: u64,
     allocated_bytes_peak: u64,
+    allocated_bytes_run_peak: u64,
 }
 
 struct BufferView<'buffer> {
@@ -130,6 +131,7 @@ impl MetalDevice {
             stream: CommandStream::new(queue),
             allocated_bytes_baseline,
             allocated_bytes_peak: allocated_bytes_baseline,
+            allocated_bytes_run_peak: allocated_bytes_baseline,
         })
     }
 
@@ -156,9 +158,9 @@ impl MetalDevice {
                 error!(message = "Metal buffer allocation failed.", bytes = nbytes);
                 MetalError::BufferAllocation
             })?;
-        self.allocated_bytes_peak = self
-            .allocated_bytes_peak
-            .max(allocated_bytes(&self.device)?);
+        let allocated = allocated_bytes(&self.device)?;
+        self.allocated_bytes_peak = self.allocated_bytes_peak.max(allocated);
+        self.allocated_bytes_run_peak = self.allocated_bytes_run_peak.max(allocated);
         Ok(MetalStorage {
             buffer,
             nbytes,
@@ -499,6 +501,21 @@ impl Device for MetalDevice {
         })
     }
 
+    fn reset_run_memory_peak(&mut self) -> Result<(), MetalError> {
+        self.allocated_bytes_run_peak = allocated_bytes(&self.device)?;
+        self.allocated_bytes_peak = self.allocated_bytes_peak.max(self.allocated_bytes_run_peak);
+        Ok(())
+    }
+
+    fn run_memory_peak(&self) -> Option<AllocatedMemory> {
+        Some(AllocatedMemory {
+            bytes: self
+                .allocated_bytes_run_peak
+                .saturating_sub(self.allocated_bytes_baseline),
+            source: "metal_current_allocated_size",
+        })
+    }
+
     fn storage_from_bytes(
         &mut self,
         bytes: &[u8],
@@ -713,12 +730,24 @@ mod tests {
     }
 
     #[test]
-    fn max_memory_allocated_counts_from_bytes_and_never_decreases() {
+    fn memory_peaks_reset_per_run_and_preserve_resident_allocations() {
         let nbytes = 1 << 20;
         let mut device = MetalDevice::new().expect("a Metal device is available");
-        let storage = device
+        let resident = device
             .storage_from_bytes(&vec![0; nbytes])
             .expect("storage_from_bytes succeeds");
+        device.synchronize().expect("resident allocation ready");
+        device
+            .reset_run_memory_peak()
+            .expect("first reset succeeds");
+        let resident_peak = device.run_memory_peak().expect("run peak available");
+        assert!(
+            resident_peak.bytes >= u64::try_from(nbytes).expect("the length fits in u64"),
+            "reset includes resident allocation"
+        );
+        let storage = device
+            .storage_from_bytes(&vec![0; nbytes.saturating_mul(8)])
+            .expect("large allocation succeeds");
         let peak = device
             .max_memory_allocated()
             .expect("Metal tracks peak memory");
@@ -727,21 +756,51 @@ mod tests {
             "Metal reads the device allocated size"
         );
         assert!(
-            peak.bytes >= u64::try_from(nbytes).expect("the length fits in u64"),
-            "peak {} bytes covers the {nbytes} written bytes",
             peak.bytes
+                >= resident_peak.bytes.saturating_add(
+                    u64::try_from(nbytes.saturating_mul(8)).expect("small allocation")
+                ),
+            "session peak includes resident and large allocations"
+        );
+        assert_eq!(
+            device.run_memory_peak(),
+            Some(peak),
+            "first run reaches session peak"
         );
         drop(storage);
+        assert_eq!(
+            device.run_memory_peak(),
+            Some(peak),
+            "free does not reset run peak"
+        );
+        device.synchronize().expect("previous work completed");
+        device
+            .reset_run_memory_peak()
+            .expect("second reset succeeds");
+        assert_eq!(
+            device.run_memory_peak(),
+            Some(resident_peak),
+            "reset retains resident allocation only"
+        );
         device.zeros(16).expect("zeros succeeds");
+        device.synchronize().expect("small allocation ready");
+        let run_peak = device.run_memory_peak().expect("second run peak available");
+        assert!(
+            run_peak.bytes >= resident_peak.bytes,
+            "resident allocation remains included"
+        );
+        assert!(
+            run_peak.bytes < peak.bytes,
+            "second run excludes the old large allocation"
+        );
         let peak_after_free = device
             .max_memory_allocated()
             .expect("Metal tracks peak memory");
-        assert!(
-            peak_after_free.bytes >= peak.bytes,
-            "peak {} bytes does not fall below {} bytes after a free",
-            peak_after_free.bytes,
-            peak.bytes
+        assert_eq!(
+            peak_after_free, peak,
+            "session peak survives free and reset"
         );
+        drop(resident);
     }
 
     #[test]

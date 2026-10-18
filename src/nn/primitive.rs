@@ -72,7 +72,14 @@ pub trait Device {
 
     fn device_name(&self) -> String;
 
+    // Peak since device creation, including loading and warmup.
     fn max_memory_allocated(&self) -> Option<AllocatedMemory>;
+
+    // Synchronize before resetting; resident allocations remain included.
+    fn reset_run_memory_peak(&mut self) -> Result<(), Self::Error>;
+
+    // Peak since the last reset, or None when tracking is unavailable.
+    fn run_memory_peak(&self) -> Option<AllocatedMemory>;
 
     /// Waits for all queued device work to complete without reading a tensor.
     fn synchronize(&mut self) -> Result<(), Self::Error>;
