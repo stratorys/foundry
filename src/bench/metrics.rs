@@ -37,7 +37,7 @@ pub struct Metrics {
     pub decode_gpu_busy_ns: Option<Summary>,
     // Step wall time minus GPU busy time: encoding, allocation and waits.
     pub decode_gpu_idle_ns: Option<Summary>,
-    pub decode_kernel_gpu_ns: BTreeMap<&'static str, Summary>,
+    pub decode_kernel_gpu_ns: BTreeMap<String, Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -150,18 +150,16 @@ impl Metrics {
     }
 }
 
-fn decode_kernel_gpu_ns(
-    runs: &[RunSamples]
-) -> Result<BTreeMap<&'static str, Summary>, BenchError> {
-    let mut samples: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+fn decode_kernel_gpu_ns(runs: &[RunSamples]) -> Result<BTreeMap<String, Summary>, BenchError> {
+    let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for profile in runs
         .iter()
         .flat_map(|run| &run.decode)
         .filter_map(|sample| sample.profile.as_ref())
     {
-        for (&kernel, timing) in &profile.kernels {
+        for (kernel, timing) in &profile.kernels {
             if let Some(gpu_ns) = timing.gpu_ns {
-                samples.entry(kernel).or_default().push(gpu_ns);
+                samples.entry(kernel.clone()).or_default().push(gpu_ns);
             }
         }
     }
@@ -557,14 +555,14 @@ mod tests {
             |dispatch_count, allocation_count, allocated_bytes, gpu_busy_ns| DeviceProfile {
                 kernels: [
                     (
-                        "binary_add",
+                        "binary_add".to_owned(),
                         KernelProfile {
                             dispatch_count,
                             gpu_ns: None,
                         },
                     ),
                     (
-                        "matmul",
+                        "matmul".to_owned(),
                         KernelProfile {
                             dispatch_count: 1,
                             gpu_ns: None,
@@ -623,7 +621,7 @@ mod tests {
                 .iter()
                 .map(|&(kernel, gpu_ns)| {
                     (
-                        kernel,
+                        kernel.to_owned(),
                         KernelProfile {
                             dispatch_count: 1,
                             gpu_ns: Some(gpu_ns),
@@ -648,7 +646,7 @@ mod tests {
             metrics
                 .decode_kernel_gpu_ns
                 .iter()
-                .map(|(&kernel, s)| (kernel, s.count, s.min, s.max))
+                .map(|(kernel, s)| (kernel.as_str(), s.count, s.min, s.max))
                 .collect::<Vec<_>>(),
             [("binary_add", 2, 2.0, 4.0), ("matmul", 1, 8.0, 8.0)],
             "one sample per decode step that ran the kernel; the prompt step is excluded"

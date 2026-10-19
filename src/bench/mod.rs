@@ -633,7 +633,7 @@ mod tests {
             let bytes = 1_u32.to_le_bytes().repeat(output.numel());
             self.count_allocation(bytes.len());
             if let Some(profile) = &mut self.profile {
-                profile.count_dispatch(op.name());
+                profile.count_dispatch(op.name().to_owned());
             }
             Ok(bytes)
         }
@@ -976,7 +976,7 @@ mod tests {
         // Input ids, then 8 bytes of f32 logits and 4 bytes of argmax.
         let step_profile = |allocated_bytes| DeviceProfile {
             kernels: [(
-                "reduce",
+                "reduce".to_owned(),
                 KernelProfile {
                     dispatch_count: 1,
                     gpu_ns: None,

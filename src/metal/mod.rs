@@ -248,6 +248,17 @@ impl MetalDevice {
         args: &[KernelArgs<'_>],
         grid: Grid,
     ) -> Result<(), MetalError> {
+        self.dispatch_as(|| kernel.op().to_owned(), kernel, buffers, args, grid)
+    }
+
+    fn dispatch_as(
+        &mut self,
+        profile_key: impl FnOnce() -> String,
+        kernel: Kernel,
+        buffers: &[&MetalStorage],
+        args: &[KernelArgs<'_>],
+        grid: Grid,
+    ) -> Result<(), MetalError> {
         if grid.is_empty() {
             return Ok(());
         }
@@ -264,7 +275,9 @@ impl MetalDevice {
             return Err(MetalError::ThreadgroupTooSmall);
         }
         let group = grid.group(threads_max);
-        self.stream.compute(&pipeline, kernel.op(), |encoder| {
+        let profile_key = self.profile.is_some().then(profile_key);
+        let buffer_key = profile_key.clone();
+        self.stream.compute(&pipeline, buffer_key, |encoder| {
             // SAFETY: every buffer is borrowed for the whole call and the
             // command buffer retains it. Each one was produced on this
             // device's serial queue, since `view` and `owns` reject foreign
@@ -306,8 +319,8 @@ impl MetalDevice {
                 } => encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group),
             }
         })?;
-        if let Some(profile) = &mut self.profile {
-            profile.count_dispatch(kernel.op());
+        if let (Some(profile), Some(profile_key)) = (&mut self.profile, profile_key) {
+            profile.count_dispatch(profile_key);
         }
         Ok(())
     }
@@ -450,7 +463,8 @@ impl MetalDevice {
         let dispatch = MatmulDispatch::new(&geometry)?;
         // The output holds `batch * m * n` elements, and the kernel writes
         // only inside `[m, n]` of each batch.
-        self.dispatch(
+        self.dispatch_as(
+            || geometry.profile_key(),
             Kernel::float("matmul", dtype)?,
             &[lhs.storage, rhs.storage, &output],
             &[KernelArgs::Matmul(&dispatch.args)],
@@ -545,7 +559,7 @@ impl Device for MetalDevice {
     fn take_profile(&mut self) -> Option<DeviceProfile> {
         let profile = self.profile.as_mut().map(std::mem::take)?;
         let intervals = self.stream.take_gpu_intervals().unwrap_or_default();
-        Some(profile.with_gpu_intervals(&intervals))
+        Some(profile.with_gpu_intervals(intervals))
     }
 
     fn storage_from_bytes(
@@ -857,7 +871,7 @@ mod tests {
                 }),
                 Some(DeviceProfile {
                     kernels: BTreeMap::from([(
-                        "binary_add",
+                        "binary_add".to_owned(),
                         KernelProfile {
                             dispatch_count: 3,
                             gpu_ns: None,
@@ -964,10 +978,15 @@ mod tests {
             profile
                 .kernels
                 .iter()
-                .map(|(&kernel, timing)| (kernel, timing.dispatch_count))
+                .map(|(kernel, timing)| (kernel.as_str(), timing.dispatch_count))
                 .collect::<Vec<_>>(),
-            [("binary_add", 1), ("copy", 1), ("matmul", 2)],
-            "the operand copy is its own kernel"
+            [
+                ("binary_add", 1),
+                ("copy", 1),
+                ("matmul b4 m2 k2 n2", 1),
+                ("matmul b4 m2 k2 n3", 1),
+            ],
+            "the operand copy is its own kernel and each matmul shape its own key"
         );
         let kernel_ns = profile
             .kernels

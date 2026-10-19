@@ -14,7 +14,7 @@ pub enum ProfileMode {
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct DeviceProfile {
-    pub kernels: BTreeMap<&'static str, KernelProfile>,
+    pub kernels: BTreeMap<String, KernelProfile>,
     pub allocation_count: u64,
     pub allocated_bytes: u64,
     pub gpu_busy_ns: Option<f64>,
@@ -29,9 +29,9 @@ pub struct KernelProfile {
 
 // Host times in seconds, as Metal reports them; `kernel` is set only when the
 // command buffer ran that single kernel.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GpuInterval {
-    pub kernel: Option<&'static str>,
+    pub kernel: Option<String>,
     pub start_s: f64,
     pub end_s: f64,
 }
@@ -39,7 +39,7 @@ pub struct GpuInterval {
 impl DeviceProfile {
     pub fn count_dispatch(
         &mut self,
-        kernel: &'static str,
+        kernel: String,
     ) {
         let kernel = self.kernels.entry(kernel).or_default();
         kernel.dispatch_count = kernel.dispatch_count.saturating_add(1);
@@ -61,24 +61,22 @@ impl DeviceProfile {
 
     pub fn with_gpu_intervals(
         mut self,
-        intervals: &[GpuInterval],
+        intervals: Vec<GpuInterval>,
     ) -> Self {
-        intervals.iter().for_each(|interval| {
+        self.gpu_busy_ns = Some(busy_ns(
+            intervals
+                .iter()
+                .map(|interval| (interval.start_s, interval.end_s))
+                .collect(),
+        ));
+        intervals.into_iter().for_each(|interval| {
             if let Some(kernel) = interval.kernel {
                 let kernel = self.kernels.entry(kernel).or_default();
                 let gpu_ns = (interval.end_s - interval.start_s) * NS_PER_S;
                 kernel.gpu_ns = Some(kernel.gpu_ns.unwrap_or(0.0) + gpu_ns);
             }
         });
-        Self {
-            gpu_busy_ns: Some(busy_ns(
-                intervals
-                    .iter()
-                    .map(|interval| (interval.start_s, interval.end_s))
-                    .collect(),
-            )),
-            ..self
-        }
+        self
     }
 }
 
@@ -119,7 +117,7 @@ mod tests {
         };
         let profile = DeviceProfile {
             kernels: BTreeMap::from([(
-                "binary_add",
+                "binary_add".to_owned(),
                 KernelProfile {
                     dispatch_count: 2,
                     gpu_ns: None,
@@ -127,10 +125,10 @@ mod tests {
             )]),
             ..DeviceProfile::default()
         }
-        .with_gpu_intervals(&[
-            interval(Some("binary_add"), 0.0, 0.5),
-            interval(Some("matmul"), 0.25, 1.0),
-            interval(Some("binary_add"), 1.0, 1.25),
+        .with_gpu_intervals(vec![
+            interval(Some("binary_add".to_owned()), 0.0, 0.5),
+            interval(Some("matmul".to_owned()), 0.25, 1.0),
+            interval(Some("binary_add".to_owned()), 1.0, 1.25),
             interval(None, 2.0, 2.5),
         ]);
         assert_eq!(
@@ -138,14 +136,14 @@ mod tests {
             DeviceProfile {
                 kernels: BTreeMap::from([
                     (
-                        "binary_add",
+                        "binary_add".to_owned(),
                         KernelProfile {
                             dispatch_count: 2,
                             gpu_ns: Some(0.75e9),
                         }
                     ),
                     (
-                        "matmul",
+                        "matmul".to_owned(),
                         KernelProfile {
                             dispatch_count: 0,
                             gpu_ns: Some(0.75e9),
@@ -159,7 +157,7 @@ mod tests {
              buffers"
         );
         assert_eq!(
-            DeviceProfile::default().with_gpu_intervals(&[]),
+            DeviceProfile::default().with_gpu_intervals(Vec::new()),
             DeviceProfile {
                 gpu_busy_ns: Some(0.0),
                 ..DeviceProfile::default()
@@ -190,7 +188,7 @@ mod tests {
         let mut profile = DeviceProfile::default();
         ["binary_add", "matmul", "binary_add"]
             .into_iter()
-            .for_each(|kernel| profile.count_dispatch(kernel));
+            .for_each(|kernel| profile.count_dispatch(kernel.to_owned()));
         [16, 0, 4096]
             .into_iter()
             .for_each(|bytes| profile.count_allocation(bytes));
@@ -199,14 +197,14 @@ mod tests {
             DeviceProfile {
                 kernels: BTreeMap::from([
                     (
-                        "binary_add",
+                        "binary_add".to_owned(),
                         KernelProfile {
                             dispatch_count: 2,
                             gpu_ns: None,
                         }
                     ),
                     (
-                        "matmul",
+                        "matmul".to_owned(),
                         KernelProfile {
                             dispatch_count: 1,
                             gpu_ns: None,
@@ -226,7 +224,7 @@ mod tests {
     fn counts_saturate_instead_of_wrapping() {
         let mut profile = DeviceProfile {
             kernels: BTreeMap::from([(
-                "copy",
+                "copy".to_owned(),
                 KernelProfile {
                     dispatch_count: u64::MAX,
                     gpu_ns: None,
@@ -236,8 +234,8 @@ mod tests {
             allocated_bytes: u64::MAX,
             gpu_busy_ns: None,
         };
-        profile.count_dispatch("copy");
-        profile.count_dispatch("matmul");
+        profile.count_dispatch("copy".to_owned());
+        profile.count_dispatch("matmul".to_owned());
         profile.count_allocation(1);
         assert_eq!(
             (

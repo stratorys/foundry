@@ -39,12 +39,12 @@ struct OpenBuffer {
     command_buffer: CommandBuffer,
     compute: Option<Retained<ComputeEncoder>>,
     dispatch_count: usize,
-    kernel: Option<&'static str>,
+    kernel: Option<String>,
 }
 
 struct InFlight {
     command_buffer: CommandBuffer,
-    kernel: Option<&'static str>,
+    kernel: Option<String>,
 }
 
 impl CommandStream {
@@ -80,14 +80,14 @@ impl CommandStream {
     pub fn compute(
         &mut self,
         pipeline: &Pipeline,
-        kernel: &'static str,
+        kernel: Option<String>,
         bind: impl FnOnce(&ComputeEncoder),
     ) -> Result<(), MetalError> {
         self.check_failure()?;
         let is_kernel_timed = self.profile_mode == Some(ProfileMode::Kernels);
         let open = self.open_buffer()?;
         if is_kernel_timed {
-            open.kernel = Some(kernel);
+            open.kernel = kernel;
         }
         let encoder = open.compute_encoder()?;
         encoder.setComputePipelineState(pipeline);
@@ -101,7 +101,7 @@ impl CommandStream {
             self.in_flight.push_back(open.commit());
         }
         while let Some(in_flight) = self.in_flight.pop_front() {
-            self.retire(&in_flight)?;
+            self.retire(in_flight)?;
         }
         Ok(())
     }
@@ -175,7 +175,7 @@ impl CommandStream {
         }) || self.in_flight.len() > in_flight_max
         {
             if let Some(in_flight) = self.in_flight.pop_front() {
-                self.retire(&in_flight)?;
+                self.retire(in_flight)?;
             }
         }
         Ok(())
@@ -183,7 +183,7 @@ impl CommandStream {
 
     fn retire(
         &mut self,
-        in_flight: &InFlight,
+        in_flight: InFlight,
     ) -> Result<(), MetalError> {
         let command_buffer = &in_flight.command_buffer;
         command_buffer.waitUntilCompleted();
@@ -239,7 +239,7 @@ impl OpenBuffer {
         self.command_buffer.commit();
         InFlight {
             command_buffer: self.command_buffer.clone(),
-            kernel: self.kernel,
+            kernel: self.kernel.take(),
         }
     }
 }

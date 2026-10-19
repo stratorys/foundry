@@ -192,6 +192,16 @@ impl MatmulGeometry {
             rhs: MatrixLayout::of(rhs)?,
         })
     }
+
+    pub fn profile_key(&self) -> String {
+        format!(
+            "matmul b{} m{} k{} n{}",
+            self.batch.numel(),
+            self.m,
+            self.k,
+            self.n
+        )
+    }
 }
 
 impl MatmulOperand {
@@ -286,6 +296,37 @@ mod tests {
         Layout,
         Shape,
     };
+
+    #[test]
+    fn matmul_profile_key_names_batch_and_matrix_dims() {
+        assert_eq!(
+            [
+                (vec![1, 3072], vec![3072, 8192]),
+                (vec![1, 1, 3072], vec![1, 3072, 128_256]),
+            ]
+            .map(|(lhs, rhs)| {
+                MatmulGeometry::of(
+                    &Layout::contiguous(Shape::try_from(lhs.as_slice()).expect("valid shape")),
+                    &Layout::contiguous(Shape::try_from(rhs.as_slice()).expect("valid shape")),
+                )
+                .map(|geometry| geometry.profile_key())
+            }),
+            [
+                Some("matmul b1 m1 k3072 n8192".to_owned()),
+                Some("matmul b1 m1 k3072 n128256".to_owned()),
+            ],
+            "a 2D matmul has one batch"
+        );
+        assert_eq!(
+            MatmulGeometry::of(
+                &Layout::contiguous(Shape::try_from([8, 3, 1, 128]).expect("valid shape")),
+                &Layout::contiguous(Shape::try_from([8, 3, 128, 512]).expect("valid shape")),
+            )
+            .map(|geometry| geometry.profile_key()),
+            Some("matmul b24 m1 k128 n512".to_owned()),
+            "batch dims are multiplied"
+        );
+    }
 
     #[test]
     fn matmul_geometry_reads_dims_and_operand_strides() {
