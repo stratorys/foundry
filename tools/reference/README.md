@@ -100,6 +100,12 @@ full generation wall time. Rates below use seconds; stored latency values use na
 | `output_tokens_per_s` | O / G; unavailable in forward scope or without output tokens. |
 | `total_tokens_per_s` | (P + O) / G, counting input and output tokens; generation scope only. |
 | `processed_tokens_per_s` | (P + D) / T, counting input tokens passed through timed forwards. |
+| `decode_dispatch_count` | Dispatch count per decode step; profiling only. |
+| `decode_allocation_count` | Buffer allocation count per decode step; profiling only. |
+| `decode_allocated_bytes` | Sum of requested buffer bytes per decode step; profiling only. |
+| `decode_gpu_busy_ns` | GPU command-buffer interval union per decode step, in nanoseconds; profiling only. |
+| `decode_gpu_idle_ns` | Per-step `step_ns - gpu_busy_ns`; profiling only. |
+| `decode_kernel_gpu_ns` | Map of kernel keys to per-step GPU time summaries, in nanoseconds; `kernels` mode only. |
 
 Choose `--timing-scope generation` (default) or `--timing-scope forward`. Run them in separate
 invocations and output directories so synchronization used to isolate forwards does not
@@ -144,6 +150,54 @@ These are observed Metal allocation peaks, not process resident memory, separate
 of weights/KV/temporaries, or an exact continuous hardware peak. No extra synchronization is
 inserted inside timed steps to measure memory.
 
+### Device profiling
+
+Use `--profile steps` to record dispatches, allocations and GPU time while keeping the normal
+command-buffer batching and in-flight limit. Recording counters adds CPU overhead. Use
+`--profile kernels` to also attribute GPU time to individual kernel keys: it runs one dispatch
+per command buffer and waits for completion before submitting the next. Its wall times and
+throughputs are perturbed and are unsuitable for normal performance comparisons.
+
+For a small diagnostic run, use separate output directories under the `OUT` selected above:
+
+```sh
+./target/release/foundry bench --model meta-llama/Llama-3.2-3B-Instruct --prompt-tokens 4 --new-tokens 3 --depth 7 --timing-scope generation --profile steps --warmup-runs 0 --runs 1 --out "$OUT/profile-steps"
+
+./target/release/foundry bench --model meta-llama/Llama-3.2-3B-Instruct --prompt-tokens 4 --new-tokens 3 --depth 7 --timing-scope generation --profile kernels --warmup-runs 0 --runs 1 --out "$OUT/profile-kernels"
+```
+
+Use `--timing-scope forward` and new output directories to inspect forwards alone. Profiles
+follow the same boundary as each step timer: generation includes greedy argmax and token
+readback; forward excludes both and discards their counters before the next step. Model
+loading, cache initialization and initial depth processing are excluded from step profiles.
+With `--new-tokens 0`, the prompt profile covers processing through ready logits, without
+selection.
+
+The selected mode is stored in `config.profile`. Raw profiles appear in
+`runs[].prompt_profile` and `runs[].decode[].profile`:
+
+| Profile field | Meaning |
+|---|---|
+| `kernels[key].dispatch_count` | Number of dispatches for this key during the step. |
+| `kernels[key].gpu_ns` | Sum of GPU command-buffer durations for this key, in nanoseconds; present only in `kernels` mode. |
+| `allocation_count` | Number of buffer allocations during the step. |
+| `allocated_bytes` | Sum of requested buffer sizes, in bytes, including buffers freed during the step; distinct from peak or resident memory. |
+| `gpu_busy_ns` | Duration of the union of completed command-buffer GPU intervals, in nanoseconds; overlapping intervals count once. |
+
+Kernel keys name operations such as `binary_add` or `reduce_argmax`. Matmul keys include
+batch product and matrix dimensions, for example `matmul b1 m1 k3072 n8192`. Operand copies
+are counted and timed separately.
+
+The `metrics.decode_*` profiling summaries pool decode steps from measured runs, excluding
+the prompt and warmups. Each `decode_kernel_gpu_ns` entry summarizes the total time for its
+key in each decode step that ran it; missing keys contribute no sample. `decode_gpu_idle_ns`
+summarizes the time outside the recorded command-buffer intervals. It is not a hardware
+utilization counter or a separate measurement of CPU encoding, allocation or waiting time.
+Command-buffer durations include all time between Metal's `GPUStartTime` and `GPUEndTime`.
+
+Without profiling, raw profile fields are omitted, scalar profiling summaries are `null`,
+and `decode_kernel_gpu_ns` is an empty map. In `steps` mode that map is also empty.
+
 ### Decode samples and context
 
 Each run records a `decode` array. Every sample contains `position` (zero-based decode index),
@@ -186,8 +240,8 @@ commands. Matching metric names alone do not establish equal measurement boundar
 | [vLLM benchmarks](https://github.com/vllm-project/vllm/tree/main/vllm/benchmarks) | Local latency and input/output throughput; first-token latency, TPOT and ITL. | Use a local benchmark for local inference comparisons. Client/server measurements include additional work. |
 | [SGLang benchmarks](https://docs.sglang.ai/developer_guide/bench_serving) | Latency and input/output throughput; first-token latency, TPOT and ITL. | Separate engine execution from streaming-client latency and concurrent serving throughput. |
 
-Loading/compilation time, GPU-only time, process RSS and serving metrics are not currently
-instrumented in this report. No value is inferred for an unmeasured quantity. For external
+GPU command-buffer times are available through device profiling above. Loading/compilation
+time, process RSS and serving metrics are not currently instrumented in this report. For external
 metrics with a different numerator or interval, use the retained raw samples and explicit
 formula; do not label a Foundry calculation as an actual run of that engine.
 
