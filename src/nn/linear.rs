@@ -1,0 +1,70 @@
+use crate::nn::{
+    Device,
+    Module,
+    Shape,
+    Tensor,
+    TensorError,
+};
+
+pub struct Linear<D: Device> {
+    weight: Tensor<D>,
+}
+
+impl<D: Device> Linear<D> {
+    pub fn new(weight: Tensor<D>) -> Self {
+        Self {
+            weight,
+        }
+    }
+}
+
+impl<D: Device> Module<D> for Linear<D> {
+    fn forward(
+        &self,
+        device: &mut D,
+        x: &Tensor<D>,
+    ) -> Result<Tensor<D>, TensorError> {
+        let weight_t = self.weight.permute(&[1, 0])?;
+        let last_dim = x.shape().last_dim()?;
+        let in_features = x.shape().size(last_dim)?;
+        let rows = x.shape().dims().iter().take(last_dim).product();
+        let output_shape = x.shape().with_dim(last_dim, weight_t.shape().size(1)?)?;
+        x.reshape(Shape::try_from([rows, in_features])?)?
+            .matmul(device, &weight_t)?
+            .reshape(output_shape)
+    }
+}
+
+pub struct Embedding<D: Device> {
+    weight: Tensor<D>,
+}
+
+impl<D: Device> Embedding<D> {
+    pub fn new(weight: Tensor<D>) -> Self {
+        Self {
+            weight,
+        }
+    }
+
+    pub fn weight(&self) -> &Tensor<D> { &self.weight }
+}
+
+impl<D: Device> Module<D> for Embedding<D> {
+    fn forward(
+        &self,
+        device: &mut D,
+        input_ids: &Tensor<D>,
+    ) -> Result<Tensor<D>, TensorError> {
+        let flat_ids = input_ids.reshape(Shape::try_from([input_ids.shape().numel()])?)?;
+        let embeds = self.weight.index_select(device, 0, &flat_ids)?;
+        let hidden_size = embeds.shape().size(embeds.shape().last_dim()?)?;
+        let dims: Vec<usize> = input_ids
+            .shape()
+            .dims()
+            .iter()
+            .copied()
+            .chain([hidden_size])
+            .collect();
+        embeds.reshape(Shape::try_from(dims.as_slice())?)
+    }
+}

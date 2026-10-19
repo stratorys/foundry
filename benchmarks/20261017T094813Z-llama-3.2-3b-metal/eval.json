@@ -1,0 +1,389 @@
+{
+  "metadata": {
+    "git_commit": "162cf3250d043155c8303a3bc7284a3b32c463f8",
+    "test_time": "2026-10-17T09:48:13Z",
+    "device": "metal",
+    "device_name": "Apple M4 Pro",
+    "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+    "model_bytes": 6425499648,
+    "model_parameter_count": 3212749824
+  },
+  "references": [
+    {
+      "engine": "transformers",
+      "dir": "/private/tmp/llama-3.2-3B-transformers",
+      "layers": [
+        {
+          "name": "model.embed_tokens",
+          "atol": 0.001,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.input_layernorm",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.mlp",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0009765625
+        },
+        {
+          "name": "model.layers.0.post_attention_layernorm",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.self_attn.k_proj",
+          "atol": 0.02,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 21504,
+          "close_count": 21504,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0000038146973
+        },
+        {
+          "name": "model.layers.0.self_attn.o_proj",
+          "atol": 0.02,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.00012207031
+        },
+        {
+          "name": "model.layers.0.self_attn.q_proj",
+          "atol": 0.02,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0078125
+        },
+        {
+          "name": "model.layers.0.self_attn.v_proj",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 21504,
+          "close_count": 21504,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.000030517578
+        }
+      ],
+      "generation": [
+        {
+          "prompt_index": 0,
+          "prompt_tokens": 21,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.24993379833857432,
+          "first_step": {
+            "kl": 0.0002988573776126079,
+            "max_abs_logit_diff": 0.09375
+          }
+        },
+        {
+          "prompt_index": 1,
+          "prompt_tokens": 22,
+          "compared_tokens": 32,
+          "matched_tokens": 12,
+          "first_divergence": 12,
+          "close": true,
+          "max_logprob_abs_diff": 0.13364515239691954,
+          "first_step": {
+            "kl": 0.0008328979526558965,
+            "max_abs_logit_diff": 0.15625
+          }
+        },
+        {
+          "prompt_index": 2,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.14185197092785984,
+          "first_step": {
+            "kl": 0.00036302774701327896,
+            "max_abs_logit_diff": 0.125
+          }
+        },
+        {
+          "prompt_index": 3,
+          "prompt_tokens": 16,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.160264663734214,
+          "first_step": {
+            "kl": 0.0008935859259237168,
+            "max_abs_logit_diff": 0.15625
+          }
+        },
+        {
+          "prompt_index": 4,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.14128327472883484,
+          "first_step": {
+            "kl": 0.0012281718279643966,
+            "max_abs_logit_diff": 0.171875
+          }
+        },
+        {
+          "prompt_index": 5,
+          "prompt_tokens": 20,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.1849411976977109,
+          "first_step": {
+            "kl": 0.00007623192111051739,
+            "max_abs_logit_diff": 0.15625
+          }
+        },
+        {
+          "prompt_index": 6,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.34235721560640187,
+          "first_step": {
+            "kl": 0.001548486637471606,
+            "max_abs_logit_diff": 0.15625
+          }
+        },
+        {
+          "prompt_index": 7,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.2500011565607636,
+          "first_step": {
+            "kl": 0.0004009906169086989,
+            "max_abs_logit_diff": 0.142578125
+          }
+        }
+      ]
+    },
+    {
+      "engine": "mlx",
+      "dir": "/private/tmp/llama-3.2-3B-mlx",
+      "generation": [
+        {
+          "prompt_index": 0,
+          "prompt_tokens": 21,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.12653068538634926,
+          "first_step": {
+            "kl": 0.00008850868274452686,
+            "max_abs_logit_diff": 0.109375
+          }
+        },
+        {
+          "prompt_index": 1,
+          "prompt_tokens": 22,
+          "compared_tokens": 32,
+          "matched_tokens": 12,
+          "first_divergence": 12,
+          "close": true,
+          "max_logprob_abs_diff": 0.12018636751300749,
+          "first_step": {
+            "kl": 0.0007889322867030082,
+            "max_abs_logit_diff": 0.125
+          }
+        },
+        {
+          "prompt_index": 2,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.18743149149880978,
+          "first_step": {
+            "kl": 0.0016119054009935008,
+            "max_abs_logit_diff": 0.125
+          }
+        },
+        {
+          "prompt_index": 3,
+          "prompt_tokens": 16,
+          "compared_tokens": 32,
+          "matched_tokens": 0,
+          "first_divergence": 0,
+          "close": true,
+          "max_logprob_abs_diff": null,
+          "first_step": {
+            "kl": 0.0019649738521001015,
+            "max_abs_logit_diff": 0.21875
+          }
+        },
+        {
+          "prompt_index": 4,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.17120339803352458,
+          "first_step": {
+            "kl": 0.0015857378492774282,
+            "max_abs_logit_diff": 0.21875
+          }
+        },
+        {
+          "prompt_index": 5,
+          "prompt_tokens": 20,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.1249775685916461,
+          "first_step": {
+            "kl": 0.00007929665662849567,
+            "max_abs_logit_diff": 0.15625
+          }
+        },
+        {
+          "prompt_index": 6,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.35651212664766163,
+          "first_step": {
+            "kl": 0.0014508264115843962,
+            "max_abs_logit_diff": 0.1875
+          }
+        },
+        {
+          "prompt_index": 7,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.30538081059303224,
+          "first_step": {
+            "kl": 0.0005118247487774027,
+            "max_abs_logit_diff": 0.1328125
+          }
+        }
+      ]
+    }
+  ],
+  "baseline": [
+    {
+      "engines": [
+        "transformers",
+        "mlx"
+      ],
+      "prompts": [
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.1249837875366211
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.24994850158691406
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.13901019096374512
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 0,
+          "first_divergence": 0,
+          "close": true,
+          "max_logprob_abs_diff": null
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.24849653244018555
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.18017005920410156
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.37358760833740234
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.2435464859008789
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,405 @@
+{
+  "metadata": {
+    "git_commit": "369f52b3399f368c001e205a313070822da4181e",
+    "test_time": "2026-10-18T17:03:39Z",
+    "device": "metal",
+    "device_name": "Apple M4 Pro",
+    "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+    "model_bytes": 6425499648,
+    "model_parameter_count": 3212749824
+  },
+  "references": [
+    {
+      "engine": "transformers",
+      "dir": "/Users/ljahier/foundry-fixtures/llama-3.2-3B-transformers",
+      "layers": [
+        {
+          "name": "model.embed_tokens",
+          "atol": 0.001,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.input_layernorm",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.mlp",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.00024414062
+        },
+        {
+          "name": "model.layers.0.post_attention_layernorm",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.self_attn.k_proj",
+          "atol": 0.02,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 21504,
+          "close_count": 21504,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.00390625
+        },
+        {
+          "name": "model.layers.0.self_attn.o_proj",
+          "atol": 0.02,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.self_attn.q_proj",
+          "atol": 0.02,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 64512,
+          "close_count": 64512,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.0
+        },
+        {
+          "name": "model.layers.0.self_attn.v_proj",
+          "atol": 0.01,
+          "rtol": 0.01,
+          "status": "passed",
+          "numel": 21504,
+          "close_count": 21504,
+          "close_fraction": 1.0,
+          "non_finite_count": 0,
+          "max_abs_error": 0.000030517578
+        }
+      ],
+      "generation": [
+        {
+          "prompt_index": 0,
+          "prompt_tokens": 21,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.24343405231438453,
+          "first_step": {
+            "kl": 0.00021693343558410347,
+            "max_abs_logit_diff": 0.09375
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 1,
+          "prompt_tokens": 22,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.24143879452931571,
+          "first_step": {
+            "kl": 0.0010358076757121142,
+            "max_abs_logit_diff": 0.13671875
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 2,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.19076173566088572,
+          "first_step": {
+            "kl": 0.000275594011206845,
+            "max_abs_logit_diff": 0.109375
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 3,
+          "prompt_tokens": 16,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.24999786685904368,
+          "first_step": {
+            "kl": 0.001297148562430151,
+            "max_abs_logit_diff": 0.1875
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 4,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.22977200677586396,
+          "first_step": {
+            "kl": 0.004887427549880123,
+            "max_abs_logit_diff": 0.3125
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 5,
+          "prompt_tokens": 20,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.15351321480258662,
+          "first_step": {
+            "kl": 0.0004148605550709917,
+            "max_abs_logit_diff": 0.1328125
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 6,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.3121192172910341,
+          "first_step": {
+            "kl": 0.001263121231493358,
+            "max_abs_logit_diff": 0.2578125
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 7,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.31249931923642293,
+          "first_step": {
+            "kl": 0.0003549128503096127,
+            "max_abs_logit_diff": 0.13525390625
+          },
+          "non_finite_logit_count": 0
+        }
+      ]
+    },
+    {
+      "engine": "mlx",
+      "dir": "/Users/ljahier/foundry-fixtures/llama-3.2-3B-mlx",
+      "generation": [
+        {
+          "prompt_index": 0,
+          "prompt_tokens": 21,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.12653068538634926,
+          "first_step": {
+            "kl": 0.00008850868274452686,
+            "max_abs_logit_diff": 0.109375
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 1,
+          "prompt_tokens": 22,
+          "compared_tokens": 32,
+          "matched_tokens": 12,
+          "first_divergence": 12,
+          "close": true,
+          "max_logprob_abs_diff": 0.12018636751300749,
+          "first_step": {
+            "kl": 0.0007889322867030082,
+            "max_abs_logit_diff": 0.125
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 2,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.18743149149880978,
+          "first_step": {
+            "kl": 0.0016119054009935008,
+            "max_abs_logit_diff": 0.125
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 3,
+          "prompt_tokens": 16,
+          "compared_tokens": 32,
+          "matched_tokens": 0,
+          "first_divergence": 0,
+          "close": true,
+          "max_logprob_abs_diff": null,
+          "first_step": {
+            "kl": 0.0019649738521001015,
+            "max_abs_logit_diff": 0.21875
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 4,
+          "prompt_tokens": 15,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.17120339803352458,
+          "first_step": {
+            "kl": 0.0015857378492774282,
+            "max_abs_logit_diff": 0.21875
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 5,
+          "prompt_tokens": 20,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.1249775685916461,
+          "first_step": {
+            "kl": 0.00007929665662849567,
+            "max_abs_logit_diff": 0.15625
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 6,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.35651212664766163,
+          "first_step": {
+            "kl": 0.0014508264115843962,
+            "max_abs_logit_diff": 0.1875
+          },
+          "non_finite_logit_count": 0
+        },
+        {
+          "prompt_index": 7,
+          "prompt_tokens": 24,
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.30538081059303224,
+          "first_step": {
+            "kl": 0.0005118247487774027,
+            "max_abs_logit_diff": 0.1328125
+          },
+          "non_finite_logit_count": 0
+        }
+      ]
+    }
+  ],
+  "baseline": [
+    {
+      "engines": [
+        "transformers",
+        "mlx"
+      ],
+      "prompts": [
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.12488937377929688
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 12,
+          "first_divergence": 12,
+          "close": true,
+          "max_logprob_abs_diff": 0.23477506637573198
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.248687744140625
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 0,
+          "first_divergence": 0,
+          "close": true,
+          "max_logprob_abs_diff": null
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.1578369140625
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.17966365814208984
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.3565042018890381
+        },
+        {
+          "compared_tokens": 32,
+          "matched_tokens": 32,
+          "first_divergence": null,
+          "close": true,
+          "max_logprob_abs_diff": 0.25
+        }
+      ]
+    }
+  ]
+}

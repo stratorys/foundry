@@ -1,0 +1,104 @@
+use tracing::error;
+
+use crate::models::llama::LlamaError;
+use crate::models::llama::error::tensor_failed;
+use crate::nn::{
+    DType,
+    Device,
+    Tensor,
+};
+use crate::weights::{
+    WeightView,
+    Weights,
+};
+
+const DTYPE: DType = DType::BF16;
+
+pub fn load_tensor<D: Device, S: AsRef<[u8]>>(
+    device: &mut D,
+    weights: &Weights<S>,
+    name: &str,
+    dims_expected: &[usize],
+) -> Result<Tensor<D>, LlamaError> {
+    let view = checked_view(weights.tensor(name), name, dims_expected)?;
+    Tensor::from_bytes(device, view.bytes, view.dtype, view.shape).map_err(tensor_failed)
+}
+
+fn checked_view<'weights>(
+    view: Option<WeightView<'weights>>,
+    name: &str,
+    dims_expected: &[usize],
+) -> Result<WeightView<'weights>, LlamaError> {
+    let view = view.ok_or_else(|| {
+        error!(message = "Tensor is not in the weights.", name);
+        LlamaError::TensorNotFound
+    })?;
+    if view.dtype != DTYPE {
+        error!(
+            message = "Tensor dtype is not the model dtype.",
+            name,
+            dtype = ?view.dtype,
+            dtype_expected = ?DTYPE,
+        );
+        return Err(LlamaError::TensorDTypeMismatch);
+    }
+    if view.shape.dims() != dims_expected {
+        error!(
+            message = "Tensor shape does not match the config.",
+            name,
+            dims = ?view.shape.dims(),
+            ?dims_expected,
+        );
+        return Err(LlamaError::TensorShapeMismatch);
+    }
+    Ok(view)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::llama::LlamaError;
+    use crate::models::llama::weights::checked_view;
+    use crate::nn::{
+        DType,
+        Shape,
+    };
+    use crate::weights::WeightView;
+
+    #[test]
+    fn checked_view_accepts_a_bf16_tensor_of_the_expected_shape() {
+        let view = WeightView {
+            name: "model.norm.weight",
+            dtype: DType::BF16,
+            shape: Shape::try_from([4]).expect("the shape is valid"),
+            bytes: &[0; 8],
+        };
+        assert_eq!(
+            checked_view(Some(view), "model.norm.weight", &[4]),
+            Ok(view),
+            "a bf16 tensor of 4 elements"
+        );
+    }
+
+    #[test]
+    fn checked_view_rejects_a_missing_tensor_a_wrong_dtype_or_a_wrong_shape() {
+        let view = |dtype| WeightView {
+            name: "model.norm.weight",
+            dtype,
+            shape: Shape::try_from([4]).expect("the shape is valid"),
+            bytes: &[0; 16],
+        };
+        assert_eq!(
+            [
+                checked_view(None, "model.norm.weight", &[4]),
+                checked_view(Some(view(DType::F32)), "model.norm.weight", &[4]),
+                checked_view(Some(view(DType::BF16)), "model.norm.weight", &[8]),
+            ],
+            [
+                Err(LlamaError::TensorNotFound),
+                Err(LlamaError::TensorDTypeMismatch),
+                Err(LlamaError::TensorShapeMismatch),
+            ],
+            "absent, then f32, then 4 elements where 8 are expected"
+        );
+    }
+}
