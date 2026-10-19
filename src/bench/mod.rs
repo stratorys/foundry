@@ -303,19 +303,16 @@ fn run<D: Device, M: CausalLm<D>>(
             } else {
                 None
             };
-        // Every step ends by reading the selected tokens or by synchronizing,
-        // so all of its device work has completed.
-        let profile = decoder.take_profile();
         if is_prompt {
             samples.prompt_step_ns = Some(step.ns);
-            samples.prompt_profile = profile;
+            samples.prompt_profile = step.profile;
         } else {
             samples.decode.push(DecodeSample {
                 position: samples.decode.len(),
                 context_tokens: past_seen_tokens,
                 step_ns: step.ns,
                 inter_token_ns,
-                profile,
+                profile: step.profile,
             });
         }
         samples
@@ -335,6 +332,7 @@ struct TimedStep {
     tokens: Vec<u32>,
     ns: u64,
     completed_at: Instant,
+    profile: Option<DeviceProfile>,
 }
 
 fn timed_step<D: Device, M: CausalLm<D>>(
@@ -354,16 +352,21 @@ fn timed_step<D: Device, M: CausalLm<D>>(
     } else {
         None
     };
+    let forward_profile = forward_end.map(|_| decoder.take_profile());
     let tokens = if select_token {
         decoder.next_tokens(&logits).map_err(step_error)?
     } else {
         Vec::new()
     };
     let completed_at = forward_end.unwrap_or_else(Instant::now);
+    // In forward scope, drain selection work without adding it to this or
+    // the next step's profile. Generation scope includes the readback.
+    let profile = decoder.take_profile();
     Ok(TimedStep {
         tokens,
         ns: duration_ns(completed_at.duration_since(start))?,
         completed_at,
+        profile: forward_profile.unwrap_or(profile),
     })
 }
 
@@ -541,6 +544,19 @@ mod tests {
     }
 
     impl RecordingDevice {
+        fn count_dispatch(
+            &mut self,
+            kernel: &str,
+            gpu_ns: f64,
+        ) {
+            if let Some(profile) = &mut self.profile {
+                profile.count_dispatch(kernel.to_owned());
+                let timing = profile.kernels.get_mut(kernel).expect("counted kernel");
+                timing.gpu_ns = Some(timing.gpu_ns.unwrap_or(0.0) + gpu_ns);
+                profile.gpu_busy_ns = Some(profile.gpu_busy_ns.unwrap_or(0.0) + gpu_ns);
+            }
+        }
+
         fn count_allocation(
             &mut self,
             nbytes: usize,
@@ -632,9 +648,7 @@ mod tests {
             self.events.push("select");
             let bytes = 1_u32.to_le_bytes().repeat(output.numel());
             self.count_allocation(bytes.len());
-            if let Some(profile) = &mut self.profile {
-                profile.count_dispatch(op.name().to_owned());
-            }
+            self.count_dispatch(op.name(), 2.0);
             Ok(bytes)
         }
         fn run_in_place(
@@ -667,6 +681,7 @@ mod tests {
             _keep: usize,
         ) -> Result<Tensor<RecordingDevice>, Self::Error> {
             device.events.push("forward");
+            device.count_dispatch("forward", 1.0);
             device
                 .forwards
                 .push((past, ids.shape().dims().get(1).copied().unwrap_or(0)));
@@ -969,50 +984,87 @@ mod tests {
 
     #[test]
     fn each_step_receives_only_its_own_device_profile() {
-        let config = BenchConfig {
-            depth_token_count: 7,
-            ..measured_config(4, 3, TimingScope::Generation)
-        };
-        // Input ids, then 8 bytes of f32 logits and 4 bytes of argmax.
-        let step_profile = |allocated_bytes| DeviceProfile {
-            kernels: [(
-                "reduce".to_owned(),
-                KernelProfile {
-                    dispatch_count: 1,
-                    gpu_ns: None,
-                },
-            )]
-            .into(),
-            allocation_count: 3,
-            allocated_bytes,
-            gpu_busy_ns: None,
-        };
-        let step_profiles = |profile: Option<DeviceProfile>| {
-            let mut device = RecordingDevice {
-                profile,
-                ..RecordingDevice::default()
-            };
-            let report =
-                bench(&mut device, &TestModel, NonZeroU32::MIN, &config).expect("benchmark");
-            let run = report.runs.first().expect("one run");
-            (
-                run.prompt_profile.clone(),
-                run.decode
-                    .iter()
-                    .map(|sample| sample.profile.clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        assert_eq!(
-            step_profiles(Some(DeviceProfile::default())),
-            (Some(step_profile(28)), vec![Some(step_profile(16)); 2]),
-            "input ids, logits and argmax per step; cache and depth work excluded"
-        );
-        assert_eq!(
-            step_profiles(None),
-            (None, vec![None; 2]),
-            "no profile without device profiling"
-        );
+        for scope in [TimingScope::Forward, TimingScope::Generation] {
+            for (prompt, output, decode_count) in [(4, 3, 2), (0, 3, 3), (4, 0, 0)] {
+                for enabled in [true, false] {
+                    let config = BenchConfig {
+                        depth_token_count: 7,
+                        warmup_run_count: 1,
+                        run_count: NonZeroU32::new(2).expect("positive run count"),
+                        ..measured_config(prompt, output, scope)
+                    };
+                    let mut device = RecordingDevice {
+                        profile: enabled.then(DeviceProfile::default),
+                        ..RecordingDevice::default()
+                    };
+                    let report = bench(&mut device, &TestModel, NonZeroU32::MIN, &config)
+                        .expect("benchmark");
+                    let includes_selection = scope == TimingScope::Generation && output > 0;
+                    let step_profile =
+                        |input_bytes: u64| {
+                            enabled.then(|| DeviceProfile {
+                                kernels: if includes_selection {
+                                    [
+                                        (
+                                            "forward".to_owned(),
+                                            KernelProfile {
+                                                dispatch_count: 1,
+                                                gpu_ns: Some(1.0),
+                                            },
+                                        ),
+                                        (
+                                            "reduce".to_owned(),
+                                            KernelProfile {
+                                                dispatch_count: 1,
+                                                gpu_ns: Some(2.0),
+                                            },
+                                        ),
+                                    ]
+                                    .into()
+                                } else {
+                                    [(
+                                        "forward".to_owned(),
+                                        KernelProfile {
+                                            dispatch_count: 1,
+                                            gpu_ns: Some(1.0),
+                                        },
+                                    )]
+                                    .into()
+                                },
+                                allocation_count: if includes_selection { 3 } else { 2 },
+                                allocated_bytes: input_bytes
+                                    .saturating_add(if includes_selection { 12 } else { 8 }),
+                                gpu_busy_ns: Some(if includes_selection { 3.0 } else { 1.0 }),
+                            })
+                        };
+                    for run in &report.runs {
+                        assert_eq!(
+                            run.prompt_profile,
+                            (prompt > 0).then(|| step_profile(16)).flatten(),
+                            "prompt profile matches {scope:?}; cache, depth and warmup excluded"
+                        );
+                        assert_eq!(
+                            run.decode
+                                .iter()
+                                .map(|sample| sample.profile.clone())
+                                .collect::<Vec<_>>(),
+                            vec![step_profile(4); decode_count],
+                            "each decode profile matches {scope:?} without prior selection work"
+                        );
+                        assert_eq!(
+                            run.token_ids,
+                            [vec![1; usize::try_from(output).expect("small output")]],
+                            "profiling preserves generated tokens"
+                        );
+                    }
+                    assert_eq!(
+                        device.take_profile(),
+                        enabled.then(DeviceProfile::default),
+                        "selection work is drained after the final step"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
