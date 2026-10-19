@@ -13,6 +13,7 @@ use crate::models::CausalLm;
 use crate::nn::{
     DType,
     Device,
+    DeviceProfile,
     Shape,
     Tensor,
 };
@@ -144,6 +145,8 @@ impl<'run, D: Device, M: CausalLm<D>> Decoder<'run, D, M> {
             GenerateError::Synchronize
         })
     }
+
+    pub fn take_profile(&mut self) -> Option<DeviceProfile> { self.device.take_profile() }
 
     pub(crate) fn forward_logits(
         &mut self,

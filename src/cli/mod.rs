@@ -14,6 +14,7 @@ use clap::{
 use foundry::bench::TimingScope;
 #[cfg(target_os = "macos")]
 use foundry::metal::MetalDevice;
+use foundry::nn::ProfileMode;
 use tracing::error;
 
 #[cfg(target_os = "macos")]
@@ -107,6 +108,13 @@ pub struct BenchArgs {
     batch_size: NonZeroU32,
     #[arg(long, default_value_t = 0, help = "Seed of the random token IDs.")]
     seed: u64,
+    #[arg(
+        long,
+        value_enum,
+        help = "Record device dispatches and allocations per step; steps keeps execution \
+                unchanged."
+    )]
+    profile: Option<ProfileMode>,
     #[arg(long, help = "Directory that receives report.json.")]
     out: PathBuf,
 }
@@ -162,8 +170,12 @@ impl fmt::Display for ModelId {
 
 #[cfg(target_os = "macos")]
 pub fn execute(command: Command) -> Result<(), CliError> {
-    let open_device = || {
-        MetalDevice::new().map_err(|error| {
+    let open_device = |profile: Option<ProfileMode>| {
+        match profile {
+            None => MetalDevice::new(),
+            Some(ProfileMode::Steps) => MetalDevice::profiled(),
+        }
+        .map_err(|error| {
             error!(message = "Creating the Metal device failed.", %error);
             CliError::Device
         })
@@ -173,9 +185,9 @@ pub fn execute(command: Command) -> Result<(), CliError> {
             model,
             prompt_ids,
             max_new_tokens,
-        } => run(open_device, &model, &prompt_ids, max_new_tokens),
-        Command::Bench(args) => bench_command(open_device, &args),
-        Command::Eval(args) => eval_command(open_device, &args),
+        } => run(|| open_device(None), &model, &prompt_ids, max_new_tokens),
+        Command::Bench(args) => bench_command(|| open_device(args.profile), &args),
+        Command::Eval(args) => eval_command(|| open_device(None), &args),
     }
 }
 
@@ -300,6 +312,7 @@ mod tests {
                 runs: NonZeroU32::new(10).expect("positive run count"),
                 batch_size: NonZeroU32::MIN,
                 seed: 0,
+                profile: None,
                 out: PathBuf::from("reports"),
             })),
             "exact generation with one warmup and ten runs"

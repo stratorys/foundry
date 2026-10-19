@@ -10,6 +10,7 @@ use crate::bench::{
     RunSamples,
     Summary,
 };
+use crate::nn::DeviceProfile;
 
 const NS_PER_S: f64 = 1e9;
 
@@ -30,6 +31,9 @@ pub struct Metrics {
     pub output_tokens_per_s: Option<Summary>,
     pub total_tokens_per_s: Option<Summary>,
     pub processed_tokens_per_s: Option<Summary>,
+    pub decode_dispatch_count: Option<Summary>,
+    pub decode_allocation_count: Option<Summary>,
+    pub decode_allocated_bytes: Option<Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -88,6 +92,14 @@ impl Metrics {
             .iter()
             .map(|run| u64_to_f64(run.step_sum_ns()))
             .collect::<Vec<_>>();
+        let decode_profile_summary = |select: fn(&DeviceProfile) -> u64| {
+            summary(
+                runs.iter()
+                    .flat_map(|run| &run.decode)
+                    .filter_map(|sample| sample.profile.as_ref())
+                    .map(|profile| u64_to_f64(select(profile))),
+            )
+        };
         Ok(Self {
             prompt_step_ns: summary(
                 runs.iter()
@@ -115,6 +127,9 @@ impl Metrics {
             output_tokens_per_s: derived_summary(|run| run.output)?,
             total_tokens_per_s: derived_summary(|run| run.total)?,
             processed_tokens_per_s: derived_summary(|run| run.processed)?,
+            decode_dispatch_count: decode_profile_summary(DeviceProfile::dispatch_count)?,
+            decode_allocation_count: decode_profile_summary(|profile| profile.allocation_count)?,
+            decode_allocated_bytes: decode_profile_summary(|profile| profile.allocated_bytes)?,
         })
     }
 }
@@ -194,6 +209,10 @@ mod tests {
         RunSamples,
         TimingScope,
     };
+    use crate::nn::{
+        DeviceProfile,
+        KernelProfile,
+    };
 
     fn config(
         prompt: u32,
@@ -209,6 +228,7 @@ mod tests {
             run_count: NonZeroU32::MIN,
             batch_size: NonZeroU32::new(batch).expect("nonzero batch"),
             seed: 0,
+            profile: None,
         }
     }
 
@@ -234,10 +254,12 @@ mod tests {
                     context_tokens: position.saturating_add(11),
                     step_ns,
                     inter_token_ns: (prompt_step_ns.is_some() || position > 0).then_some(step_ns),
+                    profile: None,
                 })
                 .collect(),
             token_ids: vec![vec![1; tokens]; batch],
             peak_memory_bytes: Some(2_000_000_000),
+            prompt_profile: None,
         }
     }
 
@@ -492,6 +514,65 @@ mod tests {
     }
 
     #[test]
+    fn decode_profiles_summarize_counts_per_step_and_exclude_the_prompt() {
+        let profile = |dispatch_count, allocation_count, allocated_bytes| DeviceProfile {
+            kernels: [
+                (
+                    "binary_add",
+                    KernelProfile {
+                        dispatch_count,
+                    },
+                ),
+                (
+                    "matmul",
+                    KernelProfile {
+                        dispatch_count: 1,
+                    },
+                ),
+            ]
+            .into(),
+            allocation_count,
+            allocated_bytes,
+        };
+        let mut sample = run(Some(100), vec![10, 10], 3, 1);
+        sample.prompt_profile = Some(profile(99, 99, 99));
+        sample
+            .decode
+            .iter_mut()
+            .zip([profile(3, 4, 64), profile(5, 6, 96)])
+            .for_each(|(step, profile)| step.profile = Some(profile));
+        let metrics = Metrics::from_runs(&[sample.clone()], &config(4, 1)).expect("metrics");
+        assert_eq!(
+            [
+                metrics.decode_dispatch_count,
+                metrics.decode_allocation_count,
+                metrics.decode_allocated_bytes
+            ]
+            .map(|summary| summary.map(|s| (s.count, s.min, s.max))),
+            [
+                Some((2, 4.0, 6.0)),
+                Some((2, 4.0, 6.0)),
+                Some((2, 64.0, 96.0))
+            ],
+            "one sample per decode step, dispatches summed over kernels"
+        );
+        sample
+            .decode
+            .iter_mut()
+            .for_each(|step| step.profile = None);
+        let metrics = Metrics::from_runs(&[sample], &config(4, 1)).expect("metrics");
+        assert_eq!(
+            [
+                metrics.decode_dispatch_count,
+                metrics.decode_allocation_count,
+                metrics.decode_allocated_bytes
+            ],
+            [None; 3],
+            "no profile metrics without profiling"
+        );
+    }
+
+    #[test]
     fn json_has_common_metrics_and_no_engine_names() {
         let config = config(2, 1);
         let samples = vec![run(Some(1), vec![], 1, 1)];
@@ -524,7 +605,7 @@ mod tests {
             .get("metrics")
             .and_then(serde_json::Value::as_object)
             .expect("metrics object");
-        assert_eq!(object.len(), 13, "one field per canonical metric");
+        assert_eq!(object.len(), 16, "one field per canonical metric");
         for name in ["mlx", "vllm", "llama_cpp", "sglang", "candle", "zml"] {
             assert!(!object.contains_key(name), "no engine projection {name}");
         }

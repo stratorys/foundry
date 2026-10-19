@@ -53,6 +53,7 @@ use crate::nn::{
     AllocatedMemory,
     DType,
     Device,
+    DeviceProfile,
     Layout,
     MAX_ITEMSIZE,
     MAX_RANK,
@@ -95,6 +96,7 @@ pub struct MetalDevice {
     allocated_bytes_baseline: u64,
     allocated_bytes_peak: u64,
     allocated_bytes_run_peak: u64,
+    profile: Option<DeviceProfile>,
 }
 
 struct BufferView<'buffer> {
@@ -132,6 +134,14 @@ impl MetalDevice {
             allocated_bytes_baseline,
             allocated_bytes_peak: allocated_bytes_baseline,
             allocated_bytes_run_peak: allocated_bytes_baseline,
+            profile: None,
+        })
+    }
+
+    pub fn profiled() -> Result<Self, MetalError> {
+        Ok(Self {
+            profile: Some(DeviceProfile::default()),
+            ..Self::new()?
         })
     }
 
@@ -161,6 +171,9 @@ impl MetalDevice {
         let allocated = allocated_bytes(&self.device)?;
         self.allocated_bytes_peak = self.allocated_bytes_peak.max(allocated);
         self.allocated_bytes_run_peak = self.allocated_bytes_run_peak.max(allocated);
+        if let Some(profile) = &mut self.profile {
+            profile.count_allocation(u64::try_from(nbytes).unwrap_or(u64::MAX));
+        }
         Ok(MetalStorage {
             buffer,
             nbytes,
@@ -289,7 +302,11 @@ impl MetalDevice {
                     grid, ..
                 } => encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group),
             }
-        })
+        })?;
+        if let Some(profile) = &mut self.profile {
+            profile.count_dispatch(kernel.op());
+        }
+        Ok(())
     }
 
     fn scatter_window(
@@ -522,6 +539,10 @@ impl Device for MetalDevice {
         })
     }
 
+    fn take_profile(&mut self) -> Option<DeviceProfile> {
+        self.profile.as_mut().map(std::mem::take)
+    }
+
     fn storage_from_bytes(
         &mut self,
         bytes: &[u8],
@@ -697,6 +718,7 @@ fn allocated_bytes(device: &MtlDevice) -> Result<u64, MetalError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::f32::consts::{
         E,
         PI,
@@ -710,6 +732,8 @@ mod tests {
     use crate::nn::{
         DType,
         Device,
+        DeviceProfile,
+        KernelProfile,
         Shape,
         Tensor,
         TensorError,
@@ -793,6 +817,56 @@ mod tests {
             "session peak survives free and reset"
         );
         drop(resident);
+    }
+
+    #[test]
+    fn profiled_device_counts_dispatches_and_allocations_until_taken() {
+        let mut device = MetalDevice::profiled().expect("a Metal device is available");
+        let [ones, start] = [1.0_f32, 0.0].map(|value| {
+            Tensor::from_bytes(
+                &mut device,
+                &[value; 4]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from([4]).expect("the shape is valid"),
+            )
+            .expect("from_bytes succeeds")
+        });
+        let inputs = device.take_profile();
+        (0..3)
+            .try_fold(start, |sum, _| sum.add(&mut device, &ones))
+            .expect("every add succeeds");
+        assert_eq!(
+            [inputs, device.take_profile(), device.take_profile()],
+            [
+                Some(DeviceProfile {
+                    kernels: BTreeMap::new(),
+                    allocation_count: 2,
+                    allocated_bytes: 32,
+                }),
+                Some(DeviceProfile {
+                    kernels: BTreeMap::from([(
+                        "binary_add",
+                        KernelProfile {
+                            dispatch_count: 3,
+                        },
+                    )]),
+                    allocation_count: 3,
+                    allocated_bytes: 48,
+                }),
+                Some(DeviceProfile::default()),
+            ],
+            "uploads, then three adds, then nothing since the previous take"
+        );
+        assert_eq!(
+            MetalDevice::new()
+                .expect("a Metal device is available")
+                .take_profile(),
+            None,
+            "an unprofiled device records nothing"
+        );
     }
 
     #[test]

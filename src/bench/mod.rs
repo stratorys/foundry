@@ -37,7 +37,11 @@ use crate::generate::{
     GenerateError,
 };
 use crate::models::CausalLm;
-use crate::nn::Device;
+use crate::nn::{
+    Device,
+    DeviceProfile,
+    ProfileMode,
+};
 
 const NS_PER_MS: f64 = 1e6;
 
@@ -52,6 +56,7 @@ pub struct BenchConfig {
     pub run_count: NonZeroU32,
     pub batch_size: NonZeroU32,
     pub seed: u64,
+    pub profile: Option<ProfileMode>,
 }
 
 /// Separate invocations prevent forward synchronization from perturbing
@@ -80,6 +85,8 @@ pub struct RunSamples {
     pub token_ids: Vec<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_profile: Option<DeviceProfile>,
 }
 
 /// One single-token forward; context is the cache length before processing its
@@ -90,6 +97,8 @@ pub struct DecodeSample {
     pub context_tokens: usize,
     pub step_ns: u64,
     pub inter_token_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<DeviceProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -271,6 +280,8 @@ fn run<D: Device, M: CausalLm<D>>(
     if inputs.timing_scope == TimingScope::Forward {
         decoder.synchronize().map_err(step_error)?;
     }
+    // Cache and depth work belong to no measured step.
+    decoder.take_profile();
     for position in 0..inputs.new_token_count.max(usize::from(prompt_len > 0)) {
         let is_prompt = position == 0 && prompt_len > 0;
         let step = timed_step(
@@ -292,14 +303,19 @@ fn run<D: Device, M: CausalLm<D>>(
             } else {
                 None
             };
+        // Every step ends by reading the selected tokens or by synchronizing,
+        // so all of its device work has completed.
+        let profile = decoder.take_profile();
         if is_prompt {
             samples.prompt_step_ns = Some(step.ns);
+            samples.prompt_profile = profile;
         } else {
             samples.decode.push(DecodeSample {
                 position: samples.decode.len(),
                 context_tokens: past_seen_tokens,
                 step_ns: step.ns,
                 inter_token_ns,
+                profile,
             });
         }
         samples
@@ -397,6 +413,8 @@ mod tests {
         AllocatedMemory,
         DType,
         Device,
+        DeviceProfile,
+        KernelProfile,
         Operand,
         Shape,
         Tensor,
@@ -413,6 +431,7 @@ mod tests {
         run_count: NonZeroU32::MIN.saturating_add(2),
         batch_size: NonZeroU32::MIN,
         seed: 7,
+        profile: None,
     };
 
     #[test]
@@ -518,6 +537,18 @@ mod tests {
         memory_peaks: VecDeque<u64>,
         run_memory_peak: Option<u64>,
         session_memory_peak: Option<u64>,
+        profile: Option<DeviceProfile>,
+    }
+
+    impl RecordingDevice {
+        fn count_allocation(
+            &mut self,
+            nbytes: usize,
+        ) {
+            if let Some(profile) = &mut self.profile {
+                profile.count_allocation(u64::try_from(nbytes).expect("small allocation"));
+            }
+        }
     }
 
     impl Device for RecordingDevice {
@@ -544,6 +575,9 @@ mod tests {
                 source: "test",
             })
         }
+        fn take_profile(&mut self) -> Option<DeviceProfile> {
+            self.profile.as_mut().map(std::mem::take)
+        }
         fn synchronize(&mut self) -> Result<(), Self::Error> {
             self.events.push("ready");
             self.sync_count = self.sync_count.saturating_add(1);
@@ -556,12 +590,14 @@ mod tests {
             &mut self,
             bytes: &[u8],
         ) -> Result<Vec<u8>, Self::Error> {
+            self.count_allocation(bytes.len());
             Ok(bytes.to_vec())
         }
         fn zeros(
             &mut self,
             nbytes: usize,
         ) -> Result<Vec<u8>, Self::Error> {
+            self.count_allocation(nbytes);
             self.events.push("cache");
             self.run_memory_peak = self.memory_peaks.pop_front();
             self.session_memory_peak = self.session_memory_peak.max(self.run_memory_peak);
@@ -594,7 +630,12 @@ mod tests {
             );
             self.selected_at = Some(std::time::Instant::now());
             self.events.push("select");
-            Ok(1_u32.to_le_bytes().repeat(output.numel()))
+            let bytes = 1_u32.to_le_bytes().repeat(output.numel());
+            self.count_allocation(bytes.len());
+            if let Some(profile) = &mut self.profile {
+                profile.count_dispatch(op.name());
+            }
+            Ok(bytes)
         }
         fn run_in_place(
             &mut self,
@@ -924,6 +965,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn each_step_receives_only_its_own_device_profile() {
+        let config = BenchConfig {
+            depth_token_count: 7,
+            ..measured_config(4, 3, TimingScope::Generation)
+        };
+        // Input ids, then 8 bytes of f32 logits and 4 bytes of argmax.
+        let step_profile = |allocated_bytes| DeviceProfile {
+            kernels: [(
+                "reduce",
+                KernelProfile {
+                    dispatch_count: 1,
+                },
+            )]
+            .into(),
+            allocation_count: 3,
+            allocated_bytes,
+        };
+        let step_profiles = |profile: Option<DeviceProfile>| {
+            let mut device = RecordingDevice {
+                profile,
+                ..RecordingDevice::default()
+            };
+            let report =
+                bench(&mut device, &TestModel, NonZeroU32::MIN, &config).expect("benchmark");
+            let run = report.runs.first().expect("one run");
+            (
+                run.prompt_profile.clone(),
+                run.decode
+                    .iter()
+                    .map(|sample| sample.profile.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            step_profiles(Some(DeviceProfile::default())),
+            (Some(step_profile(28)), vec![Some(step_profile(16)); 2]),
+            "input ids, logits and argmax per step; cache and depth work excluded"
+        );
+        assert_eq!(
+            step_profiles(None),
+            (None, vec![None; 2]),
+            "no profile without device profiling"
+        );
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub fn bench_command<D: Device>(
         run_count: args.runs,
         batch_size: args.batch_size,
         seed: args.seed,
+        profile: args.profile,
     };
     let mut device = open_device()?;
     let max_cache_len = [
@@ -191,6 +192,9 @@ pub fn bench_command<D: Device>(
         peak_memory_bytes = ?record.report.peak_memory_bytes,
         session_peak_memory_bytes = ?record.report.session_peak_memory_bytes,
         peak_memory_source = ?record.report.peak_memory_source,
+        decode_dispatch_count = ?record.report.metrics.decode_dispatch_count.map(|s| s.p50),
+        decode_allocation_count = ?record.report.metrics.decode_allocation_count.map(|s| s.p50),
+        decode_allocated_bytes = ?record.report.metrics.decode_allocated_bytes.map(|s| s.p50),
         report = %report_path.display(),
     );
     Ok(())

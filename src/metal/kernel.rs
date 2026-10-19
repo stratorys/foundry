@@ -60,6 +60,8 @@ impl Kernel {
         }
     }
 
+    pub fn op(&self) -> &'static str { self.op }
+
     pub fn name(&self) -> String {
         let suffix = match self.dtype {
             DType::F32 => "f32",
