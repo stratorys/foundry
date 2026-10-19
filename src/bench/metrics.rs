@@ -10,6 +10,7 @@ use crate::bench::{
     RunSamples,
     Summary,
 };
+use crate::nn::DeviceProfile;
 
 const NS_PER_S: f64 = 1e9;
 
@@ -30,6 +31,13 @@ pub struct Metrics {
     pub output_tokens_per_s: Option<Summary>,
     pub total_tokens_per_s: Option<Summary>,
     pub processed_tokens_per_s: Option<Summary>,
+    pub decode_dispatch_count: Option<Summary>,
+    pub decode_allocation_count: Option<Summary>,
+    pub decode_allocated_bytes: Option<Summary>,
+    pub decode_gpu_busy_ns: Option<Summary>,
+    // Step wall time minus GPU busy time: encoding, allocation and waits.
+    pub decode_gpu_idle_ns: Option<Summary>,
+    pub decode_kernel_gpu_ns: BTreeMap<String, Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -88,6 +96,13 @@ impl Metrics {
             .iter()
             .map(|run| u64_to_f64(run.step_sum_ns()))
             .collect::<Vec<_>>();
+        let decode_profile_summary = |select: fn(&DecodeSample, &DeviceProfile) -> Option<f64>| {
+            summary(
+                runs.iter()
+                    .flat_map(|run| &run.decode)
+                    .filter_map(|sample| select(sample, sample.profile.as_ref()?)),
+            )
+        };
         Ok(Self {
             prompt_step_ns: summary(
                 runs.iter()
@@ -115,8 +130,43 @@ impl Metrics {
             output_tokens_per_s: derived_summary(|run| run.output)?,
             total_tokens_per_s: derived_summary(|run| run.total)?,
             processed_tokens_per_s: derived_summary(|run| run.processed)?,
+            decode_dispatch_count: decode_profile_summary(|_, profile| {
+                Some(u64_to_f64(profile.dispatch_count()))
+            })?,
+            decode_allocation_count: decode_profile_summary(|_, profile| {
+                Some(u64_to_f64(profile.allocation_count))
+            })?,
+            decode_allocated_bytes: decode_profile_summary(|_, profile| {
+                Some(u64_to_f64(profile.allocated_bytes))
+            })?,
+            decode_gpu_busy_ns: decode_profile_summary(|_, profile| profile.gpu_busy_ns)?,
+            decode_gpu_idle_ns: decode_profile_summary(|sample, profile| {
+                profile
+                    .gpu_busy_ns
+                    .map(|busy_ns| u64_to_f64(sample.step_ns) - busy_ns)
+            })?,
+            decode_kernel_gpu_ns: decode_kernel_gpu_ns(runs)?,
         })
     }
+}
+
+fn decode_kernel_gpu_ns(runs: &[RunSamples]) -> Result<BTreeMap<String, Summary>, BenchError> {
+    let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for profile in runs
+        .iter()
+        .flat_map(|run| &run.decode)
+        .filter_map(|sample| sample.profile.as_ref())
+    {
+        for (kernel, timing) in &profile.kernels {
+            if let Some(gpu_ns) = timing.gpu_ns {
+                samples.entry(kernel.clone()).or_default().push(gpu_ns);
+            }
+        }
+    }
+    samples
+        .into_iter()
+        .map(|(kernel, gpu_ns)| Ok((kernel, Summary::try_from(gpu_ns.as_slice())?)))
+        .collect()
 }
 
 fn tpot_ns(run: &RunSamples) -> Result<Option<f64>, BenchError> {
@@ -184,6 +234,7 @@ pub(crate) fn sum_ns(samples: impl Iterator<Item = u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
     use crate::bench::{
@@ -193,6 +244,10 @@ mod tests {
         Metrics,
         RunSamples,
         TimingScope,
+    };
+    use crate::nn::{
+        DeviceProfile,
+        KernelProfile,
     };
 
     fn config(
@@ -209,6 +264,7 @@ mod tests {
             run_count: NonZeroU32::MIN,
             batch_size: NonZeroU32::new(batch).expect("nonzero batch"),
             seed: 0,
+            profile: None,
         }
     }
 
@@ -234,10 +290,12 @@ mod tests {
                     context_tokens: position.saturating_add(11),
                     step_ns,
                     inter_token_ns: (prompt_step_ns.is_some() || position > 0).then_some(step_ns),
+                    profile: None,
                 })
                 .collect(),
             token_ids: vec![vec![1; tokens]; batch],
             peak_memory_bytes: Some(2_000_000_000),
+            prompt_profile: None,
         }
     }
 
@@ -492,6 +550,117 @@ mod tests {
     }
 
     #[test]
+    fn decode_profiles_summarize_each_step_and_exclude_the_prompt() {
+        let profile =
+            |dispatch_count, allocation_count, allocated_bytes, gpu_busy_ns| DeviceProfile {
+                kernels: [
+                    (
+                        "binary_add".to_owned(),
+                        KernelProfile {
+                            dispatch_count,
+                            gpu_ns: None,
+                        },
+                    ),
+                    (
+                        "matmul".to_owned(),
+                        KernelProfile {
+                            dispatch_count: 1,
+                            gpu_ns: None,
+                        },
+                    ),
+                ]
+                .into(),
+                allocation_count,
+                allocated_bytes,
+                gpu_busy_ns,
+            };
+        let mut sample = run(Some(100), vec![10, 10], 3, 1);
+        sample.prompt_profile = Some(profile(99, 99, 99, Some(99.0)));
+        sample
+            .decode
+            .iter_mut()
+            .zip([profile(3, 4, 64, Some(4.0)), profile(5, 6, 96, Some(7.0))])
+            .for_each(|(step, profile)| step.profile = Some(profile));
+        let profile_metrics = |metrics: Metrics| {
+            [
+                metrics.decode_dispatch_count,
+                metrics.decode_allocation_count,
+                metrics.decode_allocated_bytes,
+                metrics.decode_gpu_busy_ns,
+                metrics.decode_gpu_idle_ns,
+            ]
+            .map(|summary| summary.map(|s| (s.count, s.min, s.max)))
+        };
+        assert_eq!(
+            profile_metrics(Metrics::from_runs(&[sample.clone()], &config(4, 1)).expect("metrics")),
+            [
+                Some((2, 4.0, 6.0)),
+                Some((2, 4.0, 6.0)),
+                Some((2, 64.0, 96.0)),
+                Some((2, 4.0, 7.0)),
+                Some((2, 3.0, 6.0)),
+            ],
+            "one sample per decode step, dispatches summed over kernels, idle is the 10 ns step \
+             minus busy time"
+        );
+        sample
+            .decode
+            .iter_mut()
+            .for_each(|step| step.profile = None);
+        assert_eq!(
+            profile_metrics(Metrics::from_runs(&[sample], &config(4, 1)).expect("metrics")),
+            [None; 5],
+            "no profile metrics without profiling"
+        );
+    }
+
+    #[test]
+    fn kernel_gpu_time_is_summarized_per_kernel_over_decode_steps_only() {
+        let profile = |kernels: &[(&'static str, f64)]| DeviceProfile {
+            kernels: kernels
+                .iter()
+                .map(|&(kernel, gpu_ns)| {
+                    (
+                        kernel.to_owned(),
+                        KernelProfile {
+                            dispatch_count: 1,
+                            gpu_ns: Some(gpu_ns),
+                        },
+                    )
+                })
+                .collect(),
+            ..DeviceProfile::default()
+        };
+        let mut sample = run(Some(100), vec![10, 10], 3, 1);
+        sample.prompt_profile = Some(profile(&[("binary_add", 100.0)]));
+        sample
+            .decode
+            .iter_mut()
+            .zip([
+                profile(&[("binary_add", 2.0)]),
+                profile(&[("binary_add", 4.0), ("matmul", 8.0)]),
+            ])
+            .for_each(|(step, profile)| step.profile = Some(profile));
+        let metrics = Metrics::from_runs(&[sample], &config(4, 1)).expect("metrics");
+        assert_eq!(
+            metrics
+                .decode_kernel_gpu_ns
+                .iter()
+                .map(|(kernel, s)| (kernel.as_str(), s.count, s.min, s.max))
+                .collect::<Vec<_>>(),
+            [("binary_add", 2, 2.0, 4.0), ("matmul", 1, 8.0, 8.0)],
+            "one sample per decode step that ran the kernel; the prompt step is excluded"
+        );
+        let untimed =
+            Metrics::from_runs(&[run(Some(100), vec![10], 2, 1)], &config(4, 1)).expect("metrics");
+        assert_eq!(
+            untimed.decode_kernel_gpu_ns,
+            BTreeMap::new(),
+            "no kernel time without kernel profiling"
+        );
+    }
+
+    #[test]
     fn json_has_common_metrics_and_no_engine_names() {
         let config = config(2, 1);
         let samples = vec![run(Some(1), vec![], 1, 1)];
@@ -524,7 +693,7 @@ mod tests {
             .get("metrics")
             .and_then(serde_json::Value::as_object)
             .expect("metrics object");
-        assert_eq!(object.len(), 13, "one field per canonical metric");
+        assert_eq!(object.len(), 19, "one field per canonical metric");
         for name in ["mlx", "vllm", "llama_cpp", "sglang", "candle", "zml"] {
             assert!(!object.contains_key(name), "no engine projection {name}");
         }

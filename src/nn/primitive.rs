@@ -5,6 +5,7 @@ use tracing::error;
 use crate::nn::{
     AllocatedMemory,
     DType,
+    DeviceProfile,
     Operand,
     Shape,
     TensorError,
@@ -80,6 +81,9 @@ pub trait Device {
 
     // Peak since the last reset, or None when tracking is unavailable.
     fn run_memory_peak(&self) -> Option<AllocatedMemory>;
+
+    // Counters since the previous call, then reset; None when profiling is off.
+    fn take_profile(&mut self) -> Option<DeviceProfile>;
 
     /// Waits for all queued device work to complete without reading a tensor.
     fn synchronize(&mut self) -> Result<(), Self::Error>;

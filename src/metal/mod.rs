@@ -53,10 +53,12 @@ use crate::nn::{
     AllocatedMemory,
     DType,
     Device,
+    DeviceProfile,
     Layout,
     MAX_ITEMSIZE,
     MAX_RANK,
     Operand,
+    ProfileMode,
     Shape,
 };
 
@@ -95,6 +97,7 @@ pub struct MetalDevice {
     allocated_bytes_baseline: u64,
     allocated_bytes_peak: u64,
     allocated_bytes_run_peak: u64,
+    profile: Option<DeviceProfile>,
 }
 
 struct BufferView<'buffer> {
@@ -132,6 +135,16 @@ impl MetalDevice {
             allocated_bytes_baseline,
             allocated_bytes_peak: allocated_bytes_baseline,
             allocated_bytes_run_peak: allocated_bytes_baseline,
+            profile: None,
+        })
+    }
+
+    pub fn profiled(mode: ProfileMode) -> Result<Self, MetalError> {
+        let device = Self::new()?;
+        Ok(Self {
+            stream: device.stream.with_gpu_timing(mode),
+            profile: Some(DeviceProfile::default()),
+            ..device
         })
     }
 
@@ -161,6 +174,9 @@ impl MetalDevice {
         let allocated = allocated_bytes(&self.device)?;
         self.allocated_bytes_peak = self.allocated_bytes_peak.max(allocated);
         self.allocated_bytes_run_peak = self.allocated_bytes_run_peak.max(allocated);
+        if let Some(profile) = &mut self.profile {
+            profile.count_allocation(u64::try_from(nbytes).unwrap_or(u64::MAX));
+        }
         Ok(MetalStorage {
             buffer,
             nbytes,
@@ -232,6 +248,17 @@ impl MetalDevice {
         args: &[KernelArgs<'_>],
         grid: Grid,
     ) -> Result<(), MetalError> {
+        self.dispatch_as(|| kernel.op().to_owned(), kernel, buffers, args, grid)
+    }
+
+    fn dispatch_as(
+        &mut self,
+        profile_key: impl FnOnce() -> String,
+        kernel: Kernel,
+        buffers: &[&MetalStorage],
+        args: &[KernelArgs<'_>],
+        grid: Grid,
+    ) -> Result<(), MetalError> {
         if grid.is_empty() {
             return Ok(());
         }
@@ -248,7 +275,9 @@ impl MetalDevice {
             return Err(MetalError::ThreadgroupTooSmall);
         }
         let group = grid.group(threads_max);
-        self.stream.compute(&pipeline, |encoder| {
+        let profile_key = self.profile.is_some().then(profile_key);
+        let buffer_key = profile_key.clone();
+        self.stream.compute(&pipeline, buffer_key, |encoder| {
             // SAFETY: every buffer is borrowed for the whole call and the
             // command buffer retains it. Each one was produced on this
             // device's serial queue, since `view` and `owns` reject foreign
@@ -289,7 +318,11 @@ impl MetalDevice {
                     grid, ..
                 } => encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group),
             }
-        })
+        })?;
+        if let (Some(profile), Some(profile_key)) = (&mut self.profile, profile_key) {
+            profile.count_dispatch(profile_key);
+        }
+        Ok(())
     }
 
     fn scatter_window(
@@ -430,7 +463,8 @@ impl MetalDevice {
         let dispatch = MatmulDispatch::new(&geometry)?;
         // The output holds `batch * m * n` elements, and the kernel writes
         // only inside `[m, n]` of each batch.
-        self.dispatch(
+        self.dispatch_as(
+            || geometry.profile_key(),
             Kernel::float("matmul", dtype)?,
             &[lhs.storage, rhs.storage, &output],
             &[KernelArgs::Matmul(&dispatch.args)],
@@ -520,6 +554,12 @@ impl Device for MetalDevice {
                 .saturating_sub(self.allocated_bytes_baseline),
             source: "metal_current_allocated_size",
         })
+    }
+
+    fn take_profile(&mut self) -> Option<DeviceProfile> {
+        let profile = self.profile.as_mut().map(std::mem::take)?;
+        let intervals = self.stream.take_gpu_intervals().unwrap_or_default();
+        Some(profile.with_gpu_intervals(intervals))
     }
 
     fn storage_from_bytes(
@@ -697,10 +737,12 @@ fn allocated_bytes(device: &MtlDevice) -> Result<u64, MetalError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::f32::consts::{
         E,
         PI,
     };
+    use std::time::Instant;
 
     use crate::metal::MetalDevice;
     use crate::metal::args::{
@@ -710,6 +752,9 @@ mod tests {
     use crate::nn::{
         DType,
         Device,
+        DeviceProfile,
+        KernelProfile,
+        ProfileMode,
         Shape,
         Tensor,
         TensorError,
@@ -793,6 +838,171 @@ mod tests {
             "session peak survives free and reset"
         );
         drop(resident);
+    }
+
+    #[test]
+    fn profiled_device_counts_dispatches_and_allocations_until_taken() {
+        let mut device =
+            MetalDevice::profiled(ProfileMode::Steps).expect("a Metal device is available");
+        let [ones, start] = [1.0_f32, 0.0].map(|value| {
+            Tensor::from_bytes(
+                &mut device,
+                &[value; 4]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from([4]).expect("the shape is valid"),
+            )
+            .expect("from_bytes succeeds")
+        });
+        let inputs = device.take_profile();
+        (0..3)
+            .try_fold(start, |sum, _| sum.add(&mut device, &ones))
+            .expect("every add succeeds");
+        assert_eq!(
+            [inputs, device.take_profile(), device.take_profile()],
+            [
+                Some(DeviceProfile {
+                    kernels: BTreeMap::new(),
+                    allocation_count: 2,
+                    allocated_bytes: 32,
+                    gpu_busy_ns: Some(0.0),
+                }),
+                Some(DeviceProfile {
+                    kernels: BTreeMap::from([(
+                        "binary_add".to_owned(),
+                        KernelProfile {
+                            dispatch_count: 3,
+                            gpu_ns: None,
+                        },
+                    )]),
+                    allocation_count: 3,
+                    allocated_bytes: 48,
+                    gpu_busy_ns: Some(0.0),
+                }),
+                Some(DeviceProfile {
+                    gpu_busy_ns: Some(0.0),
+                    ..DeviceProfile::default()
+                }),
+            ],
+            "uploads, then three adds still in the open command buffer, then nothing since the \
+             previous take"
+        );
+        assert_eq!(
+            MetalDevice::new()
+                .expect("a Metal device is available")
+                .take_profile(),
+            None,
+            "an unprofiled device records nothing"
+        );
+    }
+
+    #[test]
+    fn profiled_device_gpu_busy_time_fits_inside_the_wall_time() {
+        let mut device =
+            MetalDevice::profiled(ProfileMode::Steps).expect("a Metal device is available");
+        let ones = Tensor::from_bytes(
+            &mut device,
+            &[1.0_f32; 1024]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([1024]).expect("the shape is valid"),
+        )
+        .expect("from_bytes succeeds");
+        let start = Tensor::zeros(
+            &mut device,
+            DType::F32,
+            Shape::try_from([1024]).expect("the shape is valid"),
+        )
+        .expect("zeros succeeds");
+        device.take_profile();
+        let started = Instant::now();
+        (0..300)
+            .try_fold(start, |sum, _| sum.add(&mut device, &ones))
+            .expect("every add succeeds");
+        device
+            .synchronize()
+            .expect("every command buffer completes");
+        let wall_ns = started.elapsed().as_secs_f64() * 1e9;
+        let profile = device.take_profile().expect("a profiled device");
+        let busy_ns = profile
+            .gpu_busy_ns
+            .expect("a profiled device measures GPU time");
+        assert!(
+            busy_ns > 0.0 && busy_ns <= wall_ns,
+            "GPU busy time {busy_ns} ns is positive and within the wall time {wall_ns} ns"
+        );
+        assert_eq!(
+            profile.kernels.get("binary_add").copied(),
+            Some(KernelProfile {
+                dispatch_count: 300,
+                gpu_ns: None,
+            }),
+            "steps mode batches dispatches and times no kernel"
+        );
+    }
+
+    #[test]
+    fn kernel_profile_times_each_kernel_including_matmul_operand_copies() {
+        let mut device =
+            MetalDevice::profiled(ProfileMode::Kernels).expect("a Metal device is available");
+        let [lhs, rhs] = [[4, 2, 2], [2, 3, 4]].map(|dims| {
+            Tensor::from_bytes(
+                &mut device,
+                &(0_u16..16)
+                    .chain(0..8)
+                    .take(dims.iter().product())
+                    .flat_map(|value| f32::from(value).to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from(dims).expect("the shape is valid"),
+            )
+            .expect("from_bytes succeeds")
+        });
+        // Strides [1, 12, 4]: neither row-major nor transposed, so it is
+        // copied.
+        let strided_rhs = rhs.permute(&[2, 0, 1]).expect("the permutation is valid");
+        device.take_profile();
+        lhs.add(&mut device, &lhs).expect("the add succeeds");
+        lhs.matmul(&mut device, &lhs).expect("the matmul succeeds");
+        lhs.matmul(&mut device, &strided_rhs)
+            .expect("the matmul with a copied operand succeeds");
+        device
+            .synchronize()
+            .expect("every command buffer completes");
+        let profile = device.take_profile().expect("a profiled device");
+        assert_eq!(
+            profile
+                .kernels
+                .iter()
+                .map(|(kernel, timing)| (kernel.as_str(), timing.dispatch_count))
+                .collect::<Vec<_>>(),
+            [
+                ("binary_add", 1),
+                ("copy", 1),
+                ("matmul b4 m2 k2 n2", 1),
+                ("matmul b4 m2 k2 n3", 1),
+            ],
+            "the operand copy is its own kernel and each matmul shape its own key"
+        );
+        let kernel_ns = profile
+            .kernels
+            .values()
+            .map(|timing| timing.gpu_ns.expect("every kernel is timed"))
+            .collect::<Vec<_>>();
+        let kernel_ns_sum = kernel_ns.iter().sum::<f64>();
+        let busy_ns = profile.gpu_busy_ns.expect("GPU busy time");
+        // Command buffers run one after another, so their times never overlap
+        // and add up to the busy time, up to floating-point rounding.
+        assert!(
+            kernel_ns.iter().all(|&ns| ns > 0.0)
+                && (kernel_ns_sum - busy_ns).abs() <= busy_ns * 1e-9,
+            "each kernel time {kernel_ns:?} ns is positive and their sum {kernel_ns_sum} ns is \
+             the busy time {busy_ns} ns"
+        );
     }
 
     #[test]

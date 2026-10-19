@@ -10,6 +10,7 @@ mod memory;
 mod module;
 mod norm;
 pub mod primitive;
+mod profile;
 mod shape;
 mod tensor;
 
@@ -38,6 +39,12 @@ pub use self::memory::AllocatedMemory;
 pub use self::module::Module;
 pub use self::norm::RmsNorm;
 pub use self::primitive::Device;
+pub use self::profile::{
+    DeviceProfile,
+    GpuInterval,
+    KernelProfile,
+    ProfileMode,
+};
 pub use self::shape::{
     MAX_RANK,
     Shape,

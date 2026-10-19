@@ -41,7 +41,10 @@ use foundry::models::llama::{
     LlamaForCausalLm,
     module_atol,
 };
-use foundry::nn::Device;
+use foundry::nn::{
+    Device,
+    ProfileMode,
+};
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
 use serde::Serialize;
@@ -143,6 +146,7 @@ pub fn bench_command<D: Device>(
         run_count: args.runs,
         batch_size: args.batch_size,
         seed: args.seed,
+        profile: args.profile,
     };
     let mut device = open_device()?;
     let max_cache_len = [
@@ -165,6 +169,12 @@ pub fn bench_command<D: Device>(
     })?;
     let device_name = device.device_name();
     info!(message = "Selected the device.", %device_name);
+    if args.profile == Some(ProfileMode::Kernels) {
+        info!(
+            message = "Kernel profiling runs one dispatch per command buffer; wall times are not \
+                       representative."
+        );
+    }
     let llama = load_llama(&mut device, &args.model, &config, &weights, max_cache_len)?;
     let report = bench(&mut device, &llama, vocab_size, &bench_config).map_err(|error| {
         error!(message = "Benchmark failed.", model = %args.model, %error);
@@ -191,6 +201,11 @@ pub fn bench_command<D: Device>(
         peak_memory_bytes = ?record.report.peak_memory_bytes,
         session_peak_memory_bytes = ?record.report.session_peak_memory_bytes,
         peak_memory_source = ?record.report.peak_memory_source,
+        decode_dispatch_count = ?record.report.metrics.decode_dispatch_count.map(|s| s.p50),
+        decode_allocation_count = ?record.report.metrics.decode_allocation_count.map(|s| s.p50),
+        decode_allocated_bytes = ?record.report.metrics.decode_allocated_bytes.map(|s| s.p50),
+        decode_gpu_busy_ms = ?record.report.metrics.decode_gpu_busy_ns.map(|s| s.p50 / 1e6),
+        decode_gpu_idle_ms = ?record.report.metrics.decode_gpu_idle_ns.map(|s| s.p50 / 1e6),
         report = %report_path.display(),
     );
     Ok(())

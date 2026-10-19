@@ -37,7 +37,11 @@ use crate::generate::{
     GenerateError,
 };
 use crate::models::CausalLm;
-use crate::nn::Device;
+use crate::nn::{
+    Device,
+    DeviceProfile,
+    ProfileMode,
+};
 
 const NS_PER_MS: f64 = 1e6;
 
@@ -52,6 +56,7 @@ pub struct BenchConfig {
     pub run_count: NonZeroU32,
     pub batch_size: NonZeroU32,
     pub seed: u64,
+    pub profile: Option<ProfileMode>,
 }
 
 /// Separate invocations prevent forward synchronization from perturbing
@@ -71,7 +76,7 @@ impl BenchConfig {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct RunSamples {
     pub prompt_step_ns: Option<u64>,
     pub decode: Vec<DecodeSample>,
@@ -80,16 +85,20 @@ pub struct RunSamples {
     pub token_ids: Vec<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_profile: Option<DeviceProfile>,
 }
 
 /// One single-token forward; context is the cache length before processing its
 /// input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DecodeSample {
     pub position: usize,
     pub context_tokens: usize,
     pub step_ns: u64,
     pub inter_token_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<DeviceProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -271,6 +280,8 @@ fn run<D: Device, M: CausalLm<D>>(
     if inputs.timing_scope == TimingScope::Forward {
         decoder.synchronize().map_err(step_error)?;
     }
+    // Cache and depth work belong to no measured step.
+    decoder.take_profile();
     for position in 0..inputs.new_token_count.max(usize::from(prompt_len > 0)) {
         let is_prompt = position == 0 && prompt_len > 0;
         let step = timed_step(
@@ -294,12 +305,14 @@ fn run<D: Device, M: CausalLm<D>>(
             };
         if is_prompt {
             samples.prompt_step_ns = Some(step.ns);
+            samples.prompt_profile = step.profile;
         } else {
             samples.decode.push(DecodeSample {
                 position: samples.decode.len(),
                 context_tokens: past_seen_tokens,
                 step_ns: step.ns,
                 inter_token_ns,
+                profile: step.profile,
             });
         }
         samples
@@ -319,6 +332,7 @@ struct TimedStep {
     tokens: Vec<u32>,
     ns: u64,
     completed_at: Instant,
+    profile: Option<DeviceProfile>,
 }
 
 fn timed_step<D: Device, M: CausalLm<D>>(
@@ -338,16 +352,21 @@ fn timed_step<D: Device, M: CausalLm<D>>(
     } else {
         None
     };
+    let forward_profile = forward_end.map(|_| decoder.take_profile());
     let tokens = if select_token {
         decoder.next_tokens(&logits).map_err(step_error)?
     } else {
         Vec::new()
     };
     let completed_at = forward_end.unwrap_or_else(Instant::now);
+    // In forward scope, drain selection work without adding it to this or
+    // the next step's profile. Generation scope includes the readback.
+    let profile = decoder.take_profile();
     Ok(TimedStep {
         tokens,
         ns: duration_ns(completed_at.duration_since(start))?,
         completed_at,
+        profile: forward_profile.unwrap_or(profile),
     })
 }
 
@@ -397,6 +416,8 @@ mod tests {
         AllocatedMemory,
         DType,
         Device,
+        DeviceProfile,
+        KernelProfile,
         Operand,
         Shape,
         Tensor,
@@ -413,6 +434,7 @@ mod tests {
         run_count: NonZeroU32::MIN.saturating_add(2),
         batch_size: NonZeroU32::MIN,
         seed: 7,
+        profile: None,
     };
 
     #[test]
@@ -518,6 +540,31 @@ mod tests {
         memory_peaks: VecDeque<u64>,
         run_memory_peak: Option<u64>,
         session_memory_peak: Option<u64>,
+        profile: Option<DeviceProfile>,
+    }
+
+    impl RecordingDevice {
+        fn count_dispatch(
+            &mut self,
+            kernel: &str,
+            gpu_ns: f64,
+        ) {
+            if let Some(profile) = &mut self.profile {
+                profile.count_dispatch(kernel.to_owned());
+                let timing = profile.kernels.get_mut(kernel).expect("counted kernel");
+                timing.gpu_ns = Some(timing.gpu_ns.unwrap_or(0.0) + gpu_ns);
+                profile.gpu_busy_ns = Some(profile.gpu_busy_ns.unwrap_or(0.0) + gpu_ns);
+            }
+        }
+
+        fn count_allocation(
+            &mut self,
+            nbytes: usize,
+        ) {
+            if let Some(profile) = &mut self.profile {
+                profile.count_allocation(u64::try_from(nbytes).expect("small allocation"));
+            }
+        }
     }
 
     impl Device for RecordingDevice {
@@ -544,6 +591,9 @@ mod tests {
                 source: "test",
             })
         }
+        fn take_profile(&mut self) -> Option<DeviceProfile> {
+            self.profile.as_mut().map(std::mem::take)
+        }
         fn synchronize(&mut self) -> Result<(), Self::Error> {
             self.events.push("ready");
             self.sync_count = self.sync_count.saturating_add(1);
@@ -556,12 +606,14 @@ mod tests {
             &mut self,
             bytes: &[u8],
         ) -> Result<Vec<u8>, Self::Error> {
+            self.count_allocation(bytes.len());
             Ok(bytes.to_vec())
         }
         fn zeros(
             &mut self,
             nbytes: usize,
         ) -> Result<Vec<u8>, Self::Error> {
+            self.count_allocation(nbytes);
             self.events.push("cache");
             self.run_memory_peak = self.memory_peaks.pop_front();
             self.session_memory_peak = self.session_memory_peak.max(self.run_memory_peak);
@@ -594,7 +646,10 @@ mod tests {
             );
             self.selected_at = Some(std::time::Instant::now());
             self.events.push("select");
-            Ok(1_u32.to_le_bytes().repeat(output.numel()))
+            let bytes = 1_u32.to_le_bytes().repeat(output.numel());
+            self.count_allocation(bytes.len());
+            self.count_dispatch(op.name(), 2.0);
+            Ok(bytes)
         }
         fn run_in_place(
             &mut self,
@@ -626,6 +681,7 @@ mod tests {
             _keep: usize,
         ) -> Result<Tensor<RecordingDevice>, Self::Error> {
             device.events.push("forward");
+            device.count_dispatch("forward", 1.0);
             device
                 .forwards
                 .push((past, ids.shape().dims().get(1).copied().unwrap_or(0)));
@@ -922,6 +978,91 @@ mod tests {
                     report.runs.iter().all(|run| run.token_ids == [vec![1; 3]]),
                     "memory tracking preserves generated tokens in both scopes"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn each_step_receives_only_its_own_device_profile() {
+        for scope in [TimingScope::Forward, TimingScope::Generation] {
+            for (prompt, output, decode_count) in [(4, 3, 2), (0, 3, 3), (4, 0, 0)] {
+                for enabled in [true, false] {
+                    let config = BenchConfig {
+                        depth_token_count: 7,
+                        warmup_run_count: 1,
+                        run_count: NonZeroU32::new(2).expect("positive run count"),
+                        ..measured_config(prompt, output, scope)
+                    };
+                    let mut device = RecordingDevice {
+                        profile: enabled.then(DeviceProfile::default),
+                        ..RecordingDevice::default()
+                    };
+                    let report = bench(&mut device, &TestModel, NonZeroU32::MIN, &config)
+                        .expect("benchmark");
+                    let includes_selection = scope == TimingScope::Generation && output > 0;
+                    let step_profile =
+                        |input_bytes: u64| {
+                            enabled.then(|| DeviceProfile {
+                                kernels: if includes_selection {
+                                    [
+                                        (
+                                            "forward".to_owned(),
+                                            KernelProfile {
+                                                dispatch_count: 1,
+                                                gpu_ns: Some(1.0),
+                                            },
+                                        ),
+                                        (
+                                            "reduce".to_owned(),
+                                            KernelProfile {
+                                                dispatch_count: 1,
+                                                gpu_ns: Some(2.0),
+                                            },
+                                        ),
+                                    ]
+                                    .into()
+                                } else {
+                                    [(
+                                        "forward".to_owned(),
+                                        KernelProfile {
+                                            dispatch_count: 1,
+                                            gpu_ns: Some(1.0),
+                                        },
+                                    )]
+                                    .into()
+                                },
+                                allocation_count: if includes_selection { 3 } else { 2 },
+                                allocated_bytes: input_bytes
+                                    .saturating_add(if includes_selection { 12 } else { 8 }),
+                                gpu_busy_ns: Some(if includes_selection { 3.0 } else { 1.0 }),
+                            })
+                        };
+                    for run in &report.runs {
+                        assert_eq!(
+                            run.prompt_profile,
+                            (prompt > 0).then(|| step_profile(16)).flatten(),
+                            "prompt profile matches {scope:?}; cache, depth and warmup excluded"
+                        );
+                        assert_eq!(
+                            run.decode
+                                .iter()
+                                .map(|sample| sample.profile.clone())
+                                .collect::<Vec<_>>(),
+                            vec![step_profile(4); decode_count],
+                            "each decode profile matches {scope:?} without prior selection work"
+                        );
+                        assert_eq!(
+                            run.token_ids,
+                            [vec![1; usize::try_from(output).expect("small output")]],
+                            "profiling preserves generated tokens"
+                        );
+                    }
+                    assert_eq!(
+                        device.take_profile(),
+                        enabled.then(DeviceProfile::default),
+                        "selection work is drained after the final step"
+                    );
+                }
             }
         }
     }

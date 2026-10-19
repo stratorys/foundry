@@ -17,6 +17,10 @@ use crate::metal::{
     Pipeline,
     Queue,
 };
+use crate::nn::{
+    GpuInterval,
+    ProfileMode,
+};
 
 const DISPATCHES_PER_BUFFER: usize = 64;
 
@@ -25,14 +29,22 @@ const MAX_IN_FLIGHT: usize = 3;
 pub struct CommandStream {
     queue: Queue,
     open: Option<OpenBuffer>,
-    in_flight: VecDeque<CommandBuffer>,
+    in_flight: VecDeque<InFlight>,
     failed: bool,
+    profile_mode: Option<ProfileMode>,
+    gpu_intervals: Vec<GpuInterval>,
 }
 
 struct OpenBuffer {
     command_buffer: CommandBuffer,
     compute: Option<Retained<ComputeEncoder>>,
     dispatch_count: usize,
+    kernel: Option<String>,
+}
+
+struct InFlight {
+    command_buffer: CommandBuffer,
+    kernel: Option<String>,
 }
 
 impl CommandStream {
@@ -42,18 +54,42 @@ impl CommandStream {
             open: None,
             in_flight: VecDeque::with_capacity(MAX_IN_FLIGHT.saturating_add(1)),
             failed: false,
+            profile_mode: None,
+            gpu_intervals: Vec::new(),
+        }
+    }
+
+    pub fn with_gpu_timing(
+        self,
+        mode: ProfileMode,
+    ) -> Self {
+        Self {
+            profile_mode: Some(mode),
+            ..self
         }
     }
 
     pub fn queue(&self) -> &Queue { &self.queue }
 
+    // Completed command buffers only: synchronize first to include all work.
+    pub fn take_gpu_intervals(&mut self) -> Option<Vec<GpuInterval>> {
+        self.profile_mode
+            .map(|_| std::mem::take(&mut self.gpu_intervals))
+    }
+
     pub fn compute(
         &mut self,
         pipeline: &Pipeline,
+        kernel: Option<String>,
         bind: impl FnOnce(&ComputeEncoder),
     ) -> Result<(), MetalError> {
         self.check_failure()?;
-        let encoder = self.open_buffer()?.compute_encoder()?;
+        let is_kernel_timed = self.profile_mode == Some(ProfileMode::Kernels);
+        let open = self.open_buffer()?;
+        if is_kernel_timed {
+            open.kernel = kernel;
+        }
+        let encoder = open.compute_encoder()?;
         encoder.setComputePipelineState(pipeline);
         bind(encoder);
         self.count_dispatch()
@@ -64,8 +100,8 @@ impl CommandStream {
         if let Some(mut open) = self.open.take() {
             self.in_flight.push_back(open.commit());
         }
-        while let Some(command_buffer) = self.in_flight.pop_front() {
-            self.retire(&command_buffer)?;
+        while let Some(in_flight) = self.in_flight.pop_front() {
+            self.retire(in_flight)?;
         }
         Ok(())
     }
@@ -90,17 +126,37 @@ impl CommandStream {
                     command_buffer,
                     compute: None,
                     dispatch_count: 0,
+                    kernel: None,
                 }))
             }
         }
     }
 
+    // Kernel timing reads GPU time per command buffer, so each one holds a
+    // single dispatch.
+    fn dispatches_per_buffer(&self) -> usize {
+        match self.profile_mode {
+            Some(ProfileMode::Kernels) => 1,
+            Some(ProfileMode::Steps) | None => DISPATCHES_PER_BUFFER,
+        }
+    }
+
+    // Concurrent command buffers would share the GPU and inflate each other's
+    // kernel time, so kernel timing completes each one before the next.
+    fn in_flight_max(&self) -> usize {
+        match self.profile_mode {
+            Some(ProfileMode::Kernels) => 0,
+            Some(ProfileMode::Steps) | None => MAX_IN_FLIGHT,
+        }
+    }
+
     fn count_dispatch(&mut self) -> Result<(), MetalError> {
+        let dispatches_per_buffer = self.dispatches_per_buffer();
         let Some(open) = self.open.as_mut() else {
             return Ok(());
         };
         open.dispatch_count = open.dispatch_count.saturating_add(1);
-        if open.dispatch_count < DISPATCHES_PER_BUFFER {
+        if open.dispatch_count < dispatches_per_buffer {
             return Ok(());
         }
         self.commit()
@@ -110,15 +166,16 @@ impl CommandStream {
         if let Some(mut open) = self.open.take() {
             self.in_flight.push_back(open.commit());
         }
-        while self.in_flight.front().is_some_and(|command_buffer| {
+        let in_flight_max = self.in_flight_max();
+        while self.in_flight.front().is_some_and(|in_flight| {
             matches!(
-                command_buffer.status(),
+                in_flight.command_buffer.status(),
                 MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
             )
-        }) || self.in_flight.len() > MAX_IN_FLIGHT
+        }) || self.in_flight.len() > in_flight_max
         {
-            if let Some(command_buffer) = self.in_flight.pop_front() {
-                self.retire(&command_buffer)?;
+            if let Some(in_flight) = self.in_flight.pop_front() {
+                self.retire(in_flight)?;
             }
         }
         Ok(())
@@ -126,11 +183,21 @@ impl CommandStream {
 
     fn retire(
         &mut self,
-        command_buffer: &CommandBuffer,
+        in_flight: InFlight,
     ) -> Result<(), MetalError> {
+        let command_buffer = &in_flight.command_buffer;
         command_buffer.waitUntilCompleted();
         match command_buffer.status() {
-            MTLCommandBufferStatus::Completed => Ok(()),
+            MTLCommandBufferStatus::Completed => {
+                if self.profile_mode.is_some() {
+                    self.gpu_intervals.push(GpuInterval {
+                        kernel: in_flight.kernel,
+                        start_s: command_buffer.GPUStartTime(),
+                        end_s: command_buffer.GPUEndTime(),
+                    });
+                }
+                Ok(())
+            }
             status => {
                 let description = command_buffer
                     .error()
@@ -167,10 +234,13 @@ impl OpenBuffer {
         }
     }
 
-    fn commit(&mut self) -> CommandBuffer {
+    fn commit(&mut self) -> InFlight {
         self.end_compute();
         self.command_buffer.commit();
-        self.command_buffer.clone()
+        InFlight {
+            command_buffer: self.command_buffer.clone(),
+            kernel: self.kernel.take(),
+        }
     }
 }
 
