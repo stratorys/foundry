@@ -979,6 +979,7 @@ mod tests {
                 "reduce",
                 KernelProfile {
                     dispatch_count: 1,
+                    gpu_ns: None,
                 },
             )]
             .into(),

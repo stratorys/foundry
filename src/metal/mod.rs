@@ -58,8 +58,8 @@ use crate::nn::{
     MAX_ITEMSIZE,
     MAX_RANK,
     Operand,
+    ProfileMode,
     Shape,
-    busy_ns,
 };
 
 const KERNEL_SOURCES: &[&str] = &[
@@ -139,10 +139,10 @@ impl MetalDevice {
         })
     }
 
-    pub fn profiled() -> Result<Self, MetalError> {
+    pub fn profiled(mode: ProfileMode) -> Result<Self, MetalError> {
         let device = Self::new()?;
         Ok(Self {
-            stream: device.stream.with_gpu_timing(),
+            stream: device.stream.with_gpu_timing(mode),
             profile: Some(DeviceProfile::default()),
             ..device
         })
@@ -264,7 +264,7 @@ impl MetalDevice {
             return Err(MetalError::ThreadgroupTooSmall);
         }
         let group = grid.group(threads_max);
-        self.stream.compute(&pipeline, |encoder| {
+        self.stream.compute(&pipeline, kernel.op(), |encoder| {
             // SAFETY: every buffer is borrowed for the whole call and the
             // command buffer retains it. Each one was produced on this
             // device's serial queue, since `view` and `owns` reject foreign
@@ -544,10 +544,8 @@ impl Device for MetalDevice {
 
     fn take_profile(&mut self) -> Option<DeviceProfile> {
         let profile = self.profile.as_mut().map(std::mem::take)?;
-        Some(DeviceProfile {
-            gpu_busy_ns: self.stream.take_gpu_intervals().map(busy_ns),
-            ..profile
-        })
+        let intervals = self.stream.take_gpu_intervals().unwrap_or_default();
+        Some(profile.with_gpu_intervals(&intervals))
     }
 
     fn storage_from_bytes(
@@ -742,6 +740,7 @@ mod tests {
         Device,
         DeviceProfile,
         KernelProfile,
+        ProfileMode,
         Shape,
         Tensor,
         TensorError,
@@ -829,7 +828,8 @@ mod tests {
 
     #[test]
     fn profiled_device_counts_dispatches_and_allocations_until_taken() {
-        let mut device = MetalDevice::profiled().expect("a Metal device is available");
+        let mut device =
+            MetalDevice::profiled(ProfileMode::Steps).expect("a Metal device is available");
         let [ones, start] = [1.0_f32, 0.0].map(|value| {
             Tensor::from_bytes(
                 &mut device,
@@ -860,6 +860,7 @@ mod tests {
                         "binary_add",
                         KernelProfile {
                             dispatch_count: 3,
+                            gpu_ns: None,
                         },
                     )]),
                     allocation_count: 3,
@@ -885,7 +886,8 @@ mod tests {
 
     #[test]
     fn profiled_device_gpu_busy_time_fits_inside_the_wall_time() {
-        let mut device = MetalDevice::profiled().expect("a Metal device is available");
+        let mut device =
+            MetalDevice::profiled(ProfileMode::Steps).expect("a Metal device is available");
         let ones = Tensor::from_bytes(
             &mut device,
             &[1.0_f32; 1024]
@@ -911,13 +913,76 @@ mod tests {
             .synchronize()
             .expect("every command buffer completes");
         let wall_ns = started.elapsed().as_secs_f64() * 1e9;
-        let busy_ns = device
-            .take_profile()
-            .and_then(|profile| profile.gpu_busy_ns)
+        let profile = device.take_profile().expect("a profiled device");
+        let busy_ns = profile
+            .gpu_busy_ns
             .expect("a profiled device measures GPU time");
         assert!(
             busy_ns > 0.0 && busy_ns <= wall_ns,
             "GPU busy time {busy_ns} ns is positive and within the wall time {wall_ns} ns"
+        );
+        assert_eq!(
+            profile.kernels.get("binary_add").copied(),
+            Some(KernelProfile {
+                dispatch_count: 300,
+                gpu_ns: None,
+            }),
+            "steps mode batches dispatches and times no kernel"
+        );
+    }
+
+    #[test]
+    fn kernel_profile_times_each_kernel_including_matmul_operand_copies() {
+        let mut device =
+            MetalDevice::profiled(ProfileMode::Kernels).expect("a Metal device is available");
+        let [lhs, rhs] = [[4, 2, 2], [2, 3, 4]].map(|dims| {
+            Tensor::from_bytes(
+                &mut device,
+                &(0_u16..16)
+                    .chain(0..8)
+                    .take(dims.iter().product())
+                    .flat_map(|value| f32::from(value).to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                DType::F32,
+                Shape::try_from(dims).expect("the shape is valid"),
+            )
+            .expect("from_bytes succeeds")
+        });
+        // Strides [1, 12, 4]: neither row-major nor transposed, so it is
+        // copied.
+        let strided_rhs = rhs.permute(&[2, 0, 1]).expect("the permutation is valid");
+        device.take_profile();
+        lhs.add(&mut device, &lhs).expect("the add succeeds");
+        lhs.matmul(&mut device, &lhs).expect("the matmul succeeds");
+        lhs.matmul(&mut device, &strided_rhs)
+            .expect("the matmul with a copied operand succeeds");
+        device
+            .synchronize()
+            .expect("every command buffer completes");
+        let profile = device.take_profile().expect("a profiled device");
+        assert_eq!(
+            profile
+                .kernels
+                .iter()
+                .map(|(&kernel, timing)| (kernel, timing.dispatch_count))
+                .collect::<Vec<_>>(),
+            [("binary_add", 1), ("copy", 1), ("matmul", 2)],
+            "the operand copy is its own kernel"
+        );
+        let kernel_ns = profile
+            .kernels
+            .values()
+            .map(|timing| timing.gpu_ns.expect("every kernel is timed"))
+            .collect::<Vec<_>>();
+        let kernel_ns_sum = kernel_ns.iter().sum::<f64>();
+        let busy_ns = profile.gpu_busy_ns.expect("GPU busy time");
+        // Command buffers run one after another, so their times never overlap
+        // and add up to the busy time, up to floating-point rounding.
+        assert!(
+            kernel_ns.iter().all(|&ns| ns > 0.0)
+                && (kernel_ns_sum - busy_ns).abs() <= busy_ns * 1e-9,
+            "each kernel time {kernel_ns:?} ns is positive and their sum {kernel_ns_sum} ns is \
+             the busy time {busy_ns} ns"
         );
     }
 

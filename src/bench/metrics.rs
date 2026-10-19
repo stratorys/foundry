@@ -37,6 +37,7 @@ pub struct Metrics {
     pub decode_gpu_busy_ns: Option<Summary>,
     // Step wall time minus GPU busy time: encoding, allocation and waits.
     pub decode_gpu_idle_ns: Option<Summary>,
+    pub decode_kernel_gpu_ns: BTreeMap<&'static str, Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -144,8 +145,30 @@ impl Metrics {
                     .gpu_busy_ns
                     .map(|busy_ns| u64_to_f64(sample.step_ns) - busy_ns)
             })?,
+            decode_kernel_gpu_ns: decode_kernel_gpu_ns(runs)?,
         })
     }
+}
+
+fn decode_kernel_gpu_ns(
+    runs: &[RunSamples]
+) -> Result<BTreeMap<&'static str, Summary>, BenchError> {
+    let mut samples: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+    for profile in runs
+        .iter()
+        .flat_map(|run| &run.decode)
+        .filter_map(|sample| sample.profile.as_ref())
+    {
+        for (&kernel, timing) in &profile.kernels {
+            if let Some(gpu_ns) = timing.gpu_ns {
+                samples.entry(kernel).or_default().push(gpu_ns);
+            }
+        }
+    }
+    samples
+        .into_iter()
+        .map(|(kernel, gpu_ns)| Ok((kernel, Summary::try_from(gpu_ns.as_slice())?)))
+        .collect()
 }
 
 fn tpot_ns(run: &RunSamples) -> Result<Option<f64>, BenchError> {
@@ -213,6 +236,7 @@ pub(crate) fn sum_ns(samples: impl Iterator<Item = u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
     use crate::bench::{
@@ -536,12 +560,14 @@ mod tests {
                         "binary_add",
                         KernelProfile {
                             dispatch_count,
+                            gpu_ns: None,
                         },
                     ),
                     (
                         "matmul",
                         KernelProfile {
                             dispatch_count: 1,
+                            gpu_ns: None,
                         },
                     ),
                 ]
@@ -591,6 +617,52 @@ mod tests {
     }
 
     #[test]
+    fn kernel_gpu_time_is_summarized_per_kernel_over_decode_steps_only() {
+        let profile = |kernels: &[(&'static str, f64)]| DeviceProfile {
+            kernels: kernels
+                .iter()
+                .map(|&(kernel, gpu_ns)| {
+                    (
+                        kernel,
+                        KernelProfile {
+                            dispatch_count: 1,
+                            gpu_ns: Some(gpu_ns),
+                        },
+                    )
+                })
+                .collect(),
+            ..DeviceProfile::default()
+        };
+        let mut sample = run(Some(100), vec![10, 10], 3, 1);
+        sample.prompt_profile = Some(profile(&[("binary_add", 100.0)]));
+        sample
+            .decode
+            .iter_mut()
+            .zip([
+                profile(&[("binary_add", 2.0)]),
+                profile(&[("binary_add", 4.0), ("matmul", 8.0)]),
+            ])
+            .for_each(|(step, profile)| step.profile = Some(profile));
+        let metrics = Metrics::from_runs(&[sample], &config(4, 1)).expect("metrics");
+        assert_eq!(
+            metrics
+                .decode_kernel_gpu_ns
+                .iter()
+                .map(|(&kernel, s)| (kernel, s.count, s.min, s.max))
+                .collect::<Vec<_>>(),
+            [("binary_add", 2, 2.0, 4.0), ("matmul", 1, 8.0, 8.0)],
+            "one sample per decode step that ran the kernel; the prompt step is excluded"
+        );
+        let untimed =
+            Metrics::from_runs(&[run(Some(100), vec![10], 2, 1)], &config(4, 1)).expect("metrics");
+        assert_eq!(
+            untimed.decode_kernel_gpu_ns,
+            BTreeMap::new(),
+            "no kernel time without kernel profiling"
+        );
+    }
+
+    #[test]
     fn json_has_common_metrics_and_no_engine_names() {
         let config = config(2, 1);
         let samples = vec![run(Some(1), vec![], 1, 1)];
@@ -623,7 +695,7 @@ mod tests {
             .get("metrics")
             .and_then(serde_json::Value::as_object)
             .expect("metrics object");
-        assert_eq!(object.len(), 18, "one field per canonical metric");
+        assert_eq!(object.len(), 19, "one field per canonical metric");
         for name in ["mlx", "vllm", "llama_cpp", "sglang", "candle", "zml"] {
             assert!(!object.contains_key(name), "no engine projection {name}");
         }

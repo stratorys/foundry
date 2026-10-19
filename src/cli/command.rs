@@ -41,7 +41,10 @@ use foundry::models::llama::{
     LlamaForCausalLm,
     module_atol,
 };
-use foundry::nn::Device;
+use foundry::nn::{
+    Device,
+    ProfileMode,
+};
 use foundry::weights::Weights;
 use hf_hub::HFClientSync;
 use serde::Serialize;
@@ -166,6 +169,12 @@ pub fn bench_command<D: Device>(
     })?;
     let device_name = device.device_name();
     info!(message = "Selected the device.", %device_name);
+    if args.profile == Some(ProfileMode::Kernels) {
+        info!(
+            message = "Kernel profiling runs one dispatch per command buffer; wall times are not \
+                       representative."
+        );
+    }
     let llama = load_llama(&mut device, &args.model, &config, &weights, max_cache_len)?;
     let report = bench(&mut device, &llama, vocab_size, &bench_config).map_err(|error| {
         error!(message = "Benchmark failed.", model = %args.model, %error);

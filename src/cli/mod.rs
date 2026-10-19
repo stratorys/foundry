@@ -112,7 +112,8 @@ pub struct BenchArgs {
         long,
         value_enum,
         help = "Record device dispatches, allocations and GPU busy time per step; steps keeps \
-                execution unchanged."
+                execution unchanged, kernels also times each kernel with one dispatch per command \
+                buffer, which slows wall times."
     )]
     profile: Option<ProfileMode>,
     #[arg(long, help = "Directory that receives report.json.")]
@@ -171,14 +172,12 @@ impl fmt::Display for ModelId {
 #[cfg(target_os = "macos")]
 pub fn execute(command: Command) -> Result<(), CliError> {
     let open_device = |profile: Option<ProfileMode>| {
-        match profile {
-            None => MetalDevice::new(),
-            Some(ProfileMode::Steps) => MetalDevice::profiled(),
-        }
-        .map_err(|error| {
-            error!(message = "Creating the Metal device failed.", %error);
-            CliError::Device
-        })
+        profile
+            .map_or_else(MetalDevice::new, MetalDevice::profiled)
+            .map_err(|error| {
+                error!(message = "Creating the Metal device failed.", %error);
+                CliError::Device
+            })
     };
     match command {
         Command::Run {

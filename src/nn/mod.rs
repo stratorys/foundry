@@ -41,9 +41,9 @@ pub use self::norm::RmsNorm;
 pub use self::primitive::Device;
 pub use self::profile::{
     DeviceProfile,
+    GpuInterval,
     KernelProfile,
     ProfileMode,
-    busy_ns,
 };
 pub use self::shape::{
     MAX_RANK,

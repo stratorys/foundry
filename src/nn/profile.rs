@@ -8,6 +8,8 @@ const NS_PER_S: f64 = 1e9;
 #[serde(rename_all = "lowercase")]
 pub enum ProfileMode {
     Steps,
+    // One dispatch per command buffer: per-kernel GPU time, perturbed wall time.
+    Kernels,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
@@ -18,9 +20,20 @@ pub struct DeviceProfile {
     pub gpu_busy_ns: Option<f64>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
 pub struct KernelProfile {
     pub dispatch_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_ns: Option<f64>,
+}
+
+// Host times in seconds, as Metal reports them; `kernel` is set only when the
+// command buffer ran that single kernel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuInterval {
+    pub kernel: Option<&'static str>,
+    pub start_s: f64,
+    pub end_s: f64,
 }
 
 impl DeviceProfile {
@@ -45,11 +58,32 @@ impl DeviceProfile {
             total.saturating_add(kernel.dispatch_count)
         })
     }
+
+    pub fn with_gpu_intervals(
+        mut self,
+        intervals: &[GpuInterval],
+    ) -> Self {
+        intervals.iter().for_each(|interval| {
+            if let Some(kernel) = interval.kernel {
+                let kernel = self.kernels.entry(kernel).or_default();
+                let gpu_ns = (interval.end_s - interval.start_s) * NS_PER_S;
+                kernel.gpu_ns = Some(kernel.gpu_ns.unwrap_or(0.0) + gpu_ns);
+            }
+        });
+        Self {
+            gpu_busy_ns: Some(busy_ns(
+                intervals
+                    .iter()
+                    .map(|interval| (interval.start_s, interval.end_s))
+                    .collect(),
+            )),
+            ..self
+        }
+    }
 }
 
-// Each interval is a (start, end) host time in seconds; overlapping intervals
-// count once.
-pub fn busy_ns(mut intervals_s: Vec<(f64, f64)>) -> f64 {
+// Overlapping intervals count once.
+fn busy_ns(mut intervals_s: Vec<(f64, f64)>) -> f64 {
     intervals_s.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
     let (busy_s, _) = intervals_s.into_iter().fold(
         (0.0, f64::NEG_INFINITY),
@@ -69,11 +103,70 @@ pub fn busy_ns(mut intervals_s: Vec<(f64, f64)>) -> f64 {
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::nn::profile::busy_ns;
     use crate::nn::{
         DeviceProfile,
+        GpuInterval,
         KernelProfile,
-        busy_ns,
     };
+
+    #[test]
+    fn gpu_intervals_add_busy_time_and_time_per_single_kernel_buffer() {
+        let interval = |kernel, start_s, end_s| GpuInterval {
+            kernel,
+            start_s,
+            end_s,
+        };
+        let profile = DeviceProfile {
+            kernels: BTreeMap::from([(
+                "binary_add",
+                KernelProfile {
+                    dispatch_count: 2,
+                    gpu_ns: None,
+                },
+            )]),
+            ..DeviceProfile::default()
+        }
+        .with_gpu_intervals(&[
+            interval(Some("binary_add"), 0.0, 0.5),
+            interval(Some("matmul"), 0.25, 1.0),
+            interval(Some("binary_add"), 1.0, 1.25),
+            interval(None, 2.0, 2.5),
+        ]);
+        assert_eq!(
+            profile,
+            DeviceProfile {
+                kernels: BTreeMap::from([
+                    (
+                        "binary_add",
+                        KernelProfile {
+                            dispatch_count: 2,
+                            gpu_ns: Some(0.75e9),
+                        }
+                    ),
+                    (
+                        "matmul",
+                        KernelProfile {
+                            dispatch_count: 0,
+                            gpu_ns: Some(0.75e9),
+                        }
+                    ),
+                ]),
+                gpu_busy_ns: Some(1.75e9),
+                ..DeviceProfile::default()
+            },
+            "kernel times are summed per kernel, busy time merges overlaps and keeps untagged \
+             buffers"
+        );
+        assert_eq!(
+            DeviceProfile::default().with_gpu_intervals(&[]),
+            DeviceProfile {
+                gpu_busy_ns: Some(0.0),
+                ..DeviceProfile::default()
+            },
+            "no completed command buffer means zero busy time and no kernel time"
+        );
+    }
 
     #[test]
     fn busy_time_counts_overlapping_intervals_once() {
@@ -109,12 +202,14 @@ mod tests {
                         "binary_add",
                         KernelProfile {
                             dispatch_count: 2,
+                            gpu_ns: None,
                         }
                     ),
                     (
                         "matmul",
                         KernelProfile {
                             dispatch_count: 1,
+                            gpu_ns: None,
                         }
                     ),
                 ]),
@@ -134,6 +229,7 @@ mod tests {
                 "copy",
                 KernelProfile {
                     dispatch_count: u64::MAX,
+                    gpu_ns: None,
                 },
             )]),
             allocation_count: u64::MAX,
