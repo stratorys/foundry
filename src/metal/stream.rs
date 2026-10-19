@@ -27,6 +27,7 @@ pub struct CommandStream {
     open: Option<OpenBuffer>,
     in_flight: VecDeque<CommandBuffer>,
     failed: bool,
+    gpu_intervals_s: Option<Vec<(f64, f64)>>,
 }
 
 struct OpenBuffer {
@@ -42,10 +43,23 @@ impl CommandStream {
             open: None,
             in_flight: VecDeque::with_capacity(MAX_IN_FLIGHT.saturating_add(1)),
             failed: false,
+            gpu_intervals_s: None,
+        }
+    }
+
+    pub fn with_gpu_timing(self) -> Self {
+        Self {
+            gpu_intervals_s: Some(Vec::new()),
+            ..self
         }
     }
 
     pub fn queue(&self) -> &Queue { &self.queue }
+
+    // Completed command buffers only: synchronize first to include all work.
+    pub fn take_gpu_intervals(&mut self) -> Option<Vec<(f64, f64)>> {
+        self.gpu_intervals_s.as_mut().map(std::mem::take)
+    }
 
     pub fn compute(
         &mut self,
@@ -130,7 +144,12 @@ impl CommandStream {
     ) -> Result<(), MetalError> {
         command_buffer.waitUntilCompleted();
         match command_buffer.status() {
-            MTLCommandBufferStatus::Completed => Ok(()),
+            MTLCommandBufferStatus::Completed => {
+                if let Some(intervals) = &mut self.gpu_intervals_s {
+                    intervals.push((command_buffer.GPUStartTime(), command_buffer.GPUEndTime()));
+                }
+                Ok(())
+            }
             status => {
                 let description = command_buffer
                     .error()

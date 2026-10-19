@@ -195,6 +195,8 @@ pub fn bench_command<D: Device>(
         decode_dispatch_count = ?record.report.metrics.decode_dispatch_count.map(|s| s.p50),
         decode_allocation_count = ?record.report.metrics.decode_allocation_count.map(|s| s.p50),
         decode_allocated_bytes = ?record.report.metrics.decode_allocated_bytes.map(|s| s.p50),
+        decode_gpu_busy_ms = ?record.report.metrics.decode_gpu_busy_ns.map(|s| s.p50 / 1e6),
+        decode_gpu_idle_ms = ?record.report.metrics.decode_gpu_idle_ns.map(|s| s.p50 / 1e6),
         report = %report_path.display(),
     );
     Ok(())

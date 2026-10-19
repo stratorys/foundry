@@ -111,8 +111,8 @@ pub struct BenchArgs {
     #[arg(
         long,
         value_enum,
-        help = "Record device dispatches and allocations per step; steps keeps execution \
-                unchanged."
+        help = "Record device dispatches, allocations and GPU busy time per step; steps keeps \
+                execution unchanged."
     )]
     profile: Option<ProfileMode>,
     #[arg(long, help = "Directory that receives report.json.")]

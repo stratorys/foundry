@@ -59,6 +59,7 @@ use crate::nn::{
     MAX_RANK,
     Operand,
     Shape,
+    busy_ns,
 };
 
 const KERNEL_SOURCES: &[&str] = &[
@@ -139,9 +140,11 @@ impl MetalDevice {
     }
 
     pub fn profiled() -> Result<Self, MetalError> {
+        let device = Self::new()?;
         Ok(Self {
+            stream: device.stream.with_gpu_timing(),
             profile: Some(DeviceProfile::default()),
-            ..Self::new()?
+            ..device
         })
     }
 
@@ -540,7 +543,11 @@ impl Device for MetalDevice {
     }
 
     fn take_profile(&mut self) -> Option<DeviceProfile> {
-        self.profile.as_mut().map(std::mem::take)
+        let profile = self.profile.as_mut().map(std::mem::take)?;
+        Some(DeviceProfile {
+            gpu_busy_ns: self.stream.take_gpu_intervals().map(busy_ns),
+            ..profile
+        })
     }
 
     fn storage_from_bytes(
@@ -723,6 +730,7 @@ mod tests {
         E,
         PI,
     };
+    use std::time::Instant;
 
     use crate::metal::MetalDevice;
     use crate::metal::args::{
@@ -845,6 +853,7 @@ mod tests {
                     kernels: BTreeMap::new(),
                     allocation_count: 2,
                     allocated_bytes: 32,
+                    gpu_busy_ns: Some(0.0),
                 }),
                 Some(DeviceProfile {
                     kernels: BTreeMap::from([(
@@ -855,10 +864,15 @@ mod tests {
                     )]),
                     allocation_count: 3,
                     allocated_bytes: 48,
+                    gpu_busy_ns: Some(0.0),
                 }),
-                Some(DeviceProfile::default()),
+                Some(DeviceProfile {
+                    gpu_busy_ns: Some(0.0),
+                    ..DeviceProfile::default()
+                }),
             ],
-            "uploads, then three adds, then nothing since the previous take"
+            "uploads, then three adds still in the open command buffer, then nothing since the \
+             previous take"
         );
         assert_eq!(
             MetalDevice::new()
@@ -866,6 +880,44 @@ mod tests {
                 .take_profile(),
             None,
             "an unprofiled device records nothing"
+        );
+    }
+
+    #[test]
+    fn profiled_device_gpu_busy_time_fits_inside_the_wall_time() {
+        let mut device = MetalDevice::profiled().expect("a Metal device is available");
+        let ones = Tensor::from_bytes(
+            &mut device,
+            &[1.0_f32; 1024]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            DType::F32,
+            Shape::try_from([1024]).expect("the shape is valid"),
+        )
+        .expect("from_bytes succeeds");
+        let start = Tensor::zeros(
+            &mut device,
+            DType::F32,
+            Shape::try_from([1024]).expect("the shape is valid"),
+        )
+        .expect("zeros succeeds");
+        device.take_profile();
+        let started = Instant::now();
+        (0..300)
+            .try_fold(start, |sum, _| sum.add(&mut device, &ones))
+            .expect("every add succeeds");
+        device
+            .synchronize()
+            .expect("every command buffer completes");
+        let wall_ns = started.elapsed().as_secs_f64() * 1e9;
+        let busy_ns = device
+            .take_profile()
+            .and_then(|profile| profile.gpu_busy_ns)
+            .expect("a profiled device measures GPU time");
+        assert!(
+            busy_ns > 0.0 && busy_ns <= wall_ns,
+            "GPU busy time {busy_ns} ns is positive and within the wall time {wall_ns} ns"
         );
     }
 

@@ -34,6 +34,9 @@ pub struct Metrics {
     pub decode_dispatch_count: Option<Summary>,
     pub decode_allocation_count: Option<Summary>,
     pub decode_allocated_bytes: Option<Summary>,
+    pub decode_gpu_busy_ns: Option<Summary>,
+    // Step wall time minus GPU busy time: encoding, allocation and waits.
+    pub decode_gpu_idle_ns: Option<Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -92,12 +95,11 @@ impl Metrics {
             .iter()
             .map(|run| u64_to_f64(run.step_sum_ns()))
             .collect::<Vec<_>>();
-        let decode_profile_summary = |select: fn(&DeviceProfile) -> u64| {
+        let decode_profile_summary = |select: fn(&DecodeSample, &DeviceProfile) -> Option<f64>| {
             summary(
                 runs.iter()
                     .flat_map(|run| &run.decode)
-                    .filter_map(|sample| sample.profile.as_ref())
-                    .map(|profile| u64_to_f64(select(profile))),
+                    .filter_map(|sample| select(sample, sample.profile.as_ref()?)),
             )
         };
         Ok(Self {
@@ -127,9 +129,21 @@ impl Metrics {
             output_tokens_per_s: derived_summary(|run| run.output)?,
             total_tokens_per_s: derived_summary(|run| run.total)?,
             processed_tokens_per_s: derived_summary(|run| run.processed)?,
-            decode_dispatch_count: decode_profile_summary(DeviceProfile::dispatch_count)?,
-            decode_allocation_count: decode_profile_summary(|profile| profile.allocation_count)?,
-            decode_allocated_bytes: decode_profile_summary(|profile| profile.allocated_bytes)?,
+            decode_dispatch_count: decode_profile_summary(|_, profile| {
+                Some(u64_to_f64(profile.dispatch_count()))
+            })?,
+            decode_allocation_count: decode_profile_summary(|_, profile| {
+                Some(u64_to_f64(profile.allocation_count))
+            })?,
+            decode_allocated_bytes: decode_profile_summary(|_, profile| {
+                Some(u64_to_f64(profile.allocated_bytes))
+            })?,
+            decode_gpu_busy_ns: decode_profile_summary(|_, profile| profile.gpu_busy_ns)?,
+            decode_gpu_idle_ns: decode_profile_summary(|sample, profile| {
+                profile
+                    .gpu_busy_ns
+                    .map(|busy_ns| u64_to_f64(sample.step_ns) - busy_ns)
+            })?,
         })
     }
 }
@@ -514,60 +528,64 @@ mod tests {
     }
 
     #[test]
-    fn decode_profiles_summarize_counts_per_step_and_exclude_the_prompt() {
-        let profile = |dispatch_count, allocation_count, allocated_bytes| DeviceProfile {
-            kernels: [
-                (
-                    "binary_add",
-                    KernelProfile {
-                        dispatch_count,
-                    },
-                ),
-                (
-                    "matmul",
-                    KernelProfile {
-                        dispatch_count: 1,
-                    },
-                ),
-            ]
-            .into(),
-            allocation_count,
-            allocated_bytes,
-        };
+    fn decode_profiles_summarize_each_step_and_exclude_the_prompt() {
+        let profile =
+            |dispatch_count, allocation_count, allocated_bytes, gpu_busy_ns| DeviceProfile {
+                kernels: [
+                    (
+                        "binary_add",
+                        KernelProfile {
+                            dispatch_count,
+                        },
+                    ),
+                    (
+                        "matmul",
+                        KernelProfile {
+                            dispatch_count: 1,
+                        },
+                    ),
+                ]
+                .into(),
+                allocation_count,
+                allocated_bytes,
+                gpu_busy_ns,
+            };
         let mut sample = run(Some(100), vec![10, 10], 3, 1);
-        sample.prompt_profile = Some(profile(99, 99, 99));
+        sample.prompt_profile = Some(profile(99, 99, 99, Some(99.0)));
         sample
             .decode
             .iter_mut()
-            .zip([profile(3, 4, 64), profile(5, 6, 96)])
+            .zip([profile(3, 4, 64, Some(4.0)), profile(5, 6, 96, Some(7.0))])
             .for_each(|(step, profile)| step.profile = Some(profile));
-        let metrics = Metrics::from_runs(&[sample.clone()], &config(4, 1)).expect("metrics");
-        assert_eq!(
+        let profile_metrics = |metrics: Metrics| {
             [
                 metrics.decode_dispatch_count,
                 metrics.decode_allocation_count,
-                metrics.decode_allocated_bytes
+                metrics.decode_allocated_bytes,
+                metrics.decode_gpu_busy_ns,
+                metrics.decode_gpu_idle_ns,
             ]
-            .map(|summary| summary.map(|s| (s.count, s.min, s.max))),
+            .map(|summary| summary.map(|s| (s.count, s.min, s.max)))
+        };
+        assert_eq!(
+            profile_metrics(Metrics::from_runs(&[sample.clone()], &config(4, 1)).expect("metrics")),
             [
                 Some((2, 4.0, 6.0)),
                 Some((2, 4.0, 6.0)),
-                Some((2, 64.0, 96.0))
+                Some((2, 64.0, 96.0)),
+                Some((2, 4.0, 7.0)),
+                Some((2, 3.0, 6.0)),
             ],
-            "one sample per decode step, dispatches summed over kernels"
+            "one sample per decode step, dispatches summed over kernels, idle is the 10 ns step \
+             minus busy time"
         );
         sample
             .decode
             .iter_mut()
             .for_each(|step| step.profile = None);
-        let metrics = Metrics::from_runs(&[sample], &config(4, 1)).expect("metrics");
         assert_eq!(
-            [
-                metrics.decode_dispatch_count,
-                metrics.decode_allocation_count,
-                metrics.decode_allocated_bytes
-            ],
-            [None; 3],
+            profile_metrics(Metrics::from_runs(&[sample], &config(4, 1)).expect("metrics")),
+            [None; 5],
             "no profile metrics without profiling"
         );
     }
@@ -605,7 +623,7 @@ mod tests {
             .get("metrics")
             .and_then(serde_json::Value::as_object)
             .expect("metrics object");
-        assert_eq!(object.len(), 16, "one field per canonical metric");
+        assert_eq!(object.len(), 18, "one field per canonical metric");
         for name in ["mlx", "vllm", "llama_cpp", "sglang", "candle", "zml"] {
             assert!(!object.contains_key(name), "no engine projection {name}");
         }

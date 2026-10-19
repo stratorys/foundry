@@ -43,6 +43,7 @@ pub use self::profile::{
     DeviceProfile,
     KernelProfile,
     ProfileMode,
+    busy_ns,
 };
 pub use self::shape::{
     MAX_RANK,

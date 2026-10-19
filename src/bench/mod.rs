@@ -76,7 +76,7 @@ impl BenchConfig {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct RunSamples {
     pub prompt_step_ns: Option<u64>,
     pub decode: Vec<DecodeSample>,
@@ -91,7 +91,7 @@ pub struct RunSamples {
 
 /// One single-token forward; context is the cache length before processing its
 /// input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DecodeSample {
     pub position: usize,
     pub context_tokens: usize,
@@ -984,6 +984,7 @@ mod tests {
             .into(),
             allocation_count: 3,
             allocated_bytes,
+            gpu_busy_ns: None,
         };
         let step_profiles = |profile: Option<DeviceProfile>| {
             let mut device = RecordingDevice {
